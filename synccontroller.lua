@@ -8,6 +8,16 @@ Coordinates TTS playback with text highlighting.
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
 
+-- Get plugin directory for relative requires
+local function getPluginPath()
+    local callerSource = debug.getinfo(1, "S").source
+    if callerSource:find("^@") then
+        return callerSource:gsub("^@(.*/)[^/]*", "%1")
+    end
+    return "./"
+end
+local PLUGIN_PATH = getPluginPath()
+
 local SyncController = {
     -- Playback states
     STATE = {
@@ -28,6 +38,7 @@ function SyncController:new(o)
     o.current_word_index = 0
     o.current_sentence_index = 0
     o.playback_time = 0
+    o.playback_bar = nil
     
     return o
 end
@@ -42,7 +53,7 @@ function SyncController:start(text)
     end
     
     self.state = self.STATE.LOADING
-    logger.dbg("SyncController: Starting read-along")
+    logger.dbg("SyncController: Starting read-along with", #text, "characters")
     
     -- Parse the text
     self.parsed_data = self.text_parser:parse(text)
@@ -50,23 +61,42 @@ function SyncController:start(text)
     if not self.parsed_data or #self.parsed_data.words == 0 then
         logger.warn("SyncController: No words found in text")
         self.state = self.STATE.STOPPED
+        local InfoMessage = require("ui/widget/infomessage")
+        local UIManager = require("ui/uimanager")
+        UIManager:show(InfoMessage:new{
+            text = "No words found in text to read.",
+            timeout = 2,
+        })
         return
     end
     
-    -- Synthesize speech
-    self.tts_engine:synthesize(text, function(success, timing_data)
-        if not success then
+    logger.dbg("SyncController: Parsed", #self.parsed_data.words, "words")
+    
+    -- Reference to self for callback
+    local controller = self
+    
+    -- Synthesize speech (now synchronous)
+    local success = self.tts_engine:synthesize(text, function(synth_success, timing_data)
+        logger.dbg("SyncController: Synthesis callback, success:", synth_success)
+        
+        if not synth_success then
             logger.err("SyncController: TTS synthesis failed")
-            self.state = self.STATE.STOPPED
+            controller.state = controller.STATE.STOPPED
             return
         end
         
         -- Apply timing data to parsed text
-        self.text_parser:applyTimingData(self.parsed_data, timing_data)
+        controller.text_parser:applyTimingData(controller.parsed_data, timing_data)
         
         -- Start playback
-        self:beginPlayback()
+        controller:beginPlayback()
     end)
+    
+    -- If synthesize returned false immediately (before callback), we failed
+    if success == false then
+        logger.err("SyncController: synthesize() returned false")
+        self.state = self.STATE.STOPPED
+    end
 end
 
 --[[--
@@ -77,6 +107,9 @@ function SyncController:beginPlayback()
     self.current_word_index = 0
     self.current_sentence_index = 0
     self.playback_time = 0
+    
+    -- Show playback bar
+    self:showPlaybackBar()
     
     -- Start TTS playback
     self.tts_engine:play(
@@ -94,6 +127,73 @@ function SyncController:beginPlayback()
     self:startSyncLoop()
     
     logger.dbg("SyncController: Playback started")
+end
+
+--[[--
+Show the playback control bar.
+--]]
+function SyncController:showPlaybackBar()
+    if self.playback_bar then
+        self:hidePlaybackBar()
+    end
+    
+    -- Load PlaybackBar module
+    local PlaybackBar = dofile(PLUGIN_PATH .. "playbackbar.lua")
+    
+    self.playback_bar = PlaybackBar:new{
+        sync_controller = self,
+        on_play_pause = function()
+            if self:isPlaying() then
+                self:pause()
+            elseif self:isPaused() then
+                self:resume()
+            end
+        end,
+        on_rewind = function()
+            self:prevSentence()
+        end,
+        on_forward = function()
+            self:nextSentence()
+        end,
+        on_close = function()
+            self:stop()
+        end,
+    }
+    
+    self.playback_bar:show()
+end
+
+--[[--
+Hide the playback control bar.
+--]]
+function SyncController:hidePlaybackBar()
+    if self.playback_bar then
+        self.playback_bar:hide()
+        self.playback_bar = nil
+    end
+end
+
+--[[--
+Update the playback bar with current state.
+--]]
+function SyncController:updatePlaybackBar()
+    if not self.playback_bar then
+        return
+    end
+    
+    -- Update current word display
+    if self.parsed_data and self.current_word_index > 0 then
+        local word = self.text_parser:getWordByIndex(self.parsed_data, self.current_word_index)
+        if word then
+            self.playback_bar:updateCurrentWord(word.text)
+        end
+    end
+    
+    -- Update progress
+    self.playback_bar:updateProgress(self:getProgress())
+    
+    -- Update play/pause state
+    self.playback_bar:updatePlayState(self:isPlaying())
 end
 
 --[[--
@@ -125,6 +225,9 @@ function SyncController:startSyncLoop()
                 self:highlightCurrentSentence(sentence)
             end
         end
+        
+        -- Update playback bar
+        self:updatePlaybackBar()
         
         -- Schedule next update
         UIManager:scheduleIn(0.03, syncUpdate) -- ~33fps
@@ -244,6 +347,12 @@ function SyncController:pause()
         self.state = self.STATE.PAUSED
         self.pause_time = UIManager:getTime()
         self.tts_engine:pause()
+        
+        -- Update playback bar state
+        if self.playback_bar then
+            self.playback_bar:updatePlayState(false)
+        end
+        
         logger.dbg("SyncController: Paused")
     end
 end
@@ -259,6 +368,12 @@ function SyncController:resume()
         self.sync_start_time = self.sync_start_time + pause_duration
         
         self.tts_engine:resume()
+        
+        -- Update playback bar state
+        if self.playback_bar then
+            self.playback_bar:updatePlayState(true)
+        end
+        
         self:startSyncLoop()
         logger.dbg("SyncController: Resumed")
     end
@@ -272,6 +387,9 @@ function SyncController:stop()
         self.state = self.STATE.STOPPED
         self.tts_engine:stop()
         self.highlight_manager:clearHighlights()
+        
+        -- Hide playback bar
+        self:hidePlaybackBar()
         
         self.parsed_data = nil
         self.current_word_index = 0

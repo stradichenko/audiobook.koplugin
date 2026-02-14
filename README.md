@@ -4,13 +4,19 @@ A Text-to-Speech plugin with synchronized word highlighting for KOReader e-reade
 
 ## Features
 
-- **Word Highlight Sync**: Each word is highlighted as it's spoken
+- **Word Highlight Sync**: Each word is highlighted as it's spoken, moving through the text
 - **Sentence Highlighting**: Optional sentence-level highlighting
+- **Playback Control Bar**: Bottom control bar with:
+  - ⏮ Rewind (previous paragraph/sentence)
+  - ⏸/▶ Play/Pause toggle
+  - ⏭ Forward (next paragraph/sentence)
+  - ✕ Close/Stop reading
+  - Progress bar showing reading position
+  - Current word display
 - **Multiple TTS Engines**: Support for espeak, pico2wave, flite, festival, and Android TTS
 - **Adjustable Speech Rate**: 0.5x to 2.0x speed control
 - **Multiple Highlight Styles**: Background, underline, box, or invert
 - **Auto-Advance**: Automatically moves to the next page when reading completes
-- **Playback Controls**: Play, pause, stop, skip sentences
 
 ## Installation
 
@@ -26,6 +32,62 @@ A Text-to-Speech plugin with synchronized word highlighting for KOReader e-reade
 3. Open any book/document
 
 ## Requirements
+
+
+### Kobo (with USB-C headphones or Bluetooth)
+**IMPORTANT:** Kobo devices do not have built-in TTS. You need to install espeak-ng and aplay manually. No coding is required, but you will need to connect to your Kobo using your computer. Follow these steps:
+
+#### 1. Connect to your Kobo with SSH
+
+1. On your Kobo, enable **Developer Mode** (search for `devmodeon` in the search bar).
+2. Enable **Wi-Fi** and find your Kobo's IP address (in KOReader: Menu → More → Device Info).
+3. On your computer, open a terminal (or use an app like [PuTTY](https://www.putty.org/) on Windows).
+4. Connect to your Kobo by typing:
+   ```bash
+   ssh root@YOUR_KOBO_IP
+   # The password is usually: root
+   ```
+   If you get a warning about authenticity, type `yes` and press Enter.
+
+#### 2. Install espeak-ng and aplay
+
+**Option A: Using NiLuJe's package manager (recommended)**
+
+If you have the package manager (pkm) installed:
+   ```bash
+   pkm install espeak-ng
+   pkm install alsa-utils
+   ```
+This will install both espeak-ng (TTS) and aplay (audio player).
+
+**Option B: Manual download**
+
+If you do not have pkm, you can download pre-built packages from:
+   https://github.com/nickel-packages/packages
+
+Follow the instructions on that page to copy the `.ipk` files to your Kobo and install them using:
+   ```bash
+   opkg install /mnt/onboard/your-package-file.ipk
+   ```
+
+#### 3. Test TTS and Audio
+
+After installation, test that everything works:
+   ```bash
+   espeak-ng "hello Kobo" -w /tmp/test.wav
+   aplay /tmp/test.wav
+   ```
+You should hear "hello Kobo" through your headphones. If you do, you are ready to use the plugin!
+
+#### 4. Troubleshooting
+
+- If you see `command not found`, the package did not install correctly. Try rebooting your Kobo and repeat the steps.
+- If you hear no sound, make sure your headphones are plugged in before running the commands. Some USB-C adapters may not be supported.
+- For Bluetooth, pair your headphones in KOReader or Kobo settings first.
+
+**Need more help?**
+- See the [KOReader Wiki](https://github.com/koreader/koreader/wiki) for more details.
+- Ask for help on the [KOReader Community Forum](https://www.mobileread.com/forums/forumdisplay.php?f=276).
 
 ### Linux/Desktop
 One of the following TTS engines must be installed:
@@ -47,8 +109,16 @@ Uses the built-in Android TTS system. Make sure a TTS engine is installed in you
 ### Method 1: Long-press a Word (Recommended)
 1. Open a document in KOReader
 2. **Long-press on any word** to open the dictionary popup
-3. Tap **"🔊 Read aloud from here"** button (appears below "Add to vocabulary builder")
+3. Tap **"🔊 Read aloud from here"** button (appears below Wikipedia/Search/Close)
 4. Reading starts from that sentence with synchronized word highlighting
+5. **Playback control bar** appears at the bottom of the screen
+
+### Playback Controls
+When reading is active, a control bar appears at the bottom:
+- **⏮ Rewind**: Jump to previous sentence/paragraph (hold for 3x)
+- **⏸ Pause / ▶ Play**: Toggle playback
+- **⏭ Forward**: Jump to next sentence/paragraph (hold for 3x)
+- **✕ Close**: Stop reading and close the control bar
 
 ### Method 2: From Tools Menu
 1. Open a document in KOReader
@@ -76,7 +146,7 @@ Adjust how fast the text is read:
 - **Background**: Fills word background with color
 - **Underline**: Draws line under the word
 - **Box**: Draws border around the word
-- **Invert**: Inverts the word colors
+- **Invert**: Inverts the word colors (best for e-ink)
 
 #### Auto-Advance Pages
 When enabled, automatically turns to the next page and continues reading.
@@ -92,8 +162,9 @@ audiobook.koplugin/
 ├── main.lua             # Main plugin entry point  
 ├── textparser.lua       # Text parsing and tokenization
 ├── ttsengine.lua        # TTS synthesis and playback
-├── highlightmanager.lua # Visual highlighting
-├── synccontroller.lua   # Coordination and timing
+├── highlightmanager.lua # Visual highlighting (moving word highlight)
+├── playbackbar.lua      # Bottom playback control bar widget
+├── synccontroller.lua   # Coordination, timing, and playback state
 └── README.md            # This file
 ```
 
@@ -141,20 +212,48 @@ ls ~/.config/koreader/plugins/audiobook.koplugin/
 # Should show: main.lua, _meta.lua, textparser.lua, etc.
 ```
 
+### Nothing happens after "Starting read-along..."
+This usually means TTS synthesis failed:
+1. **Check for error messages** - The plugin should show what's missing
+2. **Verify TTS is installed**:
+   ```bash
+   which espeak-ng   # Should show a path
+   espeak-ng "hello" -w /tmp/test.wav  # Should create file
+   ls -la /tmp/test.wav  # Should show file size > 0
+   ```
+3. **Verify audio player**:
+   ```bash
+   which aplay   # Should show a path
+   aplay /tmp/test.wav  # Should play audio
+   ```
+
+### "No TTS engine found" error
+You need to install espeak-ng on your device. See Requirements section above.
+
+### "No audio player found" error
+The plugin needs `aplay`, `paplay`, or `mpv` to play audio files.
+- On Kobo: `aplay` is usually available
+- Make sure headphones are connected before starting
+
 ### No "Read aloud" button in dictionary popup
 - Make sure you're long-pressing a word (not selecting text)
-- The button appears below "Add to vocabulary builder"
-- If vocabulary builder is disabled, the button should still appear
+- The button appears below Wikipedia/Search/Close
+- Restart KOReader after installing the plugin
 
-### No audio playing
-- Check that a TTS engine is installed
-- Check that an audio player is available
-- Try running TTS manually: `espeak-ng "test"`
+### No audio with USB-C headphones
+- Some USB-C audio adapters need special configuration
+- Try playing audio with `aplay /tmp/test.wav` via SSH first
+- Check ALSA device list: `aplay -l`
+
+### Playback control bar doesn't appear
+- The bar should appear at the bottom when reading starts
+- If synthesis fails, the bar won't show
+- Check KOReader logs for errors
 
 ### Highlights not visible
 - E-ink screens may need a full refresh
-- Try different highlight styles
-- Check that "Highlight words" is enabled
+- Try different highlight styles (Invert works best on e-ink)
+- Check that "Highlight words" is enabled in settings
 
 ### Timing seems off
 - Estimated timing may not match exact speech

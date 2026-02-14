@@ -74,17 +74,17 @@ end
 
 function Audiobook:addToMainMenu(menu_items)
     menu_items.audiobook = {
-        text = _("Audiobook Read-Along"),
-        sorting_hint = "tools",
+        text = _("🔊 Audiobook Read-Along"),
+        sorting_hint = "tts",  -- Place near TTS/speech related items
         sub_item_table = {
             {
-                text = _("Start reading from current page"),
+                text = _("▶ Start reading from current page"),
                 callback = function()
                     self:startReadAlong()
                 end,
             },
             {
-                text = _("Stop reading"),
+                text = _("⏹ Stop reading"),
                 callback = function()
                     self:stopReadAlong()
                 end,
@@ -93,7 +93,7 @@ function Audiobook:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("Pause/Resume"),
+                text = _("⏸ Pause/Resume"),
                 callback = function()
                     if self.sync_controller:isPlaying() then
                         self:pauseReadAlong()
@@ -234,7 +234,7 @@ function Audiobook:startReadAlong(text, start_pos)
     local page_text = text or self:getCurrentPageText()
     if not page_text or page_text == "" then
         UIManager:show(InfoMessage:new{
-            text = _("Could not extract text from this page. The document format may not be fully supported."),
+            text = _("Could not extract text from this page.\n\nThe document format may not be fully supported."),
             timeout = 3,
         })
         return
@@ -266,10 +266,20 @@ function Audiobook:startReadAlong(text, start_pos)
         logger.dbg("Audiobook: Starting from position", sentence_start)
     end
     
-    -- Show starting notification
+    -- Check if TTS engine has a backend
+    if not self.tts_engine.backend then
+        UIManager:show(InfoMessage:new{
+            text = _("No TTS engine found.\n\nPlease install espeak-ng:\n\nOn Kobo: See README for instructions"),
+            timeout = 5,
+        })
+        return
+    end
+    
+    -- Show starting notification with TTS info
+    local backend_name = self.tts_engine.backend or "unknown"
     UIManager:show(InfoMessage:new{
-        text = _("Starting read-along..."),
-        timeout = 1,
+        text = string.format(_("Starting read-along...\n\nUsing: %s\nText: %d characters"), backend_name, #page_text),
+        timeout = 2,
     })
     
     self.sync_controller:start(page_text)

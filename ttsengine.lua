@@ -6,6 +6,7 @@ Handles text-to-speech synthesis with timing metadata.
 --]]
 
 local Device = require("device")
+local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local ffiutil = require("ffi/util")
 local logger = require("logger")
@@ -19,12 +20,17 @@ local TTSEngine = {
         FLITE = "flite",
         FESTIVAL = "festival",
         ANDROID = "android",
+        PICOTTS = "picotts",  -- Kobo bundled
     },
     
     -- Default settings
     DEFAULT_RATE = 1.0,
     DEFAULT_PITCH = 1.0,
     DEFAULT_VOLUME = 1.0,
+    
+    -- Status flags
+    backend_error = nil,
+    player_error = nil,
 }
 
 function TTSEngine:new(o)
@@ -58,11 +64,12 @@ function TTSEngine:detectBackend()
         return
     end
     
-    -- Check for available TTS engines on Linux
+    -- Check for available TTS engines
+    -- Order: prefer Kobo-compatible options first
     local backends_to_try = {
-        {name = self.BACKENDS.PICO, cmd = "pico2wave"},
         {name = self.BACKENDS.ESPEAK, cmd = "espeak-ng"},
         {name = self.BACKENDS.ESPEAK, cmd = "espeak"},
+        {name = self.BACKENDS.PICO, cmd = "pico2wave"},
         {name = self.BACKENDS.FLITE, cmd = "flite"},
         {name = self.BACKENDS.FESTIVAL, cmd = "festival"},
     }
@@ -71,13 +78,15 @@ function TTSEngine:detectBackend()
         if self:commandExists(backend.cmd) then
             self.backend = backend.name
             self.backend_cmd = backend.cmd
-            logger.dbg("TTSEngine: Using", backend.name, "backend")
+            logger.dbg("TTSEngine: Using", backend.name, "backend with command:", backend.cmd)
             return
         end
     end
     
-    logger.warn("TTSEngine: No TTS backend found")
+    -- Log what we searched for
+    logger.warn("TTSEngine: No TTS backend found. Searched for: espeak-ng, espeak, pico2wave, flite, festival")
     self.backend = nil
+    self.backend_error = _("No TTS engine found. Please install espeak-ng.")
 end
 
 --[[--
@@ -156,10 +165,20 @@ Synthesize text and return timing metadata.
 function TTSEngine:synthesize(text, callback)
     if not self.backend then
         logger.err("TTSEngine: No TTS backend available")
+        -- Show error to user
+        UIManager:show(InfoMessage:new{
+            text = self.backend_error or _("No TTS engine available.\n\nOn Kobo, you need to install espeak-ng.\n\nSee README for instructions."),
+            timeout = 5,
+        })
+        if callback then
+            callback(false, nil)
+        end
         return false
     end
     
     self.timing_data = {}
+    
+    logger.dbg("TTSEngine: Starting synthesis with backend:", self.backend)
     
     if self.backend == self.BACKENDS.ANDROID then
         return self:synthesizeAndroid(text, callback)
@@ -175,28 +194,38 @@ Synthesize using command-line TTS.
 @return boolean Success
 --]]
 function TTSEngine:synthesizeCommand(text, callback)
-    local temp_dir = os.getenv("TMPDIR") or "/tmp"
+    local temp_dir = os.getenv("TMPDIR") or os.getenv("HOME") or "/tmp"
     local audio_file = temp_dir .. "/audiobook_tts_" .. os.time() .. ".wav"
     local timing_file = temp_dir .. "/audiobook_timing_" .. os.time() .. ".txt"
     
+    -- Ensure temp directory exists
+    os.execute("mkdir -p " .. temp_dir)
+    
     local cmd
     local rate_param = ""
+    
+    -- Limit text length to avoid command line issues
+    local max_text_len = 1000
+    if #text > max_text_len then
+        text = text:sub(1, max_text_len)
+        logger.dbg("TTSEngine: Truncated text to", max_text_len, "chars")
+    end
     
     if self.backend == self.BACKENDS.ESPEAK then
         -- espeak-ng supports word timing output
         local speed = math.floor(175 * self.rate) -- Default is 175 wpm
         cmd = string.format(
-            '%s -v en -s %d --punct="<,>" -w "%s" "%s" 2>/dev/null',
+            '%s -v en -s %d -w "%s" "%s" 2>&1',
             self.backend_cmd, speed, audio_file, self:escapeText(text)
         )
     elseif self.backend == self.BACKENDS.PICO then
         cmd = string.format(
-            'pico2wave -l en-US -w "%s" "%s"',
+            'pico2wave -l en-US -w "%s" "%s" 2>&1',
             audio_file, self:escapeText(text)
         )
     elseif self.backend == self.BACKENDS.FLITE then
         cmd = string.format(
-            'flite -t "%s" -o "%s"',
+            'flite -t "%s" -o "%s" 2>&1',
             self:escapeText(text), audio_file
         )
     elseif self.backend == self.BACKENDS.FESTIVAL then
@@ -208,31 +237,68 @@ function TTSEngine:synthesizeCommand(text, callback)
     
     if not cmd then
         logger.err("TTSEngine: Cannot create command for backend:", self.backend)
+        UIManager:show(InfoMessage:new{
+            text = _("TTS backend error: Cannot create synthesis command."),
+            timeout = 3,
+        })
+        if callback then
+            callback(false, nil)
+        end
         return false
     end
     
     logger.dbg("TTSEngine: Running:", cmd)
     
-    -- Run synthesis in background
-    ffiutil.runInSubProcess(function()
-        os.execute(cmd)
-    end, function()
-        if ffiutil.pathExists(audio_file) then
+    -- Run synthesis synchronously for reliability on e-ink devices
+    local result = os.execute(cmd)
+    logger.dbg("TTSEngine: Command result:", result)
+    
+    -- Check if file was created
+    local file = io.open(audio_file, "r")
+    if file then
+        file:close()
+        local size = self:getFileSize(audio_file)
+        logger.dbg("TTSEngine: Audio file created, size:", size)
+        
+        if size and size > 0 then
             self.current_audio_file = audio_file
             -- Generate timing estimates since most engines don't provide timing
             self:generateTimingEstimates(text)
             if callback then
                 callback(true, self.timing_data)
             end
+            return true
         else
-            logger.err("TTSEngine: Failed to create audio file")
-            if callback then
-                callback(false, nil)
-            end
+            logger.err("TTSEngine: Audio file is empty")
         end
-    end, true)
+    else
+        logger.err("TTSEngine: Failed to create audio file at:", audio_file)
+    end
     
-    return true
+    -- Show error to user
+    UIManager:show(InfoMessage:new{
+        text = _("TTS synthesis failed.\n\nCould not generate audio file.\nCheck that espeak-ng is installed."),
+        timeout = 4,
+    })
+    if callback then
+        callback(false, nil)
+    end
+    return false
+end
+
+--[[--
+Get file size.
+@param path string File path
+@return number|nil File size in bytes
+--]]
+function TTSEngine:getFileSize(path)
+    local file = io.open(path, "rb")
+    if file then
+        local size = file:seek("end")
+        file:close()
+        return size
+    end
+    return nil
 end
 
 --[[--
@@ -357,6 +423,10 @@ Play the synthesized audio.
 function TTSEngine:play(on_word, on_complete)
     if not self.current_audio_file then
         logger.err("TTSEngine: No audio file to play")
+        UIManager:show(InfoMessage:new{
+            text = _("No audio file to play."),
+            timeout = 2,
+        })
         return false
     end
     
@@ -369,13 +439,25 @@ function TTSEngine:play(on_word, on_complete)
     local player = self:findAudioPlayer()
     if not player then
         logger.err("TTSEngine: No audio player found")
+        UIManager:show(InfoMessage:new{
+            text = _("No audio player found.\n\nNeeded: aplay, paplay, or mpv.\n\nConnect headphones and ensure audio is working."),
+            timeout = 5,
+        })
+        self.is_speaking = false
+        if on_complete then
+            on_complete()
+        end
         return false
     end
+    
+    logger.dbg("TTSEngine: Using player:", player)
+    logger.dbg("TTSEngine: Audio file:", self.current_audio_file)
     
     local cmd = string.format('%s "%s" &', player, self.current_audio_file)
     logger.dbg("TTSEngine: Playing:", cmd)
     
-    os.execute(cmd)
+    local result = os.execute(cmd)
+    logger.dbg("TTSEngine: Play command result:", result)
     
     -- Start timing loop
     self:startTimingLoop()
@@ -388,16 +470,22 @@ Find available audio player.
 @return string|nil Player command
 --]]
 function TTSEngine:findAudioPlayer()
-    local players = {"aplay", "paplay", "play", "mpv", "mplayer"}
+    -- Order by preference for e-ink/Kobo devices
+    local players = {
+        {cmd = "aplay", args = "-q"},  -- ALSA - most common on embedded
+        {cmd = "paplay", args = ""},   -- PulseAudio
+        {cmd = "mpv", args = "--no-video --really-quiet"},
+        {cmd = "mplayer", args = "-really-quiet"},
+        {cmd = "play", args = "-q"},   -- SoX
+    }
     
     for _, player in ipairs(players) do
-        if self:commandExists(player) then
-            if player == "mpv" then
-                return "mpv --no-video --really-quiet"
-            elseif player == "mplayer" then
-                return "mplayer -really-quiet"
+        if self:commandExists(player.cmd) then
+            logger.dbg("TTSEngine: Found audio player:", player.cmd)
+            if player.args and player.args ~= "" then
+                return player.cmd .. " " .. player.args
             end
-            return player
+            return player.cmd
         end
     end
     
