@@ -5,8 +5,10 @@ Coordinates TTS playback with text highlighting.
 @module synccontroller
 --]]
 
+local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
 local logger = require("logger")
+local time = require("ui/time")
 
 -- Get plugin directory for relative requires
 local function getPluginPath()
@@ -201,14 +203,22 @@ Start the synchronization loop.
 --]]
 function SyncController:startSyncLoop()
     self.sync_start_time = UIManager:getTime()
-    
+    self:_runSyncLoop()
+end
+
+--[[--
+Run the sync update loop.
+Separated from startSyncLoop so that resume can restart the loop
+without resetting sync_start_time.
+--]]
+function SyncController:_runSyncLoop()
     local function syncUpdate()
         if self.state ~= self.STATE.PLAYING then
             return
         end
         
-        -- Calculate elapsed time
-        local elapsed = (UIManager:getTime() - self.sync_start_time) * 1000 -- ms
+        -- FTS values are plain numbers (µs precision); time.to_ms converts diff to ms
+        local elapsed = time.to_ms(UIManager:getTime() - self.sync_start_time)
         self.playback_time = elapsed
         
         -- Find current word
@@ -317,26 +327,19 @@ function SyncController:advanceToNextPage()
     
     local ui = self.plugin.ui
     
-    -- Try to go to next page
-    if ui.document and ui.document:hasNextPage() then
-        ui:handleEvent({
-            handler = "onGotoPage",
-            args = {ui.document:getCurrentPage() + 1}
-        })
-        
-        -- Wait for page to render, then continue
-        UIManager:scheduleIn(0.3, function()
-            local text = self.plugin:getCurrentPageText()
-            if text and text ~= "" then
-                self:start(text)
-            else
-                self.state = self.STATE.STOPPED
-            end
-        end)
-    else
-        logger.dbg("SyncController: No more pages")
-        self.state = self.STATE.STOPPED
-    end
+    -- Navigate forward one page/view (works for both EPUB and PDF modes)
+    ui:handleEvent(Event:new("GotoViewRel", 1))
+    
+    -- Wait for page to render, then continue reading
+    UIManager:scheduleIn(0.5, function()
+        local text = self.plugin:getCurrentPageText()
+        if text and text ~= "" then
+            self:start(text)
+        else
+            logger.dbg("SyncController: No more pages or text")
+            self.state = self.STATE.STOPPED
+        end
+    end)
 end
 
 --[[--
@@ -363,7 +366,7 @@ Resume playback.
 function SyncController:resume()
     if self.state == self.STATE.PAUSED then
         self.state = self.STATE.PLAYING
-        -- Adjust start time for pause duration
+        -- Adjust start time to account for the pause duration
         local pause_duration = UIManager:getTime() - self.pause_time
         self.sync_start_time = self.sync_start_time + pause_duration
         
@@ -374,7 +377,8 @@ function SyncController:resume()
             self.playback_bar:updatePlayState(true)
         end
         
-        self:startSyncLoop()
+        -- Restart the sync loop without resetting sync_start_time
+        self:_runSyncLoop()
         logger.dbg("SyncController: Resumed")
     end
 end
@@ -383,21 +387,21 @@ end
 Stop playback.
 --]]
 function SyncController:stop()
-    if self.state ~= self.STATE.STOPPED then
-        self.state = self.STATE.STOPPED
-        self.tts_engine:stop()
-        self.highlight_manager:clearHighlights()
-        
-        -- Hide playback bar
-        self:hidePlaybackBar()
-        
-        self.parsed_data = nil
-        self.current_word_index = 0
-        self.current_sentence_index = 0
-        self.playback_time = 0
-        
-        logger.dbg("SyncController: Stopped")
-    end
+    -- Always clean up the bar and highlights, even if already stopped
+    self.state = self.STATE.STOPPED
+    
+    pcall(function() self.tts_engine:stop() end)
+    pcall(function() self.highlight_manager:clearHighlights() end)
+    
+    -- Hide playback bar
+    self:hidePlaybackBar()
+    
+    self.parsed_data = nil
+    self.current_word_index = 0
+    self.current_sentence_index = 0
+    self.playback_time = 0
+    
+    logger.dbg("SyncController: Stopped")
 end
 
 --[[--
@@ -443,8 +447,8 @@ Seek to a specific time in the audio.
 @param time_ms number Time in milliseconds
 --]]
 function SyncController:seekToTime(time_ms)
-    -- Adjust sync start time to match seek position
-    self.sync_start_time = UIManager:getTime() - (time_ms / 1000)
+    -- Convert ms to FTS and subtract to set the correct start time
+    self.sync_start_time = UIManager:getTime() - time.ms(time_ms)
     self.playback_time = time_ms
     
     -- Update highlights immediately

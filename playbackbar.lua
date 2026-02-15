@@ -40,6 +40,24 @@ local PlaybackBar = InputContainer:extend{
     on_close = nil,
 }
 
+--[[--
+Pass through touch events that land outside our bar area,
+so the reader underneath remains interactive.
+--]]
+function PlaybackBar:handleEvent(event)
+    -- Check if this is a gesture event with a position
+    if event and event.args and event.args[1] then
+        local ges = event.args[1]
+        if ges.pos and self.dimen and self.dimen.y then
+            if ges.pos.y < self.dimen.y then
+                -- Touch is above the bar — let it pass through
+                return false
+            end
+        end
+    end
+    return InputContainer.handleEvent(self, event)
+end
+
 function PlaybackBar:init()
     self.width = self.width or Screen:getWidth()
     self.height = self.height or Screen:scaleBySize(80)

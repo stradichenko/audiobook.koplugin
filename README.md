@@ -35,59 +35,142 @@ A Text-to-Speech plugin with synchronized word highlighting for KOReader e-reade
 
 
 ### Kobo (with USB-C headphones or Bluetooth)
-**IMPORTANT:** Kobo devices do not have built-in TTS. You need to install espeak-ng and aplay manually. No coding is required, but you will need to connect to your Kobo using your computer. Follow these steps:
 
-#### 1. Connect to your Kobo with SSH
+**IMPORTANT:** Kobo devices do not come with a TTS (text-to-speech) engine. You need to install **espeak-ng** once before this plugin will work. No coding experience is needed — just follow the steps below carefully.
 
-1. On your Kobo, enable **Developer Mode** (search for `devmodeon` in the search bar).
-2. Enable **Wi-Fi** and find your Kobo's IP address (in KOReader: Menu → More → Device Info).
-3. On your computer, open a terminal (or use an app like [PuTTY](https://www.putty.org/) on Windows).
-4. Connect to your Kobo by typing:
-   ```bash
-   ssh root@YOUR_KOBO_IP
-   # The password is usually: root
-   ```
-   If you get a warning about authenticity, type `yes` and press Enter.
+---
 
-#### 2. Install espeak-ng and aplay
+#### Step 1: Install the Plugin via USB
 
-**Option A: Using NiLuJe's package manager (recommended)**
+This is the easiest part. You don't need Wi-Fi or SSH for this.
 
-If you have the package manager (pkm) installed:
-   ```bash
-   pkm install espeak-ng
-   pkm install alsa-utils
-   ```
-This will install both espeak-ng (TTS) and aplay (audio player).
+1. **Connect your Kobo to your computer** using the USB cable.
+2. Your Kobo will appear as a USB drive on your computer.
+3. Navigate to the hidden `.adds/koreader/plugins/` folder.
+   - **On Windows:** You may need to enable "Show hidden files" in File Explorer (View → Show → Hidden items).
+   - **On Mac:** Press `Cmd + Shift + .` in Finder to show hidden folders.
+   - **On Linux:** Press `Ctrl + H` in your file manager.
+4. Copy the entire `audiobook.koplugin` folder into that `plugins/` folder.
+5. Eject the Kobo safely and unplug it.
 
-**Option B: Manual download**
+---
 
-If you do not have pkm, you can download pre-built packages from:
-   https://github.com/nickel-packages/packages
+#### Step 2: Connect to Your Kobo (to install espeak-ng)
 
-Follow the instructions on that page to copy the `.ipk` files to your Kobo and install them using:
-   ```bash
-   opkg install /mnt/onboard/your-package-file.ipk
-   ```
+You have **two options** — pick whichever is easier for you:
 
-#### 3. Test TTS and Audio
+##### Option A: Use KOReader's Built-in Terminal (easiest — no computer needed)
 
-After installation, test that everything works:
-   ```bash
-   espeak-ng "hello Kobo" -w /tmp/test.wav
-   aplay /tmp/test.wav
-   ```
-You should hear "hello Kobo" through your headphones. If you do, you are ready to use the plugin!
+KOReader has a terminal emulator that lets you type commands directly on your Kobo.
 
-#### 4. Troubleshooting
+1. Open KOReader on your Kobo.
+2. Tap the top of the screen to open the menu bar.
+3. Go to **☰ (hamburger menu) → More tools → Terminal emulator**.
+4. A text input will appear where you can type commands.
+5. Continue to **Step 3** below and type the commands there.
 
-- If you see `command not found`, the package did not install correctly. Try rebooting your Kobo and repeat the steps.
-- If you hear no sound, make sure your headphones are plugged in before running the commands. Some USB-C adapters may not be supported.
-- For Bluetooth, pair your headphones in KOReader or Kobo settings first.
+##### Option B: Connect via SSH from Your Computer
+
+KOReader has a **built-in SSH server** — you do NOT need `devmodeon` or developer mode.
+
+1. On your Kobo, open **KOReader**.
+2. Make sure **Wi-Fi is on** and connected to your home network.
+3. Tap the top of the screen → **☰ (hamburger menu) → Network → SSH server**.
+4. Check **"Login without password (DANGEROUS)"** (you can disable this later).
+5. Check **"SSH server"** to start it.
+6. A popup will show your Kobo's **IP address** (e.g., `192.168.1.14`).
+
+Now, on your computer:
+
+- **Windows:** Download and open [PuTTY](https://www.putty.org/). Enter the IP address, set port to **2222**, and click Open.
+- **Mac/Linux:** Open a terminal and type:
+
+```bash
+ssh root@192.168.1.14 -p 2222
+```
+
+> ⚠️ **The port is 2222, not 22!** This is the most common mistake.
+
+The password is **root**. If asked about authenticity, type `yes` and press Enter.
+
+---
+
+#### Step 3: Check What's Already Installed
+
+Once you're connected (via Terminal emulator or SSH), type these commands one at a time:
+
+```bash
+which espeak-ng
+```
+
+```bash
+which aplay
+```
+
+- If either command shows a path (like `/usr/bin/espeak-ng`), that tool is already installed.
+- If it says `not found` or shows nothing, you need to install it.
+
+---
+
+#### Step 4: Install espeak-ng
+
+**Try the package manager first:**
+
+```bash
+opkg update
+opkg install espeak-ng
+```
+
+If `opkg` is not found, try:
+
+```bash
+pkm install espeak-ng
+```
+
+If neither works, you'll need to download espeak-ng manually:
+
+1. On your computer, visit: https://github.com/nickel-packages/packages
+2. Download the espeak-ng `.ipk` file for your Kobo's architecture (usually ARM).
+3. Connect your Kobo via USB and copy the `.ipk` file to the root of your Kobo's storage.
+4. Then via SSH or Terminal emulator:
+
+```bash
+opkg install /mnt/onboard/espeak-ng*.ipk
+```
+
+---
+
+#### Step 5: Test That It Works
+
+Plug in your headphones, then type:
+
+```bash
+espeak-ng "hello" -w /tmp/test.wav
+aplay /tmp/test.wav
+```
+
+- If you hear "hello" through your headphones — **you're all set!** 🎉
+- If you hear nothing, see Troubleshooting below.
+
+---
+
+#### Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `espeak-ng: command not found` | espeak-ng is not installed. Repeat Step 4. |
+| `aplay: command not found` | Try: `opkg install alsa-utils` |
+| No sound through headphones | Make sure headphones are plugged in **before** running the command. Try `aplay -l` to list audio devices. |
+| `ssh: Connection refused` on port 22 | Use port **2222** instead: `ssh root@IP -p 2222` |
+| SSH server not showing in menu | Make sure you are in **KOReader** (not Kobo's default reader). Go to ☰ → Network → SSH server. |
+| Can't find `.adds` folder via USB | Enable "show hidden files" on your computer. The folder starts with a dot. |
 
 **Need more help?**
-- See the [KOReader Wiki](https://github.com/koreader/koreader/wiki) for more details.
-- Ask for help on the [KOReader Community Forum](https://www.mobileread.com/forums/forumdisplay.php?f=276).
+
+- [KOReader SSH Wiki](https://github.com/koreader/koreader/wiki/SSH)
+- [KOReader Community Forum](https://www.mobileread.com/forums/forumdisplay.php?f=276)
+
+---
 
 ### Linux/Desktop
 One of the following TTS engines must be installed:

@@ -41,6 +41,7 @@ function Audiobook:init()
     self.text_parser = TextParser:new()
     self.tts_engine = TTSEngine:new{
         plugin = self,
+        plugin_dir = PLUGIN_PATH:sub(1, -2), -- strip trailing slash
     }
     self.highlight_manager = HighlightManager:new{
         plugin = self,
@@ -75,7 +76,7 @@ end
 function Audiobook:addToMainMenu(menu_items)
     menu_items.audiobook = {
         text = _("🔊 Audiobook Read-Along"),
-        sorting_hint = "tts",  -- Place near TTS/speech related items
+        sorting_hint = "tools",
         sub_item_table = {
             {
                 text = _("▶ Start reading from current page"),

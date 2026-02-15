@@ -10,6 +10,7 @@ local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
 local ffiutil = require("ffi/util")
 local logger = require("logger")
+local time = require("ui/time")
 local _ = require("gettext")
 
 local TTSEngine = {
@@ -20,7 +21,6 @@ local TTSEngine = {
         FLITE = "flite",
         FESTIVAL = "festival",
         ANDROID = "android",
-        PICOTTS = "picotts",  -- Kobo bundled
     },
     
     -- Default settings
@@ -63,9 +63,25 @@ function TTSEngine:detectBackend()
         logger.dbg("TTSEngine: Using Android TTS")
         return
     end
-    
-    -- Check for available TTS engines
-    -- Order: prefer Kobo-compatible options first
+
+    -- Check for bundled espeak-ng inside our own plugin directory
+    -- Installed at: /mnt/onboard/.adds/koreader/plugins/audiobook.koplugin/espeak-ng/
+    local plugin_dir = self.plugin_dir or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin"
+    local bundled_base = plugin_dir .. "/espeak-ng"
+    local bundled_bin = bundled_base .. "/bin/espeak-ng"
+    local f = io.open(bundled_bin, "r")
+    if f then
+        f:close()
+        self.backend = self.BACKENDS.ESPEAK
+        self.backend_cmd = bundled_bin
+        self.espeak_lib_path = bundled_base .. "/lib"
+        self.espeak_data_path = bundled_base .. "/share"
+        self.espeak_linker = bundled_base .. "/lib/ld-linux-armhf.so.3"
+        logger.dbg("TTSEngine: Found bundled espeak-ng at", bundled_bin)
+        return
+    end
+
+    -- Fall back to system PATH
     local backends_to_try = {
         {name = self.BACKENDS.ESPEAK, cmd = "espeak-ng"},
         {name = self.BACKENDS.ESPEAK, cmd = "espeak"},
@@ -194,15 +210,12 @@ Synthesize using command-line TTS.
 @return boolean Success
 --]]
 function TTSEngine:synthesizeCommand(text, callback)
-    local temp_dir = os.getenv("TMPDIR") or os.getenv("HOME") or "/tmp"
+    -- /tmp always exists on Kobo; HOME and TMPDIR may point to nonexistent paths
+    local temp_dir = "/tmp"
     local audio_file = temp_dir .. "/audiobook_tts_" .. os.time() .. ".wav"
     local timing_file = temp_dir .. "/audiobook_timing_" .. os.time() .. ".txt"
     
-    -- Ensure temp directory exists
-    os.execute("mkdir -p " .. temp_dir)
-    
     local cmd
-    local rate_param = ""
     
     -- Limit text length to avoid command line issues
     local max_text_len = 1000
@@ -214,9 +227,23 @@ function TTSEngine:synthesizeCommand(text, callback)
     if self.backend == self.BACKENDS.ESPEAK then
         -- espeak-ng supports word timing output
         local speed = math.floor(175 * self.rate) -- Default is 175 wpm
+        -- Build invocation for bundled espeak-ng on Kobo:
+        -- Use the bundled ld-linux to bypass the ancient system glibc (2.11)
+        local exec_prefix = ""
+        if self.espeak_linker then
+            exec_prefix = string.format(
+                "ESPEAK_DATA_PATH=%s %s --library-path %s ",
+                self.espeak_data_path, self.espeak_linker, self.espeak_lib_path
+            )
+        elseif self.espeak_lib_path then
+            exec_prefix = string.format(
+                "LD_LIBRARY_PATH=%s ESPEAK_DATA_PATH=%s ",
+                self.espeak_lib_path, self.espeak_data_path
+            )
+        end
         cmd = string.format(
-            '%s -v en -s %d -w "%s" "%s" 2>&1',
-            self.backend_cmd, speed, audio_file, self:escapeText(text)
+            '%s%s -v en -s %d -w "%s" "%s" 2>&1',
+            exec_prefix, self.backend_cmd, speed, audio_file, self:escapeText(text)
         )
     elseif self.backend == self.BACKENDS.PICO then
         cmd = string.format(
@@ -439,9 +466,10 @@ function TTSEngine:play(on_word, on_complete)
     local player = self:findAudioPlayer()
     if not player then
         logger.err("TTSEngine: No audio player found")
+        self.player_error = true
         UIManager:show(InfoMessage:new{
-            text = _("No audio player found.\n\nNeeded: aplay, paplay, or mpv.\n\nConnect headphones and ensure audio is working."),
-            timeout = 5,
+            text = _("No audio output available.\n\nKobo has no built-in speaker.\n\nPlease pair Bluetooth headphones:\nSettings → Bluetooth → Pair\n\nThen try again."),
+            timeout = 8,
         })
         self.is_speaking = false
         if on_complete then
@@ -453,7 +481,16 @@ function TTSEngine:play(on_word, on_complete)
     logger.dbg("TTSEngine: Using player:", player)
     logger.dbg("TTSEngine: Audio file:", self.current_audio_file)
     
-    local cmd = string.format('%s "%s" &', player, self.current_audio_file)
+    local cmd
+    if self.audio_player_type == "gst-bt" then
+        -- GStreamer pipeline: convert to S16LE/48kHz/stereo for Kobo BT A2DP sink
+        cmd = string.format(
+            'gst-launch-1.0 filesrc location="%s" ! wavparse ! audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink &',
+            self.current_audio_file
+        )
+    else
+        cmd = string.format('%s "%s" &', player, self.current_audio_file)
+    end
     logger.dbg("TTSEngine: Playing:", cmd)
     
     local result = os.execute(cmd)
@@ -467,28 +504,56 @@ end
 
 --[[--
 Find available audio player.
+Sets self.audio_player_type to "gst-bt", "aplay", or "generic".
 @return string|nil Player command
 --]]
 function TTSEngine:findAudioPlayer()
+    -- 1) GStreamer with Kobo Bluetooth A2DP sink (primary on Kobo Libra Colour etc.)
+    if self:commandExists("gst-launch-1.0") then
+        local handle = io.popen("gst-inspect-1.0 mtkbtmwrpcaudiosink 2>/dev/null | head -1")
+        if handle then
+            local result = handle:read("*a")
+            handle:close()
+            if result and result:match("Factory Details") then
+                self.audio_player_type = "gst-bt"
+                logger.dbg("TTSEngine: Found GStreamer with Bluetooth audio sink")
+                return "gst-launch-1.0"
+            end
+        end
+    end
+
+    -- 2) Check if any ALSA soundcard exists (required for aplay)
+    local has_soundcard = false
+    local cards = io.open("/proc/asound/cards", "r")
+    if cards then
+        local content = cards:read("*a")
+        cards:close()
+        has_soundcard = content and not content:match("no soundcards")
+    end
+
     -- Order by preference for e-ink/Kobo devices
-    local players = {
-        {cmd = "aplay", args = "-q"},  -- ALSA - most common on embedded
-        {cmd = "paplay", args = ""},   -- PulseAudio
-        {cmd = "mpv", args = "--no-video --really-quiet"},
-        {cmd = "mplayer", args = "-really-quiet"},
-        {cmd = "play", args = "-q"},   -- SoX
-    }
-    
+    local players = {}
+    if has_soundcard then
+        table.insert(players, {cmd = "aplay", args = "-q -D default"})
+        table.insert(players, {cmd = "aplay", args = "-q -D hw:0,0"})
+        table.insert(players, {cmd = "aplay", args = "-q"})
+    end
+    table.insert(players, {cmd = "paplay", args = ""})
+    table.insert(players, {cmd = "mpv", args = "--no-video --really-quiet"})
+    table.insert(players, {cmd = "mplayer", args = "-really-quiet"})
+    table.insert(players, {cmd = "play", args = "-q"})
+
     for _, player in ipairs(players) do
         if self:commandExists(player.cmd) then
             logger.dbg("TTSEngine: Found audio player:", player.cmd)
+            self.audio_player_type = player.cmd == "aplay" and "aplay" or "generic"
             if player.args and player.args ~= "" then
                 return player.cmd .. " " .. player.args
             end
             return player.cmd
         end
     end
-    
+
     return nil
 end
 
@@ -498,13 +563,22 @@ Start the timing loop to call word callbacks.
 function TTSEngine:startTimingLoop()
     self.playback_start_time = UIManager:getTime()
     self.current_word_index = 0
-    
+    self:_runTimingLoop()
+end
+
+--[[--
+Run the timing update loop.
+Separated from startTimingLoop so that resume can restart the loop
+without resetting playback_start_time.
+--]]
+function TTSEngine:_runTimingLoop()
     local function updateTiming()
         if not self.is_speaking or self.is_paused then
             return
         end
         
-        local elapsed = (UIManager:getTime() - self.playback_start_time) * 1000 -- ms
+        -- FTS values are plain numbers (µs precision); time.to_ms converts diff to ms
+        local elapsed = time.to_ms(UIManager:getTime() - self.playback_start_time)
         
         -- Find current word based on timing
         for i, timing in ipairs(self.timing_data) do
@@ -556,8 +630,10 @@ function TTSEngine:pause()
     if self.is_speaking and not self.is_paused then
         self.is_paused = true
         self.pause_time = UIManager:getTime()
-        -- Kill audio player
-        os.execute("pkill -f '" .. self.current_audio_file .. "' 2>/dev/null")
+        -- Freeze the audio player process (SIGSTOP) so it can resume in place
+        if self.current_audio_file then
+            os.execute("pkill -STOP -f '" .. self.current_audio_file .. "' 2>/dev/null")
+        end
         logger.dbg("TTSEngine: Paused")
     end
 end
@@ -568,14 +644,15 @@ Resume playback.
 function TTSEngine:resume()
     if self.is_speaking and self.is_paused then
         self.is_paused = false
-        -- Adjust start time for pause duration
+        -- Adjust start time to account for the pause duration
         local pause_duration = UIManager:getTime() - self.pause_time
         self.playback_start_time = self.playback_start_time + pause_duration
-        
-        -- Resume from current position (simplified - plays from beginning)
-        -- Full implementation would seek to current position
-        self:play(self.on_word_callback, self.on_complete_callback)
-        
+        -- Unfreeze the audio player process (SIGCONT) — resumes exactly where it stopped
+        if self.current_audio_file then
+            os.execute("pkill -CONT -f '" .. self.current_audio_file .. "' 2>/dev/null")
+        end
+        -- Restart the timing loop (it exited when is_paused was true)
+        self:_runTimingLoop()
         logger.dbg("TTSEngine: Resumed")
     end
 end
@@ -588,7 +665,7 @@ function TTSEngine:stop()
         self.is_speaking = false
         self.is_paused = false
         
-        -- Kill audio player
+        -- Kill audio player (matches both aplay and gst-launch-1.0 by filename)
         if self.current_audio_file then
             os.execute("pkill -f '" .. self.current_audio_file .. "' 2>/dev/null")
         end
@@ -602,8 +679,12 @@ end
 Clean up temporary files.
 --]]
 function TTSEngine:cleanup()
-    if self.current_audio_file and ffiutil.pathExists(self.current_audio_file) then
-        os.remove(self.current_audio_file)
+    if self.current_audio_file then
+        local f = io.open(self.current_audio_file, "r")
+        if f then
+            f:close()
+            os.remove(self.current_audio_file)
+        end
         self.current_audio_file = nil
     end
 end

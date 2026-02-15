@@ -1,0 +1,9 @@
+# Build output
+kobo-tts-bundle/
+
+# Bundled binaries (packaged by package-for-kobo.sh)
+espeak-ng/
+
+# Temp files
+*.wav
+*.tmp
