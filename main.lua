@@ -37,6 +37,7 @@ function Audiobook:init()
     local TTSEngine = dofile(PLUGIN_PATH .. "ttsengine.lua")
     local HighlightManager = dofile(PLUGIN_PATH .. "highlightmanager.lua")
     local SyncController = dofile(PLUGIN_PATH .. "synccontroller.lua")
+    self.bt_manager = dofile(PLUGIN_PATH .. "btmanager.lua")
     
     self.text_parser = TextParser:new()
     self.tts_engine = TTSEngine:new{
@@ -159,6 +160,18 @@ function Audiobook:addToMainMenu(menu_items)
                     self:toggleSetting("highlight_sentences")
                 end,
             },
+            {
+                text = "――――――――――",
+                enabled = false,
+            },
+            {
+                text_func = function()
+                    return self:btMenuLabel()
+                end,
+                sub_item_table_func = function()
+                    return self:buildBluetoothMenu()
+                end,
+            },
         },
     }
 end
@@ -229,6 +242,294 @@ function Audiobook:buildHighlightStyleMenu()
     end
     
     return menu
+end
+
+--- Top-level label for the Bluetooth menu entry.
+-- Shows connected device name when available.
+function Audiobook:btMenuLabel()
+    local bt = self.bt_manager
+    if not bt:isPowered() then
+        return _("⚫ Bluetooth (off)")
+    end
+    -- Find a connected device to show its name
+    local devices = bt:listAudioDevices()
+    for _i, dev in ipairs(devices) do
+        if dev.connected then
+            local dname = dev.name ~= "" and dev.name or dev.address
+            return T(_("🔵 BT: %1"), dname)
+        end
+    end
+    -- Powered but nothing connected
+    local saved = self:getSetting("bt_device_name", nil)
+    if saved then
+        return T(_("🔵 BT: %1 (not connected)"), saved)
+    end
+    return _("🔵 Bluetooth (on — no device)")
+end
+
+function Audiobook:buildBluetoothMenu()
+    local bt = self.bt_manager
+    local powered = bt:isPowered()
+    local menu = {}
+
+    -- Power toggle
+    table.insert(menu, {
+        text = powered and _("⏻ Turn Bluetooth off") or _("⏻ Turn Bluetooth on"),
+        callback = function()
+            if powered then
+                bt:powerOff()
+                self:setSetting("bt_device_addr", nil)
+                UIManager:show(InfoMessage:new{
+                    text = _("Bluetooth turned off."),
+                    timeout = 2,
+                })
+            else
+                UIManager:show(InfoMessage:new{
+                    text = _("Turning Bluetooth on…"),
+                    timeout = 1,
+                })
+                local ok = bt:powerOn()
+                UIManager:show(InfoMessage:new{
+                    text = ok and _("Bluetooth is on.") or _("Failed to power on Bluetooth."),
+                    timeout = 2,
+                })
+            end
+        end,
+    })
+
+    if not powered then
+        return menu
+    end
+
+    table.insert(menu, {
+        text = "――――――――――",
+        enabled = false,
+    })
+
+    -- Scan for devices
+    table.insert(menu, {
+        text = _("🔍 Scan for new devices…"),
+        callback = function()
+            self:btScanAndShow()
+        end,
+    })
+
+    table.insert(menu, {
+        text = "――――――――――",
+        enabled = false,
+    })
+
+    -- List known / visible devices — single-tap to connect
+    local devices = bt:listAudioDevices()
+    if #devices == 0 then
+        table.insert(menu, {
+            text = _("No devices found. Tap Scan above."),
+            enabled = false,
+        })
+    end
+    for _, dev in ipairs(devices) do
+        local label = dev.name ~= "" and dev.name or dev.address
+        local icon = "  "
+        if dev.connected then
+            icon = "🔗 "
+        elseif dev.paired then
+            icon = "✓ "
+        end
+        table.insert(menu, {
+            text = icon .. label,
+            -- Tap = connect (or disconnect if already connected)
+            callback = function()
+                self:btQuickConnect(dev)
+            end,
+            -- Hold = show more actions (forget, info)
+            hold_callback = function(touchmenu_instance)
+                self:btDeviceHoldMenu(dev, touchmenu_instance)
+            end,
+            checked_func = function()
+                return dev.connected
+            end,
+        })
+    end
+
+    return menu
+end
+
+--- Quick connect/disconnect: tap on a device row in the BT menu.
+function Audiobook:btQuickConnect(dev)
+    local bt = self.bt_manager
+    local name = dev.name ~= "" and dev.name or dev.address
+
+    if dev.connected then
+        -- Already connected → disconnect
+        bt:disconnect(dev.address)
+        self:setSetting("bt_device_addr", nil)
+        self:setSetting("bt_device_name", nil)
+        UIManager:show(InfoMessage:new{
+            text = T(_("Disconnected from %1."), name),
+            timeout = 2,
+        })
+        return
+    end
+
+    -- Connecting
+    UIManager:show(InfoMessage:new{
+        text = T(_("Connecting to %1…"), name),
+        timeout = 1,
+    })
+    UIManager:scheduleIn(0.3, function()
+        -- Pair first if needed
+        if not dev.paired then
+            local ok, err = bt:pair(dev.address)
+            if not ok then
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Pairing failed: %1"), err or "unknown"),
+                    timeout = 4,
+                })
+                return
+            end
+        end
+        local ok, err = bt:connect(dev.address)
+        if ok then
+            -- Remember this as the preferred device
+            self:setSetting("bt_device_addr", dev.address)
+            self:setSetting("bt_device_name", name)
+            UIManager:show(InfoMessage:new{
+                text = T(_("Connected to %1."), name),
+                timeout = 2,
+            })
+        else
+            UIManager:show(InfoMessage:new{
+                text = T(_("Connection failed: %1"), err or "unknown"),
+                timeout = 3,
+            })
+        end
+    end)
+end
+
+--- Long-press on a device row: show additional actions.
+function Audiobook:btDeviceHoldMenu(dev, touchmenu_instance)
+    local bt = self.bt_manager
+    local name = dev.name ~= "" and dev.name or dev.address
+    local ButtonDialog = require("ui/widget/buttondialog")
+
+    local buttons = {}
+
+    if dev.connected then
+        table.insert(buttons, {{
+            text = _("Disconnect"),
+            callback = function()
+                UIManager:close(self._bt_dialog)
+                bt:disconnect(dev.address)
+                self:setSetting("bt_device_addr", nil)
+                self:setSetting("bt_device_name", nil)
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Disconnected from %1."), name),
+                    timeout = 2,
+                })
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        }})
+    else
+        table.insert(buttons, {{
+            text = _("Connect"),
+            callback = function()
+                UIManager:close(self._bt_dialog)
+                self:btQuickConnect(dev)
+                if touchmenu_instance then
+                    UIManager:scheduleIn(4, function()
+                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                    end)
+                end
+            end,
+        }})
+    end
+
+    if dev.paired then
+        table.insert(buttons, {{
+            text = _("Forget (un-pair)"),
+            callback = function()
+                UIManager:close(self._bt_dialog)
+                bt:remove(dev.address)
+                if dev.address == self:getSetting("bt_device_addr", nil) then
+                    self:setSetting("bt_device_addr", nil)
+                    self:setSetting("bt_device_name", nil)
+                end
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Removed %1."), name),
+                    timeout = 2,
+                })
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+            end,
+        }})
+    end
+
+    table.insert(buttons, {{
+        text = T(_("%1"), dev.address),
+        enabled = false,
+    }})
+
+    table.insert(buttons, {{
+        text = _("Cancel"),
+        callback = function()
+            UIManager:close(self._bt_dialog)
+        end,
+    }})
+
+    self._bt_dialog = ButtonDialog:new{
+        title = name,
+        buttons = buttons,
+    }
+    UIManager:show(self._bt_dialog)
+end
+
+function Audiobook:btScanAndShow()
+    local bt = self.bt_manager
+
+    -- Ensure powered
+    if not bt:isPowered() then
+        local ok = bt:powerOn()
+        if not ok then
+            UIManager:show(InfoMessage:new{
+                text = _("Could not power on Bluetooth."),
+                timeout = 3,
+            })
+            return
+        end
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = _("Scanning for Bluetooth devices…\n\nPlease wait 8 seconds."),
+        timeout = 2,
+    })
+
+    -- Run the scan in a deferred callback so the InfoMessage can render
+    UIManager:scheduleIn(0.5, function()
+        bt:startDiscovery()
+        -- Wait for scan results, then stop and show device list
+        UIManager:scheduleIn(8, function()
+            bt:stopDiscovery()
+            local devices = bt:listAudioDevices()
+            local lines = {}
+            for _, dev in ipairs(devices) do
+                local tag = ""
+                if dev.connected then
+                    tag = " 🔗"
+                elseif dev.paired then
+                    tag = " ✓"
+                end
+                local name = dev.name ~= "" and dev.name or dev.address
+                table.insert(lines, name .. tag)
+            end
+            if #lines == 0 then
+                table.insert(lines, _("No audio devices found."))
+            end
+            UIManager:show(InfoMessage:new{
+                text = _("Scan complete:\n\n") .. table.concat(lines, "\n")
+                    .. _("\n\nOpen the Bluetooth menu to connect."),
+                timeout = 6,
+            })
+        end)
+    end)
 end
 
 function Audiobook:startReadAlong(text, start_pos)
@@ -432,6 +733,58 @@ end
 -- Our SyncController manages page flow via advanceToNextPage().
 -- Having onPageUpdate here caused an infinite restart loop:
 -- highlight → screen refresh → PageUpdate → updateText → stop audio → restart → highlight → ...
+
+-- Auto-pause TTS when any KOReader menu or popup opens.
+-- This lets the user interact with menus without TTS talking over them.
+function Audiobook:onShowReaderMenu()
+    if self.sync_controller:isPlaying() then
+        self._paused_by_menu = true
+        self.sync_controller:pause()
+    end
+end
+
+function Audiobook:onCloseReaderMenu()
+    if self._paused_by_menu then
+        self._paused_by_menu = false
+        if self.sync_controller:isPaused() then
+            self.sync_controller:resume()
+        end
+    end
+end
+
+-- Also pause for the config/bottom menu
+function Audiobook:onShowConfigMenu()
+    if self.sync_controller:isPlaying() then
+        self._paused_by_menu = true
+        self.sync_controller:pause()
+    end
+end
+
+function Audiobook:onCloseConfigMenu()
+    if self._paused_by_menu then
+        self._paused_by_menu = false
+        if self.sync_controller:isPaused() then
+            self.sync_controller:resume()
+        end
+    end
+end
+
+-- Pause on device suspend (sleep)
+function Audiobook:onSuspend()
+    if self.sync_controller:isPlaying() then
+        self._paused_by_menu = true
+        self.sync_controller:pause()
+    end
+end
+
+function Audiobook:onResume()
+    if self._paused_by_menu then
+        self._paused_by_menu = false
+        if self.sync_controller:isPaused() then
+            self.sync_controller:resume()
+        end
+    end
+end
 
 function Audiobook:onCloseDocument()
     self:stopReadAlong()

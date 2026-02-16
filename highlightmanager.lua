@@ -85,89 +85,120 @@ sentence's first and last word. We do this by searching through the
 visible text positions.
 --]]
 function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc)
-    -- First, clear any existing selection
+    -- Clear any existing selection
     pcall(function() doc:clearSelection() end)
 
-    -- We need to map the sentence text to screen positions.
-    -- Get the full visible text with its xpointer range
+    -- Get xpointer range for full visible text
     local full_res = doc:getTextFromPositions(
         {x = 0, y = 0},
         {x = Screen:getWidth(), y = Screen:getHeight()},
-        true  -- do_not_draw_selection = true (just get text + positions)
+        true
     )
-    if not full_res or not full_res.text or not full_res.pos0 or not full_res.pos1 then
+    if not full_res or not full_res.pos0 or not full_res.pos1 then
         return
     end
 
-    -- Find the sentence text within the full visible text
-    local sentence_text = sentence.text
-    -- Use first few words for a robust match
-    local search_pat = sentence_text:sub(1, math.min(40, #sentence_text))
-    -- Escape pattern special chars
-    search_pat = search_pat:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-    local vis_start = full_res.text:find(search_pat)
+    local function ws(s) return s:gsub("%s+", " "):match("^%s*(.-)%s*$") end
+    local sent_text = ws(sentence.text)
+    if sent_text == "" then return end
 
-    if not vis_start then
-        -- Try with fewer characters
-        search_pat = sentence_text:sub(1, math.min(20, #sentence_text))
-        search_pat = search_pat:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-        vis_start = full_res.text:find(search_pat)
-    end
-
-    if not vis_start then
-        logger.dbg("HighlightManager: Could not find sentence in visible text")
-        return
-    end
-
-    -- Get the screen boxes for the full text to understand line layout
+    -- Get per-line screen boxes
     local sboxes = doc:getScreenBoxesFromPositions(full_res.pos0, full_res.pos1, true)
-    if not sboxes or #sboxes == 0 then
-        logger.dbg("HighlightManager: No screen boxes for visible text")
-        return
+    if not sboxes or #sboxes == 0 then return end
+    local n = #sboxes
+
+    -- ── Build the visible text line-by-line ──
+    -- Query each line individually and concatenate. This guarantees that
+    -- our cumulative character offsets are perfectly aligned with the
+    -- concatenated text we search through.
+    local line_texts = {}   -- normalized text per line
+    local built_text = ""   -- concatenated full text
+    local cum = {[0] = 0}   -- cum[i] = char offset at END of line i in built_text
+
+    for i = 1, n do
+        local box = sboxes[i]
+        local r = doc:getTextFromPositions(
+            {x = box.x, y = box.y + math.floor(box.h / 2)},
+            {x = box.x + box.w - 1, y = box.y + math.floor(box.h / 2)},
+            true)
+        local lt = (r and r.text) and ws(r.text) or ""
+        line_texts[i] = lt
+        if i > 1 and lt ~= "" then
+            built_text = built_text .. " "
+        end
+        built_text = built_text .. lt
+        cum[i] = #built_text
     end
 
-    local total_chars = #full_res.text
-    local total_lines = #sboxes
-    if total_chars == 0 or total_lines == 0 then return end
+    -- Find the sentence in our built text
+    local vis_start = built_text:find(sent_text, 1, true)
+    if not vis_start then
+        -- Fall back to first 40 chars
+        vis_start = built_text:find(sent_text:sub(1, math.min(40, #sent_text)), 1, true)
+    end
+    if not vis_start then
+        logger.dbg("HighlightManager: sentence not found:",
+            sent_text:sub(1, 50))
+        return
+    end
+    local vis_end = vis_start + #sent_text - 1
 
-    -- Find the sentence end position in visible text
-    local vis_end = vis_start + #sentence_text - 1
-    if vis_end > total_chars then vis_end = total_chars end
+    -- Find start and end lines
+    local start_line = 1
+    for i = 1, n do
+        if cum[i] >= vis_start then
+            start_line = i
+            break
+        end
+    end
 
-    -- Estimate: characters per line (rough average)
-    local chars_per_line = total_chars / total_lines
-    local start_line = math.max(1, math.floor((vis_start - 1) / chars_per_line) + 1)
-    local end_line = math.min(total_lines, math.floor((vis_end - 1) / chars_per_line) + 1)
+    local end_line = n
+    for i = start_line, n do
+        if cum[i] >= vis_end then
+            end_line = i
+            break
+        end
+    end
 
-    -- Get approximate screen coordinates for selection start and end
-    local start_box = sboxes[start_line]
-    local end_box = sboxes[end_line]
-    if not start_box or not end_box then return end
+    local sb = sboxes[start_line]
+    local eb = sboxes[end_line]
+    if not sb or not eb then return end
 
-    -- Estimate x position within line for start
-    local start_char_in_line = vis_start - (start_line - 1) * chars_per_line
-    local start_x = start_box.x + math.floor(start_char_in_line / chars_per_line * start_box.w)
-    start_x = math.max(start_box.x, math.min(start_box.x + start_box.w - 1, start_x))
+    -- Estimate x within the start line
+    local sl_total = cum[start_line] - cum[start_line - 1]
+    local sl_off   = vis_start - cum[start_line - 1]
+    local start_x
+    if sl_total > 0 then
+        start_x = sb.x + math.floor((sl_off / sl_total) * sb.w)
+    else
+        start_x = sb.x
+    end
+    start_x = math.max(sb.x, math.min(sb.x + sb.w - 1, start_x))
 
-    -- Estimate x position within line for end
-    local end_char_in_line = vis_end - (end_line - 1) * chars_per_line
-    local end_x = end_box.x + math.floor(end_char_in_line / chars_per_line * end_box.w)
-    end_x = math.max(end_box.x, math.min(end_box.x + end_box.w - 1, end_x))
+    -- Estimate x within the end line
+    local el_total = cum[end_line] - cum[end_line - 1]
+    local el_off   = vis_end - cum[end_line - 1]
+    local end_x
+    if el_total > 0 then
+        end_x = eb.x + math.floor((el_off / el_total) * eb.w)
+    else
+        end_x = eb.x + eb.w
+    end
+    end_x = math.max(eb.x, math.min(eb.x + eb.w - 1, end_x))
 
-    -- Now call getTextFromPositions WITHOUT do_not_draw_selection
-    -- This tells crengine to draw the selection highlight natively
+    -- Draw the native crengine selection
     local sel = doc:getTextFromPositions(
-        {x = start_x, y = start_box.y + math.floor(start_box.h / 2)},
-        {x = end_x,   y = end_box.y + math.floor(end_box.h / 2)},
-        false  -- do_not_draw_selection = false → crengine draws the highlight
+        {x = start_x, y = sb.y + math.floor(sb.h / 2)},
+        {x = end_x,   y = eb.y + math.floor(eb.h / 2)},
+        false  -- draw selection
     )
 
     if sel then
         self._selection_active = true
         self.is_highlighting = true
-        -- Refresh screen to show the crengine-drawn selection
         UIManager:setDirty(self.ui.dialog or "all", "ui")
-        logger.dbg("HighlightManager: Highlighted sentence via native selection, lines", start_line, "-", end_line)
+        logger.dbg("HighlightManager: Highlighted lines", start_line, "-", end_line,
+            "selected:", sel.text and sel.text:sub(1, 40) or "?")
     end
 end
 

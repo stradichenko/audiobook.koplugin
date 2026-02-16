@@ -41,22 +41,24 @@ local PlaybackBar = InputContainer:extend{
 }
 
 --[[--
-Pass through touch events that land outside our bar area,
-so the reader underneath remains interactive.
+Pass through ALL events that are not inside our bar area.
+Return false to let KOReader handle taps/swipes on the reading area,
+open menus, navigate pages, etc.
 --]]
 function PlaybackBar:handleEvent(event)
-    -- Check if this is a gesture event with a position
     if event and event.args and event.args[1] then
         local ges = event.args[1]
-        -- ges must be a table (gesture); some events pass numbers or strings
-        if type(ges) == "table" and ges.pos and self.dimen and self.dimen.y then
-            if ges.pos.y < self.dimen.y then
-                -- Touch is above the bar — let it pass through
-                return false
+        if type(ges) == "table" and ges.pos then
+            -- Only handle events that land inside the bar
+            if self.dimen and self.dimen.y and ges.pos.y >= self.dimen.y then
+                return InputContainer.handleEvent(self, event)
             end
+            -- Everything above the bar → pass through to reader
+            return false
         end
     end
-    return InputContainer.handleEvent(self, event)
+    -- Non-gesture events (timers, etc) → pass through
+    return false
 end
 
 function PlaybackBar:init()
@@ -300,7 +302,14 @@ end
 
 function PlaybackBar:show()
     self.visible = true
-    UIManager:show(self)
+    -- Position at bottom of screen; pass x, y so UIManager knows
+    -- the bar only covers the bottom strip → taps above it pass through.
+    local bar_x = 0
+    local bar_y = Screen:getHeight() - self.dimen.h
+    self.dimen.x = bar_x
+    self.dimen.y = bar_y
+    -- "partial" refresh type; x and y tell UIManager where we live
+    UIManager:show(self, "partial", nil, bar_x, bar_y)
     UIManager:setDirty(self, function()
         return "ui", self.dimen
     end)
@@ -320,10 +329,11 @@ function PlaybackBar:onCloseWidget()
 end
 
 function PlaybackBar:paintTo(bb, x, y)
-    -- Position at bottom of screen
-    local actual_y = Screen:getHeight() - self.dimen.h
+    -- Paint at the correct y position (bottom of screen)
+    -- UIManager passes x, y from the show() call
+    local paint_y = self.dimen.y or (Screen:getHeight() - self.dimen.h)
     if self[1] and self[1].paintTo then
-        self[1]:paintTo(bb, x, actual_y)
+        self[1]:paintTo(bb, x or 0, paint_y)
     end
 end
 

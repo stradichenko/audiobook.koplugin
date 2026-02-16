@@ -534,6 +534,27 @@ function TTSEngine:play(on_word, on_complete)
     
     -- Bump generation to invalidate any stale timing/watcher loops
     self.play_generation = (self.play_generation or 0) + 1
+
+    -- Quick sanity check: if the process died almost immediately, BT is
+    -- likely not connected. gst-launch with mtkbtmwrpcaudiosink exits in
+    -- <0.5s when there is no BT A2DP sink, but lives >2s when streaming.
+    -- We sleep 0.8s in-process (acceptable because we are already blocking
+    -- the UI during synthesis anyway) then check the PID.
+    if self.audio_player_type == "gst-bt" and self.audio_pid then
+        os.execute("sleep 0.8")
+        if not self:_isAudioProcessRunning() then
+            logger.warn("TTSEngine: gst-launch died immediately — BT audio not connected")
+            self.is_speaking = false
+            self.audio_pid = nil
+            self:cleanup()
+            UIManager:show(InfoMessage:new{
+                text = _("Bluetooth audio not connected.\n\nPlease make sure your Bluetooth headphones or speaker are:\n\n1. Powered on\n2. Paired in Kobo Settings → Bluetooth\n3. Connected and within range\n\nThen try again."),
+                timeout = 10,
+            })
+            -- Do NOT call on_complete — this stops the reading chain.
+            return false
+        end
+    end
     
     -- Start timing loop for word highlighting (does NOT detect completion)
     self:startTimingLoop()

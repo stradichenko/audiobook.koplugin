@@ -231,12 +231,10 @@ function SyncController:beginSentencePlayback(sentence)
         -- Start sync loop for highlighting during this sentence
         self:startSentenceSyncLoop(sentence)
     else
-        -- play() failed — skip to next sentence after delay
-        UIManager:scheduleIn(0.2, function()
-            if controller.state ~= controller.STATE.STOPPED then
-                controller:readNextSentence()
-            end
-        end)
+        -- play() failed (BT not connected, no audio device, etc.)
+        -- Stop the entire reading chain rather than skipping endlessly.
+        logger.warn("SyncController: play() failed, stopping read-along")
+        self:stop()
     end
 
     logger.dbg("SyncController: Playback started for sentence", sentence.index)
