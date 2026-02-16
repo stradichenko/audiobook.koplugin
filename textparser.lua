@@ -58,8 +58,13 @@ Normalize text by cleaning up whitespace and special characters.
 @return string Normalized text
 --]]
 function TextParser:normalizeText(text)
-    -- Replace multiple whitespace with single space
-    text = text:gsub("%s+", " ")
+    -- Normalize line endings to \n
+    text = text:gsub("\r\n", "\n")
+    text = text:gsub("\r", "\n")
+    -- Collapse multiple blank lines into one newline
+    text = text:gsub("\n%s*\n+", "\n")
+    -- Replace runs of spaces/tabs (but NOT newlines) with single space
+    text = text:gsub("[ \t]+", " ")
     -- Trim leading/trailing whitespace
     text = text:match("^%s*(.-)%s*$")
     return text
@@ -72,66 +77,78 @@ Parse text into sentences.
 --]]
 function TextParser:parseSentences(text)
     local sentences = {}
-    local pos = 1
-    local sentence_start = 1
     local sentence_index = 1
-    
-    while pos <= #text do
-        local char = text:sub(pos, pos)
-        
-        -- Check for sentence ending
-        if char:match(self.SENTENCE_ENDINGS) then
-            -- Look ahead to handle abbreviations and multiple punctuation
-            local next_char = text:sub(pos + 1, pos + 1)
-            local is_sentence_end = false
-            
-            if next_char == "" or next_char:match("%s") then
-                -- Check if next non-space char is uppercase (new sentence)
-                local rest = text:sub(pos + 1):match("^%s*(%S)")
-                if not rest or rest:match("%u") or pos == #text then
-                    is_sentence_end = true
+
+    -- First split on newlines (paragraph boundaries), then split each
+    -- paragraph on sentence-ending punctuation (.?!) followed by a space.
+    for paragraph in (text .. "\n"):gmatch("([^\n]+)\n") do
+        paragraph = paragraph:match("^%s*(.-)%s*$") -- trim
+        if paragraph and paragraph ~= "" then
+            -- Split paragraph into sentences on .?! followed by whitespace
+            -- We use gmatch to grab chunks ending with punctuation + space,
+            -- then pick up any trailing remainder.
+            local seg_start = 1
+            -- Find positions where a sentence-ending punctuation is followed by a space
+            while seg_start <= #paragraph do
+                -- Match: any chars, then .?! optionally repeated, then a space
+                local seg_end = nil
+                local search_from = seg_start
+                while true do
+                    local p = paragraph:find("[%.%?!][%.%?!]*%s", search_from)
+                    if p then
+                        -- Skip past the punctuation run to find where the space is
+                        local after_punct = paragraph:find("%s", p)
+                        if after_punct then
+                            seg_end = after_punct - 1  -- include last punct, not the space
+                            break
+                        end
+                    end
+                    break
                 end
-            elseif next_char:match("[%.%?!]") then
-                -- Multiple punctuation (e.g., "..." or "?!")
-                -- Continue to find the end
-                is_sentence_end = false
-            else
-                is_sentence_end = true
-            end
-            
-            if is_sentence_end then
-                local sentence_text = text:sub(sentence_start, pos):match("^%s*(.-)%s*$")
-                if sentence_text and sentence_text ~= "" then
+
+                local chunk
+                if seg_end then
+                    chunk = paragraph:sub(seg_start, seg_end)
+                    seg_start = seg_end + 1
+                    -- Skip whitespace between sentences
+                    while seg_start <= #paragraph and paragraph:sub(seg_start, seg_start):match("%s") do
+                        seg_start = seg_start + 1
+                    end
+                else
+                    -- No more punctuation — rest of paragraph is one sentence
+                    chunk = paragraph:sub(seg_start)
+                    seg_start = #paragraph + 1
+                end
+
+                chunk = chunk:match("^%s*(.-)%s*$") -- trim
+                if chunk and chunk ~= "" then
                     table.insert(sentences, {
                         index = sentence_index,
-                        text = sentence_text,
-                        start_pos = sentence_start,
-                        end_pos = pos,
-                        words = {}, -- Will be populated later
+                        text = chunk,
+                        start_pos = 0,  -- recalculated below
+                        end_pos = 0,
+                        words = {},
                     })
                     sentence_index = sentence_index + 1
                 end
-                sentence_start = pos + 1
             end
         end
-        
-        pos = pos + 1
     end
-    
-    -- Handle remaining text as last sentence
-    if sentence_start <= #text then
-        local sentence_text = text:sub(sentence_start):match("^%s*(.-)%s*$")
-        if sentence_text and sentence_text ~= "" then
-            table.insert(sentences, {
-                index = sentence_index,
-                text = sentence_text,
-                start_pos = sentence_start,
-                end_pos = #text,
-                words = {},
-            })
+
+    -- Recalculate start/end positions relative to original text
+    local search_from = 1
+    for _, sentence in ipairs(sentences) do
+        -- Find this sentence's text in the original, starting from where we left off
+        local pat = sentence.text:sub(1, math.min(30, #sentence.text))
+        pat = pat:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
+        local found = text:find(pat, search_from, false)
+        if found then
+            sentence.start_pos = found
+            sentence.end_pos = found + #sentence.text - 1
+            search_from = sentence.end_pos + 1
         end
     end
-    
+
     return sentences
 end
 

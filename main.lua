@@ -153,7 +153,7 @@ function Audiobook:addToMainMenu(menu_items)
             {
                 text = _("Highlight sentences"),
                 checked_func = function()
-                    return self:getSetting("highlight_sentences", false)
+                    return self:getSetting("highlight_sentences", true)
                 end,
                 callback = function()
                     self:toggleSetting("highlight_sentences")
@@ -345,71 +345,68 @@ function Audiobook:getCurrentPageText()
         logger.warn("Audiobook: No UI or document")
         return nil
     end
-    
+
     local document = self.ui.document
     local text = nil
-    
-    -- Method 1: Use getFullPageText if available (PDF)
-    if document.getFullPageText then
-        local page = document:getCurrentPage()
-        if page then
-            local ok, result = pcall(document.getFullPageText, document, page)
-            if ok and result then
-                text = result
-            end
+    local Screen = Device.screen
+
+    -- EPUB / CreDocument (rolling mode):
+    -- Select all visible text by spanning the full screen rectangle.
+    -- This is exactly how KOReader's own ReaderView:getCurrentPageLineWordCounts() works.
+    if self.ui.rolling then
+        local ok, res = pcall(document.getTextFromPositions, document,
+            {x = 0, y = 0},
+            {x = Screen:getWidth(), y = Screen:getHeight()},
+            true)  -- do_not_draw_selection
+        if ok and res and res.text and res.text ~= "" then
+            text = res.text
         end
     end
-    
-    -- Method 2: Use getPageText if available
-    if not text and document.getPageText then
-        local page = document:getCurrentPage()
+
+    -- PDF / DjVu (paged mode):
+    -- Get structured word boxes for the current page and concatenate them.
+    if not text and self.ui.paging then
+        local page = self.ui:getCurrentPage()
         if page then
-            local ok, result = pcall(document.getPageText, document, page)
-            if ok and result then
-                text = result
-            end
-        end
-    end
-    
-    -- Method 3: For EPUB/HTML - use ReaderView text extraction
-    if not text and self.ui.view and self.ui.view.document then
-        local view = self.ui.view
-        if view.document.getFullPageText then
-            local page = view.document:getCurrentPage()
-            if page then
-                local ok, result = pcall(view.document.getFullPageText, view.document, page)
-                if ok and result then
-                    text = result
+            local ok, page_boxes = pcall(document.getTextBoxes, document, page)
+            if ok and page_boxes and page_boxes[1] then
+                local lines = {}
+                for _, line in ipairs(page_boxes) do
+                    local words = {}
+                    for _, wb in ipairs(line) do
+                        if wb.word and wb.word ~= "" then
+                            table.insert(words, wb.word)
+                        end
+                    end
+                    if #words > 0 then
+                        table.insert(lines, table.concat(words, " "))
+                    end
                 end
+                text = table.concat(lines, "\n")
             end
         end
     end
-    
-    -- Method 4: Use text_widget's text if available (for EPUB)
-    if not text and self.ui.document.getTextFromPositions then
-        -- CreDocument (EPUB) - get text via selection interface
-        local doc = self.ui.document
-        -- Get the current page range
-        local start_pos = 0
-        local end_pos = doc:getDocumentProps().doc_pages or 10000
-        
-        if self.ui.rolling then
-            -- Rolling mode - EPUB
-            start_pos = doc:getCurrentPos()
-            end_pos = start_pos + doc:getVisiblePageCount() * 2000 -- approximate chars per page
-        end
-        
-        local ok, result = pcall(doc.getTextFromPositions, doc, start_pos, end_pos)
-        if ok and result and result.text then
-            text = result.text
-        end
-    end
-    
+
     if text and text ~= "" then
+        -- Trim to last complete sentence so we don't cut mid-word at page boundary.
+        -- Find the last sentence-ending punctuation (.?!) followed by whitespace or end.
+        local last_end = nil
+        for pos in text:gmatch("()[%.%?!]%s") do
+            last_end = pos  -- pos is the index of the punctuation mark
+        end
+        -- Also check if text ends with sentence-ending punctuation
+        if text:match("[%.%?!]%s*$") then
+            last_end = #text
+        end
+        if last_end and last_end < #text and last_end > 20 then
+            -- Trim: keep up to and including the punctuation mark
+            text = text:sub(1, last_end):match("^(.-)%s*$")  -- also strip trailing space
+            logger.dbg("Audiobook: Trimmed to last sentence end at pos", last_end)
+        end
         logger.dbg("Audiobook: Got page text, length:", #text)
         return text
     end
-    
+
     logger.warn("Audiobook: Could not get page text")
     return nil
 end
@@ -431,14 +428,10 @@ function Audiobook:onAudiobookStop()
     return true
 end
 
-function Audiobook:onPageUpdate()
-    if self.sync_controller:isPlaying() and self:getSetting("auto_advance", true) then
-        local page_text = self:getCurrentPageText()
-        if page_text then
-            self.sync_controller:updateText(page_text)
-        end
-    end
-end
+-- NOTE: onPageUpdate intentionally removed.
+-- Our SyncController manages page flow via advanceToNextPage().
+-- Having onPageUpdate here caused an infinite restart loop:
+-- highlight → screen refresh → PageUpdate → updateText → stop audio → restart → highlight → ...
 
 function Audiobook:onCloseDocument()
     self:stopReadAlong()

@@ -48,6 +48,7 @@ function TTSEngine:new(o)
     o.timing_data = {}
     o.on_word_callback = nil
     o.on_complete_callback = nil
+    o.audio_pid = nil
     
     o:detectBackend()
     
@@ -212,7 +213,8 @@ Synthesize using command-line TTS.
 function TTSEngine:synthesizeCommand(text, callback)
     -- /tmp always exists on Kobo; HOME and TMPDIR may point to nonexistent paths
     local temp_dir = "/tmp"
-    local audio_file = temp_dir .. "/audiobook_tts_" .. os.time() .. ".wav"
+    self.file_counter = (self.file_counter or 0) + 1
+    local audio_file = temp_dir .. "/audiobook_tts_" .. os.time() .. "_" .. self.file_counter .. ".wav"
     local timing_file = temp_dir .. "/audiobook_timing_" .. os.time() .. ".txt"
     
     local cmd
@@ -481,23 +483,63 @@ function TTSEngine:play(on_word, on_complete)
     logger.dbg("TTSEngine: Using player:", player)
     logger.dbg("TTSEngine: Audio file:", self.current_audio_file)
     
-    local cmd
+    -- Calculate real audio duration from WAV file
+    local real_duration_ms = self:getAudioDurationMs()
+    logger.dbg("TTSEngine: Real WAV duration:", real_duration_ms, "ms")
+    
+    -- BT audio has significant startup latency (A2DP negotiation)
+    self.playback_latency_ms = (self.audio_player_type == "gst-bt") and 1500 or 0
+    
+    -- Scale timing data to match real audio duration
+    if real_duration_ms > 0 and #self.timing_data > 0 then
+        local estimated_total = self.timing_data[#self.timing_data].end_time
+        if estimated_total > 0 then
+            local scale = real_duration_ms / estimated_total
+            for _, t in ipairs(self.timing_data) do
+                t.start_time = math.floor(t.start_time * scale)
+                t.end_time = math.floor(t.end_time * scale)
+            end
+            logger.dbg("TTSEngine: Scaled timing by", scale, "(estimated", estimated_total, "-> real", real_duration_ms, ")")
+        end
+    end
+    
+    -- Build command WITHOUT trailing &; we'll add '& echo $!' for PID capture
+    local play_cmd
     if self.audio_player_type == "gst-bt" then
         -- GStreamer pipeline: convert to S16LE/48kHz/stereo for Kobo BT A2DP sink
-        cmd = string.format(
-            'gst-launch-1.0 filesrc location="%s" ! wavparse ! audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink &',
+        play_cmd = string.format(
+            'gst-launch-1.0 filesrc location="%s" ! wavparse ! audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink',
             self.current_audio_file
         )
     else
-        cmd = string.format('%s "%s" &', player, self.current_audio_file)
+        play_cmd = string.format('%s "%s"', player, self.current_audio_file)
     end
-    logger.dbg("TTSEngine: Playing:", cmd)
     
-    local result = os.execute(cmd)
-    logger.dbg("TTSEngine: Play command result:", result)
+    -- Kill any lingering audio from a previous sentence (by PID if we have one)
+    if self.audio_pid then
+        os.execute("kill " .. self.audio_pid .. " 2>/dev/null")
+        self.audio_pid = nil
+    end
     
-    -- Start timing loop
+    -- Launch in background and capture PID for reliable process tracking.
+    -- io.popen runs: sh -c '<play_cmd> >/dev/null 2>&1 & echo $!'
+    -- The shell backgrounds the player, prints its PID, and exits.
+    local pid_cmd = play_cmd .. " >/dev/null 2>&1 & echo $!"
+    logger.dbg("TTSEngine: Launching:", pid_cmd)
+    local handle = io.popen(pid_cmd)
+    local pid_str = handle and handle:read("*a") or ""
+    if handle then handle:close() end
+    self.audio_pid = tonumber(pid_str:match("(%d+)"))
+    logger.dbg("TTSEngine: Audio PID:", self.audio_pid)
+    
+    -- Bump generation to invalidate any stale timing/watcher loops
+    self.play_generation = (self.play_generation or 0) + 1
+    
+    -- Start timing loop for word highlighting (does NOT detect completion)
     self:startTimingLoop()
+    
+    -- Start process watcher to detect when audio finishes
+    self:_startProcessWatcher()
     
     return true
 end
@@ -572,55 +614,123 @@ Separated from startTimingLoop so that resume can restart the loop
 without resetting playback_start_time.
 --]]
 function TTSEngine:_runTimingLoop()
+    local my_gen = self.play_generation or 0
     local function updateTiming()
         if not self.is_speaking or self.is_paused then
+            return
+        end
+        -- Exit if superseded by a newer play() call
+        if (self.play_generation or 0) ~= my_gen then
             return
         end
         
         -- FTS values are plain numbers (µs precision); time.to_ms converts diff to ms
         local elapsed = time.to_ms(UIManager:getTime() - self.playback_start_time)
+        -- Offset by BT latency: audio doesn't start until A2DP negotiation completes
+        local adjusted = elapsed - (self.playback_latency_ms or 0)
         
-        -- Find current word based on timing
-        for i, timing in ipairs(self.timing_data) do
-            if elapsed >= timing.start_time and elapsed < timing.end_time then
-                if i ~= self.current_word_index then
-                    self.current_word_index = i
-                    if self.on_word_callback then
-                        self.on_word_callback(timing, i)
+        if adjusted > 0 then
+            -- Find current word based on timing
+            for i, timing in ipairs(self.timing_data) do
+                if adjusted >= timing.start_time and adjusted < timing.end_time then
+                    if i ~= self.current_word_index then
+                        self.current_word_index = i
+                        if self.on_word_callback then
+                            self.on_word_callback(timing, i)
+                        end
                     end
+                    break
                 end
-                break
             end
         end
         
-        -- Check if playback is complete
-        if #self.timing_data > 0 then
-            local last_timing = self.timing_data[#self.timing_data]
-            if elapsed >= last_timing.end_time then
-                self:onPlaybackComplete()
-                return
-            end
-        end
-        
+        -- NOTE: Completion is detected by the process watcher, not here.
         -- Schedule next update
-        UIManager:scheduleIn(0.05, updateTiming) -- Update every 50ms
+        UIManager:scheduleIn(0.05, updateTiming)
     end
     
     UIManager:scheduleIn(0.05, updateTiming)
 end
 
 --[[--
+Get actual audio duration from the WAV file header.
+@return number Duration in milliseconds, or 0 on error
+--]]
+function TTSEngine:getAudioDurationMs()
+    if not self.current_audio_file then return 0 end
+    local f = io.open(self.current_audio_file, "rb")
+    if not f then return 0 end
+    local size = f:seek("end")
+    -- Read byte rate from WAV header (offset 28, 4 bytes little-endian)
+    f:seek("set", 28)
+    local raw = f:read(4)
+    f:close()
+    if not raw or #raw < 4 then return 0 end
+    local b1, b2, b3, b4 = raw:byte(1, 4)
+    local byte_rate = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+    if byte_rate <= 0 then return 0 end
+    local data_bytes = size - 44
+    if data_bytes <= 0 then return 0 end
+    return math.floor((data_bytes / byte_rate) * 1000)
+end
+
+--[[--
+Check if the audio player process is still running.
+@return boolean true if process is alive
+--]]
+function TTSEngine:_isAudioProcessRunning()
+    if not self.audio_pid then return false end
+    local ret = os.execute("kill -0 " .. self.audio_pid .. " 2>/dev/null")
+    return ret == 0
+end
+
+--[[--
+Poll for audio process exit. When the player process finishes,
+trigger playback completion. Replaces fragile timing-based completion.
+--]]
+function TTSEngine:_startProcessWatcher()
+    local my_gen = self.play_generation or 0
+    -- Short delay to let the process start up
+    local initial_delay = 0.3
+
+    local function checkProcess()
+        if (self.play_generation or 0) ~= my_gen then return end
+        if not self.is_speaking then return end
+        if self.is_paused then
+            UIManager:scheduleIn(0.5, checkProcess)
+            return
+        end
+
+        if self:_isAudioProcessRunning() then
+            UIManager:scheduleIn(0.3, checkProcess)
+        else
+            logger.dbg("TTSEngine: Process watcher detected playback end")
+            self:onPlaybackComplete()
+        end
+    end
+
+    UIManager:scheduleIn(initial_delay, checkProcess)
+end
+
+--[[--
 Handle playback completion.
 --]]
 function TTSEngine:onPlaybackComplete()
+    if not self.is_speaking then return end -- guard against double-fire
     logger.dbg("TTSEngine: Playback complete")
     self.is_speaking = false
+    -- Bump generation so stale watcher/timing loops exit
+    self.play_generation = (self.play_generation or 0) + 1
+    -- Kill the audio process by PID
+    if self.audio_pid then
+        os.execute("kill " .. self.audio_pid .. " 2>/dev/null")
+        self.audio_pid = nil
+    end
+    self:cleanup()
     
     if self.on_complete_callback then
         self.on_complete_callback()
     end
-    
-    self:cleanup()
 end
 
 --[[--
@@ -631,8 +741,8 @@ function TTSEngine:pause()
         self.is_paused = true
         self.pause_time = UIManager:getTime()
         -- Freeze the audio player process (SIGSTOP) so it can resume in place
-        if self.current_audio_file then
-            os.execute("pkill -STOP -f '" .. self.current_audio_file .. "' 2>/dev/null")
+        if self.audio_pid then
+            os.execute("kill -STOP " .. self.audio_pid .. " 2>/dev/null")
         end
         logger.dbg("TTSEngine: Paused")
     end
@@ -648,8 +758,8 @@ function TTSEngine:resume()
         local pause_duration = UIManager:getTime() - self.pause_time
         self.playback_start_time = self.playback_start_time + pause_duration
         -- Unfreeze the audio player process (SIGCONT) — resumes exactly where it stopped
-        if self.current_audio_file then
-            os.execute("pkill -CONT -f '" .. self.current_audio_file .. "' 2>/dev/null")
+        if self.audio_pid then
+            os.execute("kill -CONT " .. self.audio_pid .. " 2>/dev/null")
         end
         -- Restart the timing loop (it exited when is_paused was true)
         self:_runTimingLoop()
@@ -664,10 +774,13 @@ function TTSEngine:stop()
     if self.is_speaking then
         self.is_speaking = false
         self.is_paused = false
+        -- Bump generation so stale watcher/timing loops exit
+        self.play_generation = (self.play_generation or 0) + 1
         
-        -- Kill audio player (matches both aplay and gst-launch-1.0 by filename)
-        if self.current_audio_file then
-            os.execute("pkill -f '" .. self.current_audio_file .. "' 2>/dev/null")
+        -- Kill audio player by PID
+        if self.audio_pid then
+            os.execute("kill " .. self.audio_pid .. " 2>/dev/null")
+            self.audio_pid = nil
         end
         
         self:cleanup()
@@ -687,6 +800,7 @@ function TTSEngine:cleanup()
         end
         self.current_audio_file = nil
     end
+    self.audio_pid = nil
 end
 
 --[[--

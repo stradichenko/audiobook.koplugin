@@ -48,7 +48,8 @@ function PlaybackBar:handleEvent(event)
     -- Check if this is a gesture event with a position
     if event and event.args and event.args[1] then
         local ges = event.args[1]
-        if ges.pos and self.dimen and self.dimen.y then
+        -- ges must be a table (gesture); some events pass numbers or strings
+        if type(ges) == "table" and ges.pos and self.dimen and self.dimen.y then
             if ges.pos.y < self.dimen.y then
                 -- Touch is above the bar — let it pass through
                 return false
