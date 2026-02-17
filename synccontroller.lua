@@ -206,15 +206,29 @@ function SyncController:beginSentencePlayback(sentence)
                 controller:highlightCurrentWord(word)
             end
         end,
-        -- Completion callback — chain to next sentence after a short delay
-        -- (gives BT audio device time to release, prevents deep synchronous call chains)
+        -- Completion callback — chain to next sentence with a configurable delay
+        -- that depends on whether the sentence ended at a paragraph break or mid-line.
         function()
             controller.highlight_manager:clearHighlights()
-            UIManager:scheduleIn(0.2, function()
+            -- Choose delay based on the sentence's end_type tag
+            local delay = 0.2  -- fallback
+            if sentence.end_type == "paragraph" then
+                delay = (controller.plugin and controller.plugin:getSetting("paragraph_pause", 0.8)) or 0.8
+            else
+                delay = (controller.plugin and controller.plugin:getSetting("sentence_pause", 0.1)) or 0.1
+            end
+            UIManager:scheduleIn(delay, function()
                 if controller.state ~= controller.STATE.STOPPED then
                     controller:readNextSentence()
                 end
             end)
+        end,
+        -- Failure callback — BT audio launch failed asynchronously (after
+        -- the non-blocking retry). Stop the entire reading chain rather
+        -- than looping endlessly on dead BT connections.
+        function()
+            logger.warn("SyncController: Async BT launch failure, stopping read-along")
+            controller:stop()
         end
     )
 
@@ -328,6 +342,21 @@ function SyncController:startSentenceSyncLoop(sentence)
         end
         if self.sync_generation ~= my_generation then
             return -- superseded by a newer sync loop
+        end
+
+        -- Auto-pause when a menu/dialog opens (we can't receive ShowConfigMenu events)
+        if self.playback_bar and self.playback_bar._isOverlayActive and self.playback_bar:_isOverlayActive() then
+            if not self._auto_paused_by_overlay then
+                self._auto_paused_by_overlay = true
+                self:pause()
+            end
+            -- Keep polling so we can resume when the overlay closes
+            UIManager:scheduleIn(0.3, syncUpdate)
+            return
+        elseif self._auto_paused_by_overlay then
+            self._auto_paused_by_overlay = false
+            self:resume()
+            return -- resume restarts the sync loop
         end
 
         local elapsed = time.to_ms(UIManager:getTime() - self.sentence_sync_start)
@@ -475,11 +504,15 @@ Stop playback completely.
 function SyncController:stop()
     self.state = self.STATE.STOPPED
 
-    pcall(function() self.tts_engine:stop() end)
-    pcall(function() self.highlight_manager:clearHighlights() end)
+    if self.tts_engine then
+        pcall(function() self.tts_engine:stop() end)
+    end
+    if self.highlight_manager then
+        pcall(function() self.highlight_manager:clearHighlights() end)
+    end
 
     -- Hide playback bar (also triggers full screen refresh)
-    self:hidePlaybackBar()
+    pcall(function() self:hidePlaybackBar() end)
 
     self.parsed_data = nil
     self.current_word_index = 0

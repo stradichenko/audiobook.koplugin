@@ -80,7 +80,10 @@ function TextParser:parseSentences(text)
     local sentence_index = 1
 
     -- Helper: add a sentence if non-empty
-    local function addSentence(s)
+    -- @param s string  Trimmed sentence text
+    -- @param end_type string  "paragraph" = last segment before a newline,
+    --                         "sentence"  = split by .?!;: mid-line
+    local function addSentence(s, end_type)
         s = s:match("^%s*(.-)%s*$")  -- trim
         if s and s ~= "" then
             table.insert(sentences, {
@@ -89,6 +92,7 @@ function TextParser:parseSentences(text)
                 start_pos = 0,
                 end_pos = 0,
                 words = {},
+                end_type = end_type or "sentence",
             })
             sentence_index = sentence_index + 1
         end
@@ -98,16 +102,16 @@ function TextParser:parseSentences(text)
     for line in (text .. "\n"):gmatch("([^\n]+)\n") do
         line = line:match("^%s*(.-)%s*$")
         if line and line ~= "" then
-            -- Step 2: split each line on sentence-ending punctuation.
-            -- Pattern: capture everything up to and including .?!
+            -- Step 2: split each line on sentence-ending punctuation (.?!;:)
             -- followed by a space or end-of-string.
             local pos = 1
+            local segments_in_line = {}
             while pos <= #line do
-                -- Find .?! that is followed by a space (or is at end of line)
-                local pstart, pend = line:find("[%.%?!]+%s", pos)
+                -- Find .?!;: that is followed by a space (or is at end of line)
+                local pstart, pend = line:find("[%.%?!;:]+%s", pos)
                 if not pstart then
-                    -- Check for .?! at very end of line (no trailing space)
-                    pstart, pend = line:find("[%.%?!]+$", pos)
+                    -- Check for .?!;: at very end of line (no trailing space)
+                    pstart, pend = line:find("[%.%?!;:]+$", pos)
                 end
                 if pstart then
                     -- Include the punctuation but not the trailing space
@@ -116,17 +120,22 @@ function TextParser:parseSentences(text)
                     if line:sub(pend, pend):match("%s") then
                         seg_end = pend - 1
                     end
-                    addSentence(line:sub(pos, seg_end))
+                    table.insert(segments_in_line, line:sub(pos, seg_end))
                     pos = seg_end + 1
                     -- Skip whitespace
                     while pos <= #line and line:sub(pos, pos):match("%s") do
                         pos = pos + 1
                     end
                 else
-                    -- No more sentence-ending punctuation: rest is one sentence
-                    addSentence(line:sub(pos))
+                    -- No more sentence-ending punctuation: rest is one segment
+                    table.insert(segments_in_line, line:sub(pos))
                     break
                 end
+            end
+            -- Tag: last segment in line → "paragraph", others → "sentence"
+            for i, seg in ipairs(segments_in_line) do
+                local etype = (i == #segments_in_line) and "paragraph" or "sentence"
+                addSentence(seg, etype)
             end
         end
     end

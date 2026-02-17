@@ -272,9 +272,29 @@ function BTManager:connect(address)
         local err = out:match("Error[^\n]*") or "Connection failed"
         return false, err
     end
-    -- Wait a moment for A2DP to set up
-    os.execute("sleep 2")
-    return true
+    -- Wait for A2DP profile to come up.  Device1.Connect returns as soon
+    -- as the ACL link is established, but the audio sink (mtkbtmwrpcaudiosink)
+    -- isn't usable until btservice sets up the A2DP channel.  Poll for up
+    -- to 5 seconds.
+    for attempt = 1, 10 do
+        os.execute("sleep 0.5")
+        -- Quick probe: try to open the audio sink.  gst-launch will exit
+        -- immediately with "Address already in use" or "Pipeline doesn't
+        -- want to pause" if A2DP isn't ready, or succeed and start prerolling.
+        local probe = io.popen(
+            "timeout 2 gst-launch-1.0 audiotestsrc num-buffers=1 ! audio/x-raw,format=S16LE,rate=48000,channels=2 ! mtkbtmwrpcaudiosink 2>&1; echo __RC:$?"
+        )
+        local pout = probe and probe:read("*a") or ""
+        if probe then probe:close() end
+        if pout:match("PLAYING") or pout:match("PREROLLED") or pout:match("__RC:0") then
+            logger.dbg("BTManager: A2DP audio sink ready after", attempt * 0.5, "s")
+            return true
+        end
+        logger.dbg("BTManager: A2DP not ready yet, attempt", attempt)
+    end
+    -- If we get here the D-Bus connect succeeded but A2DP never came up
+    logger.warn("BTManager: D-Bus connect OK but A2DP audio sink not ready after 5s")
+    return true, "Connected but audio may not be ready yet"
 end
 
 --- Disconnect a device.

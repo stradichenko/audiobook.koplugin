@@ -33,33 +33,15 @@ local PlaybackBar = InputContainer:extend{
     is_playing = true,
     current_word = "",
     progress = 0,
+    -- Mark as toast so UIManager never blocks events to widgets below us.
+    -- Toast widgets receive events but never become the exclusive "top_widget".
+    toast = true,
     -- Callbacks from sync_controller
     on_play_pause = nil,
     on_rewind = nil,
     on_forward = nil,
     on_close = nil,
 }
-
---[[--
-Pass through ALL events that are not inside our bar area.
-Return false to let KOReader handle taps/swipes on the reading area,
-open menus, navigate pages, etc.
---]]
-function PlaybackBar:handleEvent(event)
-    if event and event.args and event.args[1] then
-        local ges = event.args[1]
-        if type(ges) == "table" and ges.pos then
-            -- Only handle events that land inside the bar
-            if self.dimen and self.dimen.y and ges.pos.y >= self.dimen.y then
-                return InputContainer.handleEvent(self, event)
-            end
-            -- Everything above the bar → pass through to reader
-            return false
-        end
-    end
-    -- Non-gesture events (timers, etc) → pass through
-    return false
-end
 
 function PlaybackBar:init()
     self.width = self.width or Screen:getWidth()
@@ -302,17 +284,9 @@ end
 
 function PlaybackBar:show()
     self.visible = true
-    -- Position at bottom of screen; pass x, y so UIManager knows
-    -- the bar only covers the bottom strip → taps above it pass through.
-    local bar_x = 0
-    local bar_y = Screen:getHeight() - self.dimen.h
-    self.dimen.x = bar_x
-    self.dimen.y = bar_y
-    -- "partial" refresh type; x and y tell UIManager where we live
-    UIManager:show(self, "partial", nil, bar_x, bar_y)
-    UIManager:setDirty(self, function()
-        return "ui", self.dimen
-    end)
+    self.dimen.x = 0
+    self.dimen.y = Screen:getHeight() - self.dimen.h
+    UIManager:show(self, "ui", nil, self.dimen.x, self.dimen.y)
 end
 
 function PlaybackBar:hide()
@@ -328,13 +302,80 @@ function PlaybackBar:onCloseWidget()
     -- Clean up when widget closes
 end
 
-function PlaybackBar:paintTo(bb, x, y)
-    -- Paint at the correct y position (bottom of screen)
-    -- UIManager passes x, y from the show() call
-    local paint_y = self.dimen.y or (Screen:getHeight() - self.dimen.h)
-    if self[1] and self[1].paintTo then
-        self[1]:paintTo(bb, x or 0, paint_y)
+--[[--
+Handle screen dimension changes (e.g. after device rotation).
+Rebuild the bar layout with the new screen width and reposition at the
+new bottom edge.
+--]]
+function PlaybackBar:onSetDimensions()
+    if not self.visible then return end
+    -- Re-derive width and height from the (potentially rotated) screen
+    self.width = Screen:getWidth()
+    self.height = Screen:scaleBySize(80)
+    -- Preserve current playback state across the rebuild
+    local was_playing = self.is_playing
+    local word = self.current_word
+    local progress = self.progress
+    -- Rebuild the UI tree with new dimensions
+    self:setupUI()
+    -- Restore state into the fresh widgets
+    self.is_playing = was_playing
+    self.current_word = word
+    self.progress = progress
+    self:updatePlayPauseButton()
+    if word and word ~= "" then self.word_display:setText(word) end
+    self.progress_bar:setPercentage(progress / 100)
+    -- Reposition at the new screen bottom
+    self.dimen.x = 0
+    self.dimen.y = Screen:getHeight() - self.dimen.h
+    UIManager:setDirty(self, "ui")
+    return true
+end
+
+--- Override handleEvent so that we only consume tap gestures within
+--- our bar area.  Swipe/pan gestures are ALWAYS passed through so the
+--- bottom-swipe ConfigMenu activation works even when the bar is visible.
+function PlaybackBar:handleEvent(event)
+    if event.handler == "onGesture" or (event.args and event.args[1] and event.args[1].ges) then
+        -- This is a gesture event from GestureDetector
+        local ges = event.args and event.args[1]
+        if ges and (ges.ges == "swipe" or ges.ges == "pan" or ges.ges == "hold" or ges.ges == "hold_pan") then
+            -- Let swipe/pan/hold pass through unconditionally
+            return false
+        end
     end
+    -- For taps and everything else, use standard InputContainer dispatch
+    return InputContainer.handleEvent(self, event)
+end
+
+function PlaybackBar:paintTo(bb, x, y)
+    -- Toast widgets are painted on top of everything. To let menus/dialogs
+    -- appear above us, skip painting when any non-toast widget besides the
+    -- base reader is in the UIManager window stack.
+    if self:_isOverlayActive() then
+        return
+    end
+    if self[1] and self[1].paintTo then
+        self[1]:paintTo(bb, x or 0, y or self.dimen.y)
+    end
+end
+
+--- Check if any menu or dialog sits between us and the base reader.
+-- In normal operation there is exactly 1 non-toast widget (the reader).
+-- When a menu/dialog opens, there are 2+.
+function PlaybackBar:_isOverlayActive()
+    local stack = UIManager._window_stack
+    if not stack then return false end
+    local non_toast = 0
+    for i = 1, #stack do
+        if not stack[i].widget.toast then
+            non_toast = non_toast + 1
+            if non_toast > 1 then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 return PlaybackBar

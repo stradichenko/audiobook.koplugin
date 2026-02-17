@@ -44,6 +44,19 @@ function Audiobook:init()
         plugin = self,
         plugin_dir = PLUGIN_PATH:sub(1, -2), -- strip trailing slash
     }
+    -- Restore saved voice settings
+    self.tts_engine:setRate(self:getSetting("speech_rate", 1.0))
+    self.tts_engine:setPitch(self:getSetting("speech_pitch", 50))
+    self.tts_engine:setVolume(self:getSetting("speech_volume", 1.0))
+    -- Compose full voice id: base accent + optional variant (e.g. "en-us+f1")
+    local voice_base = self:getSetting("tts_voice", "en")
+    local voice_variant = self:getSetting("tts_voice_variant", "")
+    local full_voice = voice_base
+    if voice_variant ~= "" then
+        full_voice = voice_base .. "+" .. voice_variant
+    end
+    self.tts_engine:setVoice(full_voice)
+    self.tts_engine:setWordGap(self:getSetting("word_gap", 0))
     self.highlight_manager = HighlightManager:new{
         plugin = self,
         ui = self.ui,
@@ -113,9 +126,16 @@ function Audiobook:addToMainMenu(menu_items)
             },
             {
                 text_func = function()
-                    return T(_("Speech rate: %1x"), self:getSetting("speech_rate", 1.0))
+                    local voice_label = self:getSetting("tts_voice_label", "English (GB)")
+                    local variant_label = self:getSetting("tts_variant_label", "")
+                    if variant_label ~= "" and variant_label ~= "Default (male)" then
+                        voice_label = voice_label .. " — " .. variant_label
+                    end
+                    return T(_("🎤 Voice settings (%1)"), voice_label)
                 end,
-                sub_item_table = self:buildSpeechRateMenu(),
+                sub_item_table_func = function()
+                    return self:buildVoiceSettingsMenu()
+                end,
             },
             {
                 text_func = function()
@@ -199,11 +219,83 @@ function Audiobook:onDictButtonsReady(dict_popup, buttons)
     }})
 end
 
+function Audiobook:buildVoiceSettingsMenu()
+    local menu = {}
+
+    -- Speech rate submenu
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Speech rate: %1x"), self:getSetting("speech_rate", 1.0))
+        end,
+        sub_item_table = self:buildSpeechRateMenu(),
+    })
+
+    -- Pitch submenu
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Pitch: %1"), self:getSetting("speech_pitch", 50))
+        end,
+        sub_item_table = self:buildPitchMenu(),
+    })
+
+    -- Volume submenu
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Volume: %1%%"), math.floor(self:getSetting("speech_volume", 1.0) * 100))
+        end,
+        sub_item_table = self:buildVolumeMenu(),
+    })
+
+    table.insert(menu, {
+        text = "――――――――――",
+        enabled = false,
+    })
+
+    -- Pause between sentences (after . ? ! ; :)
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Sentence pause: %1s"), self:getSetting("sentence_pause", 0.1))
+        end,
+        sub_item_table = self:buildSentencePauseMenu(),
+    })
+
+    -- Pause between paragraphs (at newlines)
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Paragraph pause: %1s"), self:getSetting("paragraph_pause", 0.8))
+        end,
+        sub_item_table = self:buildParagraphPauseMenu(),
+    })
+
+    -- Word gap (silence between words within a sentence)
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Word gap: %1"), self:getSetting("word_gap", 0))
+        end,
+        sub_item_table = self:buildWordGapMenu(),
+    })
+
+    table.insert(menu, {
+        text = "――――――――――",
+        enabled = false,
+    })
+
+    -- Voice / accent selection
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Voice: %1"), self:getSetting("tts_voice_label", "English (GB)"))
+        end,
+        sub_item_table = self:buildVoiceMenu(),
+    })
+
+    return menu
+end
+
 function Audiobook:buildSpeechRateMenu()
-    local rates = {0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0}
+    local rates = {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0}
     local menu = {}
     
-    for _, rate in ipairs(rates) do
+    for _i, rate in ipairs(rates) do
         table.insert(menu, {
             text = string.format("%.2fx", rate),
             checked_func = function()
@@ -216,6 +308,231 @@ function Audiobook:buildSpeechRateMenu()
         })
     end
     
+    return menu
+end
+
+function Audiobook:buildPitchMenu()
+    -- espeak-ng pitch range: 0–99, default 50
+    local pitches = {0, 10, 20, 30, 40, 50, 60, 70, 80, 99}
+    local labels = {
+        [0] = _("0 (very low)"),
+        [10] = "10", [20] = "20", [30] = "30", [40] = "40",
+        [50] = _("50 (default)"),
+        [60] = "60", [70] = "70", [80] = "80",
+        [99] = _("99 (very high)"),
+    }
+    local menu = {}
+    for _i, p in ipairs(pitches) do
+        table.insert(menu, {
+            text = labels[p] or tostring(p),
+            checked_func = function()
+                return self:getSetting("speech_pitch", 50) == p
+            end,
+            callback = function()
+                self:setSetting("speech_pitch", p)
+                self.tts_engine:setPitch(p)
+            end,
+        })
+    end
+    return menu
+end
+
+function Audiobook:buildVolumeMenu()
+    local volumes = {0.25, 0.50, 0.75, 1.0}
+    local menu = {}
+    for _i, v in ipairs(volumes) do
+        table.insert(menu, {
+            text = string.format("%d%%", math.floor(v * 100)),
+            checked_func = function()
+                return self:getSetting("speech_volume", 1.0) == v
+            end,
+            callback = function()
+                self:setSetting("speech_volume", v)
+                self.tts_engine:setVolume(v)
+            end,
+        })
+    end
+    return menu
+end
+
+function Audiobook:buildSentencePauseMenu()
+    -- Pause after sentence-ending punctuation (.?!;:) within the same paragraph
+    local values = {0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.8, 1.0}
+    local menu = {}
+    for _i, v in ipairs(values) do
+        local label = string.format("%.2fs", v)
+        if v == 0.1 then label = label .. _(" (default)") end
+        table.insert(menu, {
+            text = label,
+            checked_func = function()
+                return self:getSetting("sentence_pause", 0.1) == v
+            end,
+            callback = function()
+                self:setSetting("sentence_pause", v)
+            end,
+        })
+    end
+    return menu
+end
+
+function Audiobook:buildParagraphPauseMenu()
+    -- Pause at paragraph/newline boundaries
+    local values = {0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0}
+    local menu = {}
+    for _i, v in ipairs(values) do
+        local label = string.format("%.1fs", v)
+        if v == 0.8 then label = label .. _(" (default)") end
+        table.insert(menu, {
+            text = label,
+            checked_func = function()
+                return self:getSetting("paragraph_pause", 0.8) == v
+            end,
+            callback = function()
+                self:setSetting("paragraph_pause", v)
+            end,
+        })
+    end
+    return menu
+end
+
+function Audiobook:buildWordGapMenu()
+    -- espeak-ng word gap: extra silence (in units of 10ms) between words
+    -- 0 = default (no extra gap), higher values slow down speech
+    local values = {0, 1, 2, 5, 10, 20, 50}
+    local labels = {
+        [0] = _("0 (default — no extra gap)"),
+        [1] = _("1 (10ms)"),
+        [2] = _("2 (20ms)"),
+        [5] = _("5 (50ms)"),
+        [10] = _("10 (100ms)"),
+        [20] = _("20 (200ms)"),
+        [50] = _("50 (500ms)"),
+    }
+    local menu = {}
+    for _i, v in ipairs(values) do
+        table.insert(menu, {
+            text = labels[v] or tostring(v),
+            checked_func = function()
+                return self:getSetting("word_gap", 0) == v
+            end,
+            callback = function()
+                self:setSetting("word_gap", v)
+                self.tts_engine:setWordGap(v)
+            end,
+        })
+    end
+    return menu
+end
+
+function Audiobook:buildVoiceMenu()
+    -- Voices are split into sections: accents (male base) and voice variants
+    -- Voice variants use espeak-ng "+variant" syntax: e.g. "en+f1" = English GB female1
+    local current_base = self:getSetting("tts_voice", "en")
+    local current_variant = self:getSetting("tts_voice_variant", "")
+    local current_full = current_base
+    if current_variant ~= "" then
+        current_full = current_base .. "+" .. current_variant
+    end
+
+    local accents = {
+        { id = "en",              label = _("English (GB)") },
+        { id = "en-us",           label = _("English (US)") },
+        { id = "en-gb-x-rp",     label = _("English (Received Pronunciation)") },
+        { id = "en-gb-scotland",  label = _("English (Scotland)") },
+        { id = "en-gb-x-gbclan",  label = _("English (Lancaster)") },
+        { id = "en-gb-x-gbcwmd", label = _("English (West Midlands)") },
+        { id = "en-029",          label = _("English (Caribbean)") },
+        { id = "en-us-nyc",       label = _("English (New York City)") },
+    }
+
+    local variants = {
+        { id = "",         label = _("Default (male)") },
+        { separator = true },
+        { id = "f1",       label = _("♀ Female 1") },
+        { id = "f2",       label = _("♀ Female 2") },
+        { id = "f3",       label = _("♀ Female 3") },
+        { id = "f4",       label = _("♀ Female 4 (breathy)") },
+        { id = "f5",       label = _("♀ Female 5") },
+        { separator = true },
+        { id = "Annie",    label = _("♀ Annie") },
+        { id = "Alicia",   label = _("♀ Alicia") },
+        { id = "belinda",  label = _("♀ Belinda") },
+        { id = "linda",    label = _("♀ Linda") },
+        { id = "steph",    label = _("♀ Steph") },
+        { id = "Andrea",   label = _("♀ Andrea") },
+        { id = "anika",    label = _("♀ Anika") },
+        { id = "aunty",    label = _("♀ Aunty") },
+        { id = "grandma",  label = _("♀ Grandma") },
+        { separator = true },
+        { id = "m1",       label = _("♂ Male 1") },
+        { id = "m2",       label = _("♂ Male 2") },
+        { id = "m3",       label = _("♂ Male 3") },
+        { id = "m7",       label = _("♂ Male 7") },
+        { separator = true },
+        { id = "whisper",  label = _("🤫 Whisper") },
+        { id = "whisperf", label = _("🤫 Whisper (female)") },
+        { id = "croak",    label = _("🐸 Croak") },
+    }
+
+    local menu = {}
+
+    -- Accent submenu
+    local accent_sub = {}
+    for _i, a in ipairs(accents) do
+        table.insert(accent_sub, {
+            text = a.label,
+            checked_func = function()
+                return self:getSetting("tts_voice", "en") == a.id
+            end,
+            callback = function()
+                self:setSetting("tts_voice", a.id)
+                self:setSetting("tts_voice_label", a.label)
+                local var = self:getSetting("tts_voice_variant", "")
+                local full = a.id
+                if var ~= "" then full = a.id .. "+" .. var end
+                self.tts_engine:setVoice(full)
+            end,
+        })
+    end
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Accent: %1"), self:getSetting("tts_voice_label", "English (GB)"))
+        end,
+        sub_item_table = accent_sub,
+    })
+
+    -- Voice / gender variant submenu
+    local variant_sub = {}
+    for _i, v in ipairs(variants) do
+        if v.separator then
+            table.insert(variant_sub, {
+                text = "――――――――――",
+                enabled = false,
+            })
+        else
+            table.insert(variant_sub, {
+                text = v.label,
+                checked_func = function()
+                    return self:getSetting("tts_voice_variant", "") == v.id
+                end,
+                callback = function()
+                    self:setSetting("tts_voice_variant", v.id)
+                    self:setSetting("tts_variant_label", v.label)
+                    local base = self:getSetting("tts_voice", "en")
+                    local full = base
+                    if v.id ~= "" then full = base .. "+" .. v.id end
+                    self.tts_engine:setVoice(full)
+                end,
+            })
+        end
+    end
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Voice type: %1"), self:getSetting("tts_variant_label", "Default (male)"))
+        end,
+        sub_item_table = variant_sub,
+    })
+
     return menu
 end
 
@@ -338,8 +655,8 @@ function Audiobook:buildBluetoothMenu()
         table.insert(menu, {
             text = icon .. label,
             -- Tap = connect (or disconnect if already connected)
-            callback = function()
-                self:btQuickConnect(dev)
+            callback = function(touchmenu_instance)
+                self:btQuickConnect(dev, touchmenu_instance)
             end,
             -- Hold = show more actions (forget, info)
             hold_callback = function(touchmenu_instance)
@@ -355,26 +672,28 @@ function Audiobook:buildBluetoothMenu()
 end
 
 --- Quick connect/disconnect: tap on a device row in the BT menu.
-function Audiobook:btQuickConnect(dev)
+function Audiobook:btQuickConnect(dev, touchmenu_instance)
     local bt = self.bt_manager
     local name = dev.name ~= "" and dev.name or dev.address
 
     if dev.connected then
         -- Already connected → disconnect
         bt:disconnect(dev.address)
+        dev.connected = false  -- update captured state so checked_func refreshes
         self:setSetting("bt_device_addr", nil)
         self:setSetting("bt_device_name", nil)
         UIManager:show(InfoMessage:new{
             text = T(_("Disconnected from %1."), name),
             timeout = 2,
         })
+        -- Menu auto-refreshes via checked_func after callback returns
         return
     end
 
     -- Connecting
     UIManager:show(InfoMessage:new{
-        text = T(_("Connecting to %1…"), name),
-        timeout = 1,
+        text = T(_("Connecting to %1…\nVerifying audio…"), name),
+        timeout = 8,
     })
     UIManager:scheduleIn(0.3, function()
         -- Pair first if needed
@@ -387,9 +706,11 @@ function Audiobook:btQuickConnect(dev)
                 })
                 return
             end
+            dev.paired = true
         end
         local ok, err = bt:connect(dev.address)
         if ok then
+            dev.connected = true  -- update captured state
             -- Remember this as the preferred device
             self:setSetting("bt_device_addr", dev.address)
             self:setSetting("bt_device_name", name)
@@ -402,6 +723,10 @@ function Audiobook:btQuickConnect(dev)
                 text = T(_("Connection failed: %1"), err or "unknown"),
                 timeout = 3,
             })
+        end
+        -- Refresh the menu to show updated connection state
+        if touchmenu_instance then
+            touchmenu_instance:updateItems()
         end
     end)
 end
@@ -629,8 +954,12 @@ end
 
 function Audiobook:stopReadAlong()
     logger.dbg("Audiobook: Stopping read-along")
-    self.sync_controller:stop()
-    self.highlight_manager:clearHighlights()
+    pcall(function() self.sync_controller:stop() end)
+    pcall(function() self.highlight_manager:clearHighlights() end)
+    -- Always kill orphan audio processes, even if we think we're not playing.
+    -- A stale gst-launch-1.0 holding the BT socket can destabilize the
+    -- system when Nickel resumes after KOReader exits.
+    pcall(function() self.tts_engine:forceKillAll() end)
 end
 
 function Audiobook:pauseReadAlong()
@@ -735,7 +1064,9 @@ end
 -- highlight → screen refresh → PageUpdate → updateText → stop audio → restart → highlight → ...
 
 -- Auto-pause TTS when any KOReader menu or popup opens.
--- This lets the user interact with menus without TTS talking over them.
+-- NOTE: ShowConfigMenu event is consumed by ReaderConfig before reaching us,
+-- so onShowConfigMenu may never fire. The PlaybackBar handles its own
+-- visibility via paintTo (checks for overlay widgets in the stack).
 function Audiobook:onShowReaderMenu()
     if self.sync_controller:isPlaying() then
         self._paused_by_menu = true
@@ -788,6 +1119,26 @@ end
 
 function Audiobook:onCloseDocument()
     self:stopReadAlong()
+end
+
+-- Safety net: if UIManager tears down the widget tree (exit, doc switch)
+-- without CloseDocument firing first, force-stop everything.
+function Audiobook:onCloseWidget()
+    self:stopReadAlong()
+end
+
+-- Handle screen rotation: briefly pause TTS so the screen can redraw,
+-- then let the PlaybackBar rebuild itself via onSetDimensions.
+function Audiobook:onSetRotationMode()
+    if self.sync_controller:isPlaying() then
+        self.sync_controller:pause()
+        -- Resume after a short delay to let the rotation redraw settle
+        UIManager:scheduleIn(0.5, function()
+            if self.sync_controller:isPaused() then
+                self.sync_controller:resume()
+            end
+        end)
+    end
 end
 
 -- Settings management

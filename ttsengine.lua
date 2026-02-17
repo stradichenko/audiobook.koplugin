@@ -39,8 +39,10 @@ function TTSEngine:new(o)
     self.__index = self
     
     o.rate = o.rate or self.DEFAULT_RATE
-    o.pitch = o.pitch or self.DEFAULT_PITCH
+    o.pitch = o.pitch or 50  -- espeak-ng default pitch
     o.volume = o.volume or self.DEFAULT_VOLUME
+    o.voice = o.voice or "en"  -- espeak-ng voice id
+    o.word_gap = o.word_gap or 0  -- espeak-ng word gap (units of 10ms)
     o.backend = nil
     o.is_speaking = false
     o.is_paused = false
@@ -151,16 +153,16 @@ Set speech rate.
 @param rate number Rate multiplier (0.5 to 2.0)
 --]]
 function TTSEngine:setRate(rate)
-    self.rate = math.max(0.5, math.min(2.0, rate))
+    self.rate = math.max(0.25, math.min(2.0, rate))
     logger.dbg("TTSEngine: Rate set to", self.rate)
 end
 
 --[[--
 Set speech pitch.
-@param pitch number Pitch multiplier (0.5 to 2.0)
+@param pitch number Pitch value (0 to 99, espeak-ng native range)
 --]]
 function TTSEngine:setPitch(pitch)
-    self.pitch = math.max(0.5, math.min(2.0, pitch))
+    self.pitch = math.max(0, math.min(99, pitch))
     logger.dbg("TTSEngine: Pitch set to", self.pitch)
 end
 
@@ -171,6 +173,24 @@ Set speech volume.
 function TTSEngine:setVolume(volume)
     self.volume = math.max(0.0, math.min(1.0, volume))
     logger.dbg("TTSEngine: Volume set to", self.volume)
+end
+
+--[[--
+Set the espeak-ng voice/language.
+@param voice string espeak-ng voice identifier (e.g. "en", "en-us")
+--]]
+function TTSEngine:setVoice(voice)
+    self.voice = voice
+    logger.dbg("TTSEngine: Voice set to", self.voice)
+end
+
+--[[--
+Set the espeak-ng word gap (extra silence between words).
+@param gap number Gap in units of 10ms (0 = default)
+--]]
+function TTSEngine:setWordGap(gap)
+    self.word_gap = gap or 0
+    logger.dbg("TTSEngine: Word gap set to", self.word_gap)
 end
 
 --[[--
@@ -229,6 +249,10 @@ function TTSEngine:synthesizeCommand(text, callback)
     if self.backend == self.BACKENDS.ESPEAK then
         -- espeak-ng supports word timing output
         local speed = math.floor(175 * self.rate) -- Default is 175 wpm
+        local pitch = self.pitch or 50
+        local amplitude = math.floor((self.volume or 1.0) * 100)
+        local voice = self.voice or "en"
+        local word_gap = self.word_gap or 0
         -- Build invocation for bundled espeak-ng on Kobo:
         -- Use the bundled ld-linux to bypass the ancient system glibc (2.11)
         local exec_prefix = ""
@@ -243,9 +267,14 @@ function TTSEngine:synthesizeCommand(text, callback)
                 self.espeak_lib_path, self.espeak_data_path
             )
         end
+        -- Build word-gap flag only if non-zero
+        local gap_flag = ""
+        if word_gap > 0 then
+            gap_flag = string.format(" -g %d", word_gap)
+        end
         cmd = string.format(
-            '%s%s -v en -s %d -w "%s" "%s" 2>&1',
-            exec_prefix, self.backend_cmd, speed, audio_file, self:escapeText(text)
+            '%s%s -v %s -s %d -p %d -a %d%s -w "%s" "%s" 2>&1',
+            exec_prefix, self.backend_cmd, voice, speed, pitch, amplitude, gap_flag, audio_file, self:escapeText(text)
         )
     elseif self.backend == self.BACKENDS.PICO then
         cmd = string.format(
@@ -449,7 +478,7 @@ Play the synthesized audio.
 @param on_complete function Callback when playback completes
 @return boolean Success
 --]]
-function TTSEngine:play(on_word, on_complete)
+function TTSEngine:play(on_word, on_complete, on_fail)
     if not self.current_audio_file then
         logger.err("TTSEngine: No audio file to play")
         UIManager:show(InfoMessage:new{
@@ -461,6 +490,7 @@ function TTSEngine:play(on_word, on_complete)
     
     self.on_word_callback = on_word
     self.on_complete_callback = on_complete
+    self.on_fail_callback = on_fail
     self.is_speaking = true
     self.is_paused = false
     
@@ -515,53 +545,57 @@ function TTSEngine:play(on_word, on_complete)
         play_cmd = string.format('%s "%s"', player, self.current_audio_file)
     end
     
-    -- Kill any lingering audio from a previous sentence (by PID if we have one)
-    if self.audio_pid then
-        os.execute("kill " .. self.audio_pid .. " 2>/dev/null")
-        self.audio_pid = nil
-    end
-    
-    -- Launch in background and capture PID for reliable process tracking.
-    -- io.popen runs: sh -c '<play_cmd> >/dev/null 2>&1 & echo $!'
-    -- The shell backgrounds the player, prints its PID, and exits.
-    local pid_cmd = play_cmd .. " >/dev/null 2>&1 & echo $!"
-    logger.dbg("TTSEngine: Launching:", pid_cmd)
-    local handle = io.popen(pid_cmd)
-    local pid_str = handle and handle:read("*a") or ""
-    if handle then handle:close() end
-    self.audio_pid = tonumber(pid_str:match("(%d+)"))
-    logger.dbg("TTSEngine: Audio PID:", self.audio_pid)
-    
+    -- Force-kill any lingering audio — SIGKILL + killall to release the
+    -- @kobo:mtkbtmwrpc abstract socket held by stale gst-launch processes.
+    self:_killAudioProcess()
+
     -- Bump generation to invalidate any stale timing/watcher loops
     self.play_generation = (self.play_generation or 0) + 1
 
-    -- Quick sanity check: if the process died almost immediately, BT is
-    -- likely not connected. gst-launch with mtkbtmwrpcaudiosink exits in
-    -- <0.5s when there is no BT A2DP sink, but lives >2s when streaming.
-    -- We sleep 0.8s in-process (acceptable because we are already blocking
-    -- the UI during synthesis anyway) then check the PID.
-    if self.audio_player_type == "gst-bt" and self.audio_pid then
-        os.execute("sleep 0.8")
-        if not self:_isAudioProcessRunning() then
-            logger.warn("TTSEngine: gst-launch died immediately — BT audio not connected")
-            self.is_speaking = false
-            self.audio_pid = nil
-            self:cleanup()
-            UIManager:show(InfoMessage:new{
-                text = _("Bluetooth audio not connected.\n\nPlease make sure your Bluetooth headphones or speaker are:\n\n1. Powered on\n2. Paired in Kobo Settings → Bluetooth\n3. Connected and within range\n\nThen try again."),
-                timeout = 10,
-            })
-            -- Do NOT call on_complete — this stops the reading chain.
-            return false
-        end
+    -- Build PID-capturing launch command and save for potential async retry
+    local pid_cmd = play_cmd .. " >/dev/null 2>&1 & echo $!"
+    self._last_pid_cmd = pid_cmd
+
+    -- Launch the audio process, start timing loop and process watcher.
+    -- This is extracted so BT can call it after a non-blocking socket-release
+    -- delay, while non-BT calls it immediately.
+    local engine = self
+    local my_gen = self.play_generation
+    local function launchAndStart()
+        -- Guard: bail if a newer play()/stop() call superseded us
+        if (engine.play_generation or 0) ~= my_gen then return end
+        if not engine.is_speaking then return end
+
+        -- Launch in background and capture PID for reliable process tracking.
+        -- io.popen runs: sh -c '<play_cmd> >/dev/null 2>&1 & echo $!'
+        -- The shell backgrounds the player, prints its PID, and exits.
+        logger.dbg("TTSEngine: Launching:", pid_cmd)
+        local handle = io.popen(pid_cmd)
+        local pid_str = handle and handle:read("*a") or ""
+        if handle then handle:close() end
+        engine.audio_pid = tonumber(pid_str:match("(%d+)"))
+        logger.dbg("TTSEngine: Audio PID:", engine.audio_pid)
+
+        -- Start timing loop for word highlighting (does NOT detect completion)
+        engine:startTimingLoop()
+
+        -- Start process watcher — detects normal completion AND BT early-death.
+        -- For BT, the watcher retries once if the process dies within 2s (A2DP
+        -- negotiation failure). This replaces the old blocking os.execute("sleep")
+        -- checks so the UI stays responsive for rotation, taps, etc.
+        engine:_startProcessWatcher(true)
     end
-    
-    -- Start timing loop for word highlighting (does NOT detect completion)
-    self:startTimingLoop()
-    
-    -- Start process watcher to detect when audio finishes
-    self:_startProcessWatcher()
-    
+
+    if self.audio_player_type == "gst-bt" then
+        -- Non-blocking pause (0.3s) to let the kernel reclaim the abstract
+        -- socket before launching gst-launch.  UIManager:scheduleIn() keeps
+        -- the main loop running so rotation / input events are processed.
+        UIManager:scheduleIn(0.3, launchAndStart)
+    else
+        -- Non-BT: launch immediately (no socket contention)
+        launchAndStart()
+    end
+
     return true
 end
 
@@ -696,6 +730,23 @@ function TTSEngine:getAudioDurationMs()
 end
 
 --[[--
+Force-kill the current audio process AND any orphan gst-launch-1.0 processes.
+Uses SIGKILL (not SIGTERM) because gst-launch with mtkbtmwrpcaudiosink holds
+an abstract UNIX socket (@kobo:mtkbtmwrpc) that isn't released on graceful
+shutdown fast enough, causing "Address already in use" for the next launch.
+--]]
+function TTSEngine:_killAudioProcess()
+    if self.audio_pid then
+        os.execute("kill -9 " .. self.audio_pid .. " 2>/dev/null")
+        self.audio_pid = nil
+    end
+    -- Catch any orphan gst-launch-1.0 processes we may have lost track of
+    if self.audio_player_type == "gst-bt" then
+        os.execute("killall -9 gst-launch-1.0 2>/dev/null")
+    end
+end
+
+--[[--
 Check if the audio player process is still running.
 @return boolean true if process is alive
 --]]
@@ -707,30 +758,81 @@ end
 
 --[[--
 Poll for audio process exit. When the player process finishes,
-trigger playback completion. Replaces fragile timing-based completion.
+trigger playback completion.
+
+For Bluetooth audio, also detects "early death" — if gst-launch exits
+within 2 seconds it means A2DP negotiation failed (no connected sink).
+On first early death it retries once (kill, 0.5s socket wait, relaunch).
+On second early death it shows an error and stops the reading chain.
+
+All waits use UIManager:scheduleIn so the main loop stays responsive
+for rotation, taps, and other input events.
+
+@param bt_retry_allowed boolean Whether BT early-death retry is allowed
 --]]
-function TTSEngine:_startProcessWatcher()
+function TTSEngine:_startProcessWatcher(bt_retry_allowed)
     local my_gen = self.play_generation or 0
-    -- Short delay to let the process start up
-    local initial_delay = 0.3
+    local launch_time = UIManager:getTime()
+    local BT_EARLY_DEATH_MS = 2000
+    local engine = self
 
     local function checkProcess()
-        if (self.play_generation or 0) ~= my_gen then return end
-        if not self.is_speaking then return end
-        if self.is_paused then
+        if (engine.play_generation or 0) ~= my_gen then return end
+        if not engine.is_speaking then return end
+        if engine.is_paused then
             UIManager:scheduleIn(0.5, checkProcess)
             return
         end
 
-        if self:_isAudioProcessRunning() then
+        if engine:_isAudioProcessRunning() then
             UIManager:scheduleIn(0.3, checkProcess)
         else
-            logger.dbg("TTSEngine: Process watcher detected playback end")
-            self:onPlaybackComplete()
+            local elapsed_ms = time.to_ms(UIManager:getTime() - launch_time)
+
+            -- BT early-death detection: gst-launch exits in <0.5s when
+            -- there is no A2DP sink but survives >2s when streaming.
+            if engine.audio_player_type == "gst-bt" and elapsed_ms < BT_EARLY_DEATH_MS then
+                if bt_retry_allowed then
+                    logger.warn("TTSEngine: gst-launch died early (" .. elapsed_ms .. "ms), retrying…")
+                    engine:_killAudioProcess()
+                    -- Non-blocking 0.5s wait for socket release, then retry
+                    UIManager:scheduleIn(0.5, function()
+                        if (engine.play_generation or 0) ~= my_gen then return end
+                        if not engine.is_speaking then return end
+                        local handle = io.popen(engine._last_pid_cmd)
+                        local pid_str = handle and handle:read("*a") or ""
+                        if handle then handle:close() end
+                        engine.audio_pid = tonumber(pid_str:match("(%d+)"))
+                        logger.dbg("TTSEngine: Retry PID:", engine.audio_pid)
+                        -- Restart watcher WITHOUT retry (second chance only)
+                        engine:_startProcessWatcher(false)
+                    end)
+                else
+                    -- Retry also failed — BT not connected
+                    logger.warn("TTSEngine: gst-launch died on retry — BT audio not connected")
+                    engine.is_speaking = false
+                    engine.audio_pid = nil
+                    engine.play_generation = (engine.play_generation or 0) + 1
+                    engine:cleanup()
+                    UIManager:show(InfoMessage:new{
+                        text = _("Bluetooth audio not connected.\n\nPlease make sure your Bluetooth headphones or speaker are:\n\n1. Powered on\n2. Paired in Kobo Settings → Bluetooth\n3. Connected and within range\n\nThen try again."),
+                        timeout = 10,
+                    })
+                    -- Signal failure to SyncController so it stops the chain
+                    if engine.on_fail_callback then
+                        engine.on_fail_callback()
+                    end
+                end
+            else
+                -- Normal completion (process streamed successfully then exited)
+                logger.dbg("TTSEngine: Process watcher detected playback end")
+                engine:onPlaybackComplete()
+            end
         end
     end
 
-    UIManager:scheduleIn(initial_delay, checkProcess)
+    -- Short initial delay to let the process initialize
+    UIManager:scheduleIn(0.3, checkProcess)
 end
 
 --[[--
@@ -742,11 +844,8 @@ function TTSEngine:onPlaybackComplete()
     self.is_speaking = false
     -- Bump generation so stale watcher/timing loops exit
     self.play_generation = (self.play_generation or 0) + 1
-    -- Kill the audio process by PID
-    if self.audio_pid then
-        os.execute("kill " .. self.audio_pid .. " 2>/dev/null")
-        self.audio_pid = nil
-    end
+    -- Force-kill the audio process (SIGKILL to release the BT socket immediately)
+    self:_killAudioProcess()
     self:cleanup()
     
     if self.on_complete_callback then
@@ -792,21 +891,32 @@ end
 Stop playback.
 --]]
 function TTSEngine:stop()
-    if self.is_speaking then
-        self.is_speaking = false
-        self.is_paused = false
-        -- Bump generation so stale watcher/timing loops exit
-        self.play_generation = (self.play_generation or 0) + 1
-        
-        -- Kill audio player by PID
-        if self.audio_pid then
-            os.execute("kill " .. self.audio_pid .. " 2>/dev/null")
-            self.audio_pid = nil
-        end
-        
-        self:cleanup()
-        logger.dbg("TTSEngine: Stopped")
+    -- Always bump generation and clear state, even if not speaking.
+    -- This ensures stale scheduled callbacks (launchAndStart, checkProcess,
+    -- updateTiming) exit immediately regardless of what state we were in.
+    self.is_speaking = false
+    self.is_paused = false
+    self.play_generation = (self.play_generation or 0) + 1
+    
+    -- Force-kill audio player (SIGKILL to release BT socket immediately)
+    self:_killAudioProcess()
+    
+    self:cleanup()
+    logger.dbg("TTSEngine: Stopped")
+end
+
+--[[--%
+Unconditionally kill all gst-launch-1.0 processes and clean up.
+Called on plugin teardown to prevent orphaned processes from holding
+the BT A2DP socket when Nickel resumes after KOReader exits.
+--]]
+function TTSEngine:forceKillAll()
+    if self.audio_pid then
+        os.execute("kill -9 " .. self.audio_pid .. " 2>/dev/null")
+        self.audio_pid = nil
     end
+    os.execute("killall -9 gst-launch-1.0 2>/dev/null")
+    self:cleanup()
 end
 
 --[[--
