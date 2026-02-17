@@ -41,6 +41,7 @@ local PlaybackBar = InputContainer:extend{
     on_rewind = nil,
     on_forward = nil,
     on_close = nil,
+    on_realign = nil,
 }
 
 function PlaybackBar:init()
@@ -112,6 +113,21 @@ function PlaybackBar:setupUI()
         show_parent = self,
     }
     
+    -- Re-align button (go to the page currently being read)
+    self.realign_button = Button:new{
+        text = "📌",
+        width = button_width,
+        max_width = button_width,
+        height = button_height,
+        text_font_size = button_font_size,
+        callback = function()
+            self:onRealign()
+        end,
+        bordersize = Size.border.button,
+        radius = Size.radius.button,
+        show_parent = self,
+    }
+
     -- Close button
     self.close_button = Button:new{
         text = "✕",
@@ -131,7 +147,7 @@ function PlaybackBar:setupUI()
     self.word_display = TextWidget:new{
         text = self.current_word or _("Starting..."),
         face = Font:getFace("cfont", 16),
-        max_width = self.width - button_width * 4 - spacing * 6,
+        max_width = self.width - button_width * 5 - spacing * 7,
         truncate_left = true,
     }
     
@@ -153,6 +169,8 @@ function PlaybackBar:setupUI()
         self.play_pause_button,
         HorizontalSpan:new{ width = spacing },
         self.forward_button,
+        HorizontalSpan:new{ width = spacing },
+        self.realign_button,
         HorizontalSpan:new{ width = spacing * 2 },
         self.close_button,
     }
@@ -235,6 +253,12 @@ function PlaybackBar:onForwardHold()
     end
 end
 
+function PlaybackBar:onRealign()
+    if self.on_realign then
+        self.on_realign()
+    end
+end
+
 function PlaybackBar:onClose()
     if self.on_close then
         self.on_close()
@@ -309,13 +333,16 @@ new bottom edge.
 --]]
 function PlaybackBar:onSetDimensions()
     if not self.visible then return end
-    -- Re-derive width and height from the (potentially rotated) screen
-    self.width = Screen:getWidth()
-    self.height = Screen:scaleBySize(80)
+    logger.warn("PlaybackBar: onSetDimensions, new screen =", Screen:getWidth(), "x", Screen:getHeight())
     -- Preserve current playback state across the rebuild
     local was_playing = self.is_playing
     local word = self.current_word
     local progress = self.progress
+    -- Remove from UIManager so the old x,y coordinates are discarded
+    UIManager:close(self)
+    -- Re-derive width and height from the (potentially rotated) screen
+    self.width = Screen:getWidth()
+    self.height = Screen:scaleBySize(80)
     -- Rebuild the UI tree with new dimensions
     self:setupUI()
     -- Restore state into the fresh widgets
@@ -325,9 +352,9 @@ function PlaybackBar:onSetDimensions()
     self:updatePlayPauseButton()
     if word and word ~= "" then self.word_display:setText(word) end
     self.progress_bar:setPercentage(progress / 100)
-    -- Reposition at the new screen bottom
-    self.dimen.x = 0
-    self.dimen.y = Screen:getHeight() - self.dimen.h
+    -- Re-show at the correct position — this registers the new x,y
+    -- with UIManager so paintTo receives the right coordinates.
+    self:show()
     UIManager:setDirty(self, "ui")
     return true
 end
@@ -336,9 +363,10 @@ end
 --- our bar area.  Swipe/pan gestures are ALWAYS passed through so the
 --- bottom-swipe ConfigMenu activation works even when the bar is visible.
 function PlaybackBar:handleEvent(event)
-    if event.handler == "onGesture" or (event.args and event.args[1] and event.args[1].ges) then
+    local arg1 = event.args and event.args[1]
+    if event.handler == "onGesture" or (type(arg1) == "table" and arg1.ges) then
         -- This is a gesture event from GestureDetector
-        local ges = event.args and event.args[1]
+        local ges = type(arg1) == "table" and arg1 or nil
         if ges and (ges.ges == "swipe" or ges.ges == "pan" or ges.ges == "hold" or ges.ges == "hold_pan") then
             -- Let swipe/pan/hold pass through unconditionally
             return false

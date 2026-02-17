@@ -48,6 +48,8 @@ function SyncController:new(o)
     o.sentence_sync_start = nil
     o.pause_time = nil
     o.playback_bar = nil
+    -- Xpointer of the page currently being read (for re-align)
+    o.reading_page_xpointer = nil
 
     return o
 end
@@ -87,6 +89,16 @@ function SyncController:start(text)
     self.current_sentence_index = 0
     self.current_sentence = nil
 
+    -- Remember the xpointer of the page we're reading so the user can
+    -- re-align the view after browsing away.
+    if self.plugin and self.plugin.ui and self.plugin.ui.document
+            and self.plugin.ui.rolling
+            and self.plugin.ui.document.getXPointer then
+        pcall(function()
+            self.reading_page_xpointer = self.plugin.ui.document:getXPointer()
+        end)
+    end
+
     logger.dbg("SyncController: Parsed", self.total_sentences, "sentences")
 
     -- Show playback bar only if not already showing (preserves bar across page turns)
@@ -104,10 +116,11 @@ Chains automatically: when a sentence finishes, this is called again.
 --]]
 function SyncController:readNextSentence()
     self.reading_sentence_idx = self.reading_sentence_idx + 1
+    logger.warn("SyncController: readNextSentence idx=", self.reading_sentence_idx, "/", self.total_sentences, "state=", self.state)
 
     if self.reading_sentence_idx > self.total_sentences then
         -- All sentences on this page are done
-        logger.dbg("SyncController: All", self.total_sentences, "sentences done")
+        logger.warn("SyncController: All", self.total_sentences, "sentences done, auto_advance=", self.plugin and self.plugin:getSetting("auto_advance", true))
         if self.plugin and self.plugin:getSetting("auto_advance", true) then
             self:advanceToNextPage()
         else
@@ -130,7 +143,18 @@ function SyncController:readNextSentence()
         self.reading_sentence_idx, "/", self.total_sentences, ":",
         sentence.text:sub(1, 60))
 
-    -- Synthesize this single sentence
+    -- Check if we already prefetched this sentence's audio
+    local used_prefetch = self.tts_engine:usePrefetched(sentence.text)
+    if used_prefetch then
+        -- Audio is ready — apply timing and start playback immediately
+        logger.warn("SyncController: Using prefetched audio for sentence", self.reading_sentence_idx)
+        controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
+        controller:beginSentencePlayback(sentence)
+        return
+    end
+
+    -- No prefetch available — synthesize now (first sentence, or prefetch missed)
+    logger.warn("SyncController: Synthesizing sentence", self.reading_sentence_idx, "(", sentence.text:sub(1,40), ")")
     local success = self.tts_engine:synthesize(sentence.text, function(synth_success, timing_data)
         if not synth_success then
             logger.warn("SyncController: Synthesis failed for sentence", controller.reading_sentence_idx)
@@ -184,6 +208,7 @@ Begin audio playback for one sentence.
 @param sentence table Sentence object
 --]]
 function SyncController:beginSentencePlayback(sentence)
+    logger.warn("SyncController: beginSentencePlayback sentence", sentence.index, "has_audio=", self.tts_engine.current_audio_file ~= nil)
     self.state = self.STATE.PLAYING
     self.current_sentence = sentence
     self.current_sentence_index = sentence.index
@@ -209,6 +234,7 @@ function SyncController:beginSentencePlayback(sentence)
         -- Completion callback — chain to next sentence with a configurable delay
         -- that depends on whether the sentence ended at a paragraph break or mid-line.
         function()
+            logger.warn("SyncController: Completion callback for sentence", sentence.index, "state=", controller.state)
             controller.highlight_manager:clearHighlights()
             -- Choose delay based on the sentence's end_type tag
             local delay = 0.2  -- fallback
@@ -217,9 +243,12 @@ function SyncController:beginSentencePlayback(sentence)
             else
                 delay = (controller.plugin and controller.plugin:getSetting("sentence_pause", 0.1)) or 0.1
             end
+            logger.warn("SyncController: Scheduling next sentence in", delay, "s, state=", controller.state)
             UIManager:scheduleIn(delay, function()
                 if controller.state ~= controller.STATE.STOPPED then
                     controller:readNextSentence()
+                else
+                    logger.warn("SyncController: Chain BLOCKED — state is STOPPED when timer fired")
                 end
             end)
         end,
@@ -233,6 +262,10 @@ function SyncController:beginSentencePlayback(sentence)
     )
 
     if play_ok then
+        -- Prefetch the NEXT sentence's audio while this one plays.
+        -- This eliminates the espeak-ng synthesis delay between sentences.
+        self:_prefetchNextSentence()
+
         -- Highlight the sentence being read (deferred so it doesn't block audio)
         if self.plugin and self.plugin:getSetting("highlight_sentences", true) then
             UIManager:scheduleIn(0.1, function()
@@ -252,6 +285,32 @@ function SyncController:beginSentencePlayback(sentence)
     end
 
     logger.dbg("SyncController: Playback started for sentence", sentence.index)
+end
+
+--[[--
+Prefetch the next sentence's audio in the background.
+Called right after the current sentence starts playing, so espeak-ng
+runs its synthesis while audio is streaming. When the current sentence
+finishes, the next one's WAV is already on disk.
+--]]
+function SyncController:_prefetchNextSentence()
+    local next_idx = self.reading_sentence_idx + 1
+    if not self.parsed_data or next_idx > self.total_sentences then
+        return -- nothing to prefetch
+    end
+    local next_sentence = self.parsed_data.sentences[next_idx]
+    if not next_sentence or not next_sentence.text or next_sentence.text == "" then
+        return
+    end
+    -- Defer prefetch so it doesn't block the UI thread.
+    -- espeak-ng synthesis takes ~100-300ms — running it synchronously right
+    -- after play() would freeze touch input.  Scheduling with a small delay
+    -- lets UIManager process any pending touch events first.
+    local engine = self.tts_engine
+    local text = next_sentence.text
+    UIManager:scheduleIn(0.05, function()
+        engine:prefetch(text)
+    end)
 end
 
 --[[--
@@ -283,9 +342,16 @@ function SyncController:showPlaybackBar()
         on_close = function()
             self:stop()
         end,
+        on_realign = function()
+            self:realignToReadingPage()
+        end,
     }
 
     self.playback_bar:show()
+
+    -- Force an immediate UI refresh so the bar is painted on the very next
+    -- cycle, even if another (toast) notification is still visible.
+    UIManager:setDirty(self.playback_bar, "ui")
 end
 
 --[[--
@@ -298,6 +364,31 @@ function SyncController:hidePlaybackBar()
     end
     -- Force full screen refresh on e-ink to cleanly remove bar and highlight artifacts
     UIManager:setDirty("all", "full")
+end
+
+--[[--
+Navigate the view back to the page currently being read aloud.
+Triggered by the re-align (📌) button on the PlaybackBar.
+--]]
+function SyncController:realignToReadingPage()
+    if not self.reading_page_xpointer then
+        logger.dbg("SyncController: No reading xpointer to realign to")
+        return
+    end
+    if not self.plugin or not self.plugin.ui then return end
+    local ui = self.plugin.ui
+    if ui.rolling then
+        ui:handleEvent(Event:new("GotoXPointer", self.reading_page_xpointer))
+    end
+    -- Re-apply sentence highlight after the page settles
+    if self.current_sentence
+            and self.plugin:getSetting("highlight_sentences", true) then
+        local sentence = self.current_sentence
+        UIManager:scheduleIn(0.3, function()
+            pcall(self.highlightCurrentSentence, self, sentence)
+        end)
+    end
+    self.current_word_index = 0  -- force word re-highlight
 end
 
 --[[--
@@ -337,7 +428,8 @@ function SyncController:startSentenceSyncLoop(sentence)
     local my_generation = self.sync_generation
 
     local function syncUpdate()
-        if self.state ~= self.STATE.PLAYING then
+        -- Only exit completely if stopped or superseded
+        if self.state == self.STATE.STOPPED then
             return
         end
         if self.sync_generation ~= my_generation then
@@ -345,6 +437,9 @@ function SyncController:startSentenceSyncLoop(sentence)
         end
 
         -- Auto-pause when a menu/dialog opens (we can't receive ShowConfigMenu events)
+        -- IMPORTANT: this must run even when state==PAUSED so we can detect the
+        -- overlay closing and call resume().  The old code checked state==PLAYING
+        -- first, which caused the loop to exit permanently while paused.
         if self.playback_bar and self.playback_bar._isOverlayActive and self.playback_bar:_isOverlayActive() then
             if not self._auto_paused_by_overlay then
                 self._auto_paused_by_overlay = true
@@ -357,6 +452,12 @@ function SyncController:startSentenceSyncLoop(sentence)
             self._auto_paused_by_overlay = false
             self:resume()
             return -- resume restarts the sync loop
+        end
+
+        -- Skip word-highlighting work when not actively playing
+        if self.state ~= self.STATE.PLAYING then
+            UIManager:scheduleIn(0.1, syncUpdate)
+            return
         end
 
         local elapsed = time.to_ms(UIManager:getTime() - self.sentence_sync_start)
@@ -489,6 +590,21 @@ function SyncController:resume()
             self.playback_bar:updatePlayState(true)
         end
 
+        -- Re-apply sentence highlight — CRe's native selection is wiped
+        -- whenever the page redraws (e.g. after rotation), so we must
+        -- repaint it.
+        if self.current_sentence
+                and self.plugin
+                and self.plugin:getSetting("highlight_sentences", true) then
+            local sentence = self.current_sentence
+            UIManager:scheduleIn(0.15, function()
+                pcall(self.highlightCurrentSentence, self, sentence)
+            end)
+        end
+        -- Reset current_word_index so the sync loop's "changed?" check
+        -- will fire again and re-highlight the current word.
+        self.current_word_index = 0
+
         -- Restart the sync loop for the current sentence
         if self.current_sentence then
             self:startSentenceSyncLoop(self.current_sentence)
@@ -522,6 +638,7 @@ function SyncController:stop()
     self.current_sentence = nil
     self.sentence_sync_start = nil
     self.pause_time = nil
+    self.reading_page_xpointer = nil
 
     logger.dbg("SyncController: Stopped")
 end

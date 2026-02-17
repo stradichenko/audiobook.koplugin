@@ -121,10 +121,6 @@ function Audiobook:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = "――――――――――",
-                enabled = false,
-            },
-            {
                 text_func = function()
                     local voice_label = self:getSetting("tts_voice_label", "English (GB)")
                     local variant_label = self:getSetting("tts_variant_label", "")
@@ -150,16 +146,12 @@ function Audiobook:addToMainMenu(menu_items)
                 sub_item_table = self:buildHighlightStyleMenu(),
             },
             {
-                text = "――――――――――",
-                enabled = false,
-            },
-            {
                 text = _("Auto-advance pages"),
                 checked_func = function()
                     return self:getSetting("auto_advance", true)
                 end,
                 callback = function()
-                    self:toggleSetting("auto_advance")
+                    self:toggleSetting("auto_advance", true)
                 end,
             },
             {
@@ -168,7 +160,7 @@ function Audiobook:addToMainMenu(menu_items)
                     return self:getSetting("highlight_words", true)
                 end,
                 callback = function()
-                    self:toggleSetting("highlight_words")
+                    self:toggleSetting("highlight_words", true)
                 end,
             },
             {
@@ -177,12 +169,8 @@ function Audiobook:addToMainMenu(menu_items)
                     return self:getSetting("highlight_sentences", true)
                 end,
                 callback = function()
-                    self:toggleSetting("highlight_sentences")
+                    self:toggleSetting("highlight_sentences", true)
                 end,
-            },
-            {
-                text = "――――――――――",
-                enabled = false,
             },
             {
                 text_func = function()
@@ -211,9 +199,27 @@ function Audiobook:onDictButtonsReady(dict_popup, buttons)
         font_bold = false,
         callback = function()
             local word = dict_popup.word or dict_popup.lookupword
+            -- Capture surrounding text context from the highlight selection
+            -- so we can find the correct occurrence of the word on the page,
+            -- not just the first one.
+            local selected_text_context = nil
+            if dict_popup.highlight and dict_popup.highlight.selected_text then
+                local sel = dict_popup.highlight.selected_text
+                -- For CRe docs, pos0 is an xpointer string with an offset;
+                -- for paged docs it's a table.  Either way, save the surrounding
+                -- selected text or the raw pos0 for position matching.
+                selected_text_context = {
+                    pos0 = sel.pos0,
+                    pos1 = sel.pos1,
+                }
+            end
             UIManager:close(dict_popup)
-            UIManager:scheduleIn(0.1, function()
-                plugin:startReadAlongFromWord(word)
+            -- Give the dictionary popup and any parent highlight enough time
+            -- to fully close and leave the UIManager window stack before we
+            -- add the PlaybackBar.  Too short a delay means _isOverlayActive()
+            -- still sees stale non-toast widgets and suppresses the bar.
+            UIManager:scheduleIn(0.3, function()
+                plugin:startReadAlongFromWord(word, selected_text_context)
             end)
         end,
     }})
@@ -246,15 +252,10 @@ function Audiobook:buildVoiceSettingsMenu()
         sub_item_table = self:buildVolumeMenu(),
     })
 
-    table.insert(menu, {
-        text = "――――――――――",
-        enabled = false,
-    })
-
     -- Pause between sentences (after . ? ! ; :)
     table.insert(menu, {
         text_func = function()
-            return T(_("Sentence pause: %1s"), self:getSetting("sentence_pause", 0.1))
+            return T(_("Sentence pause (. ? ! ; :): %1s"), self:getSetting("sentence_pause", 0.1))
         end,
         sub_item_table = self:buildSentencePauseMenu(),
     })
@@ -262,7 +263,7 @@ function Audiobook:buildVoiceSettingsMenu()
     -- Pause between paragraphs (at newlines)
     table.insert(menu, {
         text_func = function()
-            return T(_("Paragraph pause: %1s"), self:getSetting("paragraph_pause", 0.8))
+            return T(_("Paragraph pause (newlines): %1s"), self:getSetting("paragraph_pause", 0.8))
         end,
         sub_item_table = self:buildParagraphPauseMenu(),
     })
@@ -270,14 +271,9 @@ function Audiobook:buildVoiceSettingsMenu()
     -- Word gap (silence between words within a sentence)
     table.insert(menu, {
         text_func = function()
-            return T(_("Word gap: %1"), self:getSetting("word_gap", 0))
+            return T(_("Word gap (between words): %1"), self:getSetting("word_gap", 0))
         end,
         sub_item_table = self:buildWordGapMenu(),
-    })
-
-    table.insert(menu, {
-        text = "――――――――――",
-        enabled = false,
     })
 
     -- Voice / accent selection
@@ -504,12 +500,7 @@ function Audiobook:buildVoiceMenu()
     -- Voice / gender variant submenu
     local variant_sub = {}
     for _i, v in ipairs(variants) do
-        if v.separator then
-            table.insert(variant_sub, {
-                text = "――――――――――",
-                enabled = false,
-            })
-        else
+        if not v.separator then
             table.insert(variant_sub, {
                 text = v.label,
                 checked_func = function()
@@ -901,18 +892,11 @@ function Audiobook:startReadAlong(text, start_pos)
         })
         return
     end
-    
-    -- Show starting notification with TTS info
-    local backend_name = self.tts_engine.backend or "unknown"
-    UIManager:show(InfoMessage:new{
-        text = string.format(_("Starting read-along...\n\nUsing: %s\nText: %d characters"), backend_name, #page_text),
-        timeout = 2,
-    })
-    
+
     self.sync_controller:start(page_text)
 end
 
-function Audiobook:startReadAlongFromWord(word)
+function Audiobook:startReadAlongFromWord(word, context)
     local page_text = self:getCurrentPageText()
     if not page_text or page_text == "" then
         -- Try to get text from the dictionary lookup context instead
@@ -936,15 +920,76 @@ function Audiobook:startReadAlongFromWord(word)
     -- Find the word position in the page text
     local start_pos = nil
     if word then
-        -- Find first occurrence of the word (escape special pattern chars)
+        -- Escape special pattern chars
         local pattern = word:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-        start_pos = page_text:find(pattern)
-        logger.dbg("Audiobook: Looking for word:", word, "found at:", start_pos)
+
+        -- Helper: find the occurrence of `pattern` in page_text closest to
+        -- `target_offset` (a character index into page_text).
+        local function find_closest_occurrence(target_offset)
+            local best_pos = nil
+            local best_dist = math.huge
+            local search_start = 1
+            while true do
+                local found = page_text:find(pattern, search_start)
+                if not found then break end
+                local dist = math.abs(found - target_offset)
+                if dist < best_dist then
+                    best_dist = dist
+                    best_pos = found
+                end
+                search_start = found + 1
+            end
+            return best_pos, best_dist
+        end
+
+        -- Primary approach: convert the xpointer to a screen position,
+        -- then ask CRe for all text from the top of the page down to that
+        -- screen position.  The length of that text is the char offset
+        -- into page_text.
+        if context and context.pos0 and self.ui.document
+                and self.ui.rolling
+                and self.ui.document.getScreenPositionFromXPointer then
+            local ok, screen_y, screen_x = pcall(
+                self.ui.document.getScreenPositionFromXPointer,
+                self.ui.document, context.pos0)
+            if ok and screen_y then
+                local ScreenDev = Device.screen
+                -- Clamp screen_y to visible area
+                if screen_y < 0 then screen_y = 0 end
+                -- Get text from top-left of page to the word's position.
+                -- Use the word's screen_x so we stop in the middle of the
+                -- line rather than grabbing the whole line.
+                local use_x = (screen_x and screen_x > 0) and screen_x or ScreenDev:getWidth()
+                local ok2, res = pcall(
+                    self.ui.document.getTextFromPositions,
+                    self.ui.document,
+                    {x = 0, y = 0},
+                    {x = use_x, y = screen_y},
+                    true)
+                if ok2 and res and res.text then
+                    local approx_offset = #res.text
+                    local best, dist = find_closest_occurrence(approx_offset)
+                    if best then
+                        start_pos = best
+                        logger.warn("Audiobook: Found word '", word,
+                            "' via screen-pos at", start_pos,
+                            "(approx_offset=", approx_offset,
+                            "screen_y=", screen_y, "dist=", dist, ")")
+                    end
+                end
+            end
+        end
+
+        -- Final fallback: first occurrence
+        if not start_pos then
+            start_pos = page_text:find(pattern)
+            logger.warn("Audiobook: Found word '", word, "' via first-occurrence at", start_pos)
+        end
     end
     
     -- If we couldn't find the word, just start from beginning
     if not start_pos then
-        logger.dbg("Audiobook: Word not found, starting from beginning")
+        logger.warn("Audiobook: Word not found, starting from beginning")
         start_pos = 1
     end
     
@@ -1127,11 +1172,24 @@ function Audiobook:onCloseWidget()
     self:stopReadAlong()
 end
 
--- Handle screen rotation: briefly pause TTS so the screen can redraw,
--- then let the PlaybackBar rebuild itself via onSetDimensions.
+-- Handle screen rotation: pause TTS, rebuild the PlaybackBar for the new
+-- screen dimensions, then resume.
+-- NOTE: SetDimensions is dispatched via self.ui:handleEvent() which only
+-- reaches reader plugins — standalone UIManager widgets like PlaybackBar
+-- never receive it.  We must explicitly tell the bar to rebuild here.
 function Audiobook:onSetRotationMode()
-    if self.sync_controller:isPlaying() then
+    local was_playing = self.sync_controller:isPlaying()
+    if was_playing then
         self.sync_controller:pause()
+    end
+    -- Rebuild the PlaybackBar for the new screen size.
+    -- Screen dimensions have already been updated by ReaderView before
+    -- this event reaches us.
+    local bar = self.sync_controller and self.sync_controller.playback_bar
+    if bar and bar.visible then
+        bar:onSetDimensions()
+    end
+    if was_playing then
         -- Resume after a short delay to let the rotation redraw settle
         UIManager:scheduleIn(0.5, function()
             if self.sync_controller:isPaused() then
@@ -1156,8 +1214,8 @@ function Audiobook:setSetting(key, value)
     G_reader_settings:saveSetting("audiobook_settings", settings)
 end
 
-function Audiobook:toggleSetting(key)
-    local current = self:getSetting(key, false)
+function Audiobook:toggleSetting(key, default)
+    local current = self:getSetting(key, default or false)
     self:setSetting(key, not current)
 end
 
