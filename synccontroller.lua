@@ -368,7 +368,7 @@ end
 
 --[[--
 Navigate the view back to the page currently being read aloud.
-Triggered by the re-align (📌) button on the PlaybackBar.
+Triggered by the re-align button on the PlaybackBar.
 --]]
 function SyncController:realignToReadingPage()
     if not self.reading_page_xpointer then

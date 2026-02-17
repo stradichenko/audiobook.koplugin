@@ -89,17 +89,17 @@ end
 
 function Audiobook:addToMainMenu(menu_items)
     menu_items.audiobook = {
-        text = _("🔊 Audiobook Read-Along"),
+        text = _("Audiobook Read-Along"),
         sorting_hint = "tools",
         sub_item_table = {
             {
-                text = _("▶ Start reading from current page"),
+                text = _("Start reading from current page"),
                 callback = function()
                     self:startReadAlong()
                 end,
             },
             {
-                text = _("⏹ Stop reading"),
+                text = _("Stop reading"),
                 callback = function()
                     self:stopReadAlong()
                 end,
@@ -108,7 +108,7 @@ function Audiobook:addToMainMenu(menu_items)
                 end,
             },
             {
-                text = _("⏸ Pause/Resume"),
+                text = _("Pause/Resume"),
                 callback = function()
                     if self.sync_controller:isPlaying() then
                         self:pauseReadAlong()
@@ -127,7 +127,7 @@ function Audiobook:addToMainMenu(menu_items)
                     if variant_label ~= "" and variant_label ~= "Default (male)" then
                         voice_label = voice_label .. " — " .. variant_label
                     end
-                    return T(_("🎤 Voice settings (%1)"), voice_label)
+                    return T(_("Voice settings (%1)"), voice_label)
                 end,
                 sub_item_table_func = function()
                     return self:buildVoiceSettingsMenu()
@@ -195,7 +195,7 @@ function Audiobook:onDictButtonsReady(dict_popup, buttons)
     -- Add "Read aloud from here" button at the end (below Wikipedia/Search/Close)
     table.insert(buttons, {{
         id = "audiobook_read",
-        text = _("🔊 Read aloud from here"),
+        text = _("Read aloud from here"),
         font_bold = false,
         callback = function()
             local word = dict_popup.word or dict_popup.lookupword
@@ -444,30 +444,48 @@ function Audiobook:buildVoiceMenu()
     local variants = {
         { id = "",         label = _("Default (male)") },
         { separator = true },
-        { id = "f1",       label = _("♀ Female 1") },
-        { id = "f2",       label = _("♀ Female 2") },
-        { id = "f3",       label = _("♀ Female 3") },
-        { id = "f4",       label = _("♀ Female 4 (breathy)") },
-        { id = "f5",       label = _("♀ Female 5") },
+        -- Female voices
+        { id = "f1",       label = _("Female 1") },
+        { id = "f2",       label = _("Female 2") },
+        { id = "f3",       label = _("Female 3") },
+        { id = "f4",       label = _("Female 4 (breathy)") },
+        { id = "f5",       label = _("Female 5") },
         { separator = true },
-        { id = "Annie",    label = _("♀ Annie") },
-        { id = "Alicia",   label = _("♀ Alicia") },
-        { id = "belinda",  label = _("♀ Belinda") },
-        { id = "linda",    label = _("♀ Linda") },
-        { id = "steph",    label = _("♀ Steph") },
-        { id = "Andrea",   label = _("♀ Andrea") },
-        { id = "anika",    label = _("♀ Anika") },
-        { id = "aunty",    label = _("♀ Aunty") },
-        { id = "grandma",  label = _("♀ Grandma") },
+        { id = "Annie",    label = _("Annie (F)") },
+        { id = "Alicia",   label = _("Alicia (F)") },
+        { id = "belinda",  label = _("Belinda (F)") },
+        { id = "linda",    label = _("Linda (F)") },
+        { id = "steph",    label = _("Steph (F)") },
+        { id = "Andrea",   label = _("Andrea (F)") },
+        { id = "anika",    label = _("Anika (F)") },
+        { id = "aunty",    label = _("Aunty (F)") },
+        { id = "grandma",  label = _("Grandma (F)") },
         { separator = true },
-        { id = "m1",       label = _("♂ Male 1") },
-        { id = "m2",       label = _("♂ Male 2") },
-        { id = "m3",       label = _("♂ Male 3") },
-        { id = "m7",       label = _("♂ Male 7") },
+        -- Male voices
+        { id = "m1",       label = _("Male 1") },
+        { id = "m2",       label = _("Male 2") },
+        { id = "m3",       label = _("Male 3") },
+        { id = "m7",       label = _("Male 7") },
+        { id = "Alex",     label = _("Alex (M)") },
+        { id = "Andy",     label = _("Andy (M)") },
+        { id = "Gene",     label = _("Gene (M)") },
+        { id = "Lee",      label = _("Lee (M)") },
+        { id = "shelby",   label = _("Shelby (M, smooth)") },
         { separator = true },
-        { id = "whisper",  label = _("🤫 Whisper") },
-        { id = "whisperf", label = _("🤫 Whisper (female)") },
-        { id = "croak",    label = _("🐸 Croak") },
+        -- Softer / less robotic
+        { id = "robosoft",  label = _("Robosoft 1 (softer)") },
+        { id = "robosoft2", label = _("Robosoft 2 (softer)") },
+        { id = "robosoft3", label = _("Robosoft 3 (softer)") },
+        { id = "robosoft4", label = _("Robosoft 4 (softer)") },
+        { id = "robosoft5", label = _("Robosoft 5 (softer)") },
+        { id = "robosoft6", label = _("Robosoft 6 (softer)") },
+        { id = "robosoft7", label = _("Robosoft 7 (softer)") },
+        { id = "robosoft8", label = _("Robosoft 8 (softer)") },
+        { separator = true },
+        -- Special
+        { id = "whisper",  label = _("Whisper") },
+        { id = "whisperf", label = _("Whisper (female)") },
+        { id = "croak",    label = _("Croak") },
     }
 
     local menu = {}
@@ -557,22 +575,22 @@ end
 function Audiobook:btMenuLabel()
     local bt = self.bt_manager
     if not bt:isPowered() then
-        return _("⚫ Bluetooth (off)")
+        return _("Bluetooth (off)")
     end
     -- Find a connected device to show its name
     local devices = bt:listAudioDevices()
     for _i, dev in ipairs(devices) do
         if dev.connected then
             local dname = dev.name ~= "" and dev.name or dev.address
-            return T(_("🔵 BT: %1"), dname)
+            return T(_("BT: %1"), dname)
         end
     end
     -- Powered but nothing connected
     local saved = self:getSetting("bt_device_name", nil)
     if saved then
-        return T(_("🔵 BT: %1 (not connected)"), saved)
+        return T(_("BT: %1 (not connected)"), saved)
     end
-    return _("🔵 Bluetooth (on — no device)")
+    return _("Bluetooth (on)")
 end
 
 function Audiobook:buildBluetoothMenu()
@@ -582,7 +600,7 @@ function Audiobook:buildBluetoothMenu()
 
     -- Power toggle
     table.insert(menu, {
-        text = powered and _("⏻ Turn Bluetooth off") or _("⏻ Turn Bluetooth on"),
+        text = powered and _("Turn Bluetooth off") or _("Turn Bluetooth on"),
         callback = function()
             if powered then
                 bt:powerOff()
@@ -609,22 +627,12 @@ function Audiobook:buildBluetoothMenu()
         return menu
     end
 
-    table.insert(menu, {
-        text = "――――――――――",
-        enabled = false,
-    })
-
     -- Scan for devices
     table.insert(menu, {
-        text = _("🔍 Scan for new devices…"),
+        text = _("Scan for new devices..."),
         callback = function()
             self:btScanAndShow()
         end,
-    })
-
-    table.insert(menu, {
-        text = "――――――――――",
-        enabled = false,
     })
 
     -- List known / visible devices — single-tap to connect
@@ -639,7 +647,7 @@ function Audiobook:buildBluetoothMenu()
         local label = dev.name ~= "" and dev.name or dev.address
         local icon = "  "
         if dev.connected then
-            icon = "🔗 "
+            icon = "[*] "
         elseif dev.paired then
             icon = "✓ "
         end
@@ -829,7 +837,7 @@ function Audiobook:btScanAndShow()
             for _, dev in ipairs(devices) do
                 local tag = ""
                 if dev.connected then
-                    tag = " 🔗"
+                    tag = " [*]"
                 elseif dev.paired then
                     tag = " ✓"
                 end

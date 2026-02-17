@@ -115,7 +115,7 @@ function PlaybackBar:setupUI()
     
     -- Re-align button (go to the page currently being read)
     self.realign_button = Button:new{
-        text = "📌",
+        text = "○",
         width = button_width,
         max_width = button_width,
         height = button_height,
@@ -164,13 +164,13 @@ function PlaybackBar:setupUI()
     -- Button row
     local button_row = HorizontalGroup:new{
         align = "center",
+        self.realign_button,
+        HorizontalSpan:new{ width = spacing * 2 },
         self.rewind_button,
         HorizontalSpan:new{ width = spacing },
         self.play_pause_button,
         HorizontalSpan:new{ width = spacing },
         self.forward_button,
-        HorizontalSpan:new{ width = spacing },
-        self.realign_button,
         HorizontalSpan:new{ width = spacing * 2 },
         self.close_button,
     }
