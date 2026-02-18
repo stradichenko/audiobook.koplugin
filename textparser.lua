@@ -102,16 +102,19 @@ function TextParser:parseSentences(text)
     for line in (text .. "\n"):gmatch("([^\n]+)\n") do
         line = line:match("^%s*(.-)%s*$")
         if line and line ~= "" then
-            -- Step 2: split each line on sentence-ending punctuation (.?!;:)
+            -- Step 2: split each line on sentence-ending punctuation (.?!)
             -- followed by a space or end-of-string.
+            -- NOTE: semicolons (;) and colons (:) are NOT treated as sentence
+            -- endings — they are mid-sentence punctuation that should not
+            -- interrupt the reading flow.
             local pos = 1
             local segments_in_line = {}
             while pos <= #line do
-                -- Find .?!;: that is followed by a space (or is at end of line)
-                local pstart, pend = line:find("[%.%?!;:]+%s", pos)
+                -- Find .?! that is followed by a space (or is at end of line)
+                local pstart, pend = line:find("[%.%?!]+%s", pos)
                 if not pstart then
-                    -- Check for .?!;: at very end of line (no trailing space)
-                    pstart, pend = line:find("[%.%?!;:]+$", pos)
+                    -- Check for .?! at very end of line (no trailing space)
+                    pstart, pend = line:find("[%.%?!]+$", pos)
                 end
                 if pstart then
                     -- Include the punctuation but not the trailing space

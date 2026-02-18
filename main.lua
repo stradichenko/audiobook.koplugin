@@ -56,7 +56,7 @@ function Audiobook:init()
         full_voice = voice_base .. "+" .. voice_variant
     end
     self.tts_engine:setVoice(full_voice)
-    self.tts_engine:setWordGap(self:getSetting("word_gap", 0))
+    self.tts_engine:setWordGap(self:getSetting("word_gap", 2))
     self.highlight_manager = HighlightManager:new{
         plugin = self,
         ui = self.ui,
@@ -281,7 +281,7 @@ function Audiobook:buildVoiceSettingsMenu()
     -- Word gap (silence between words within a sentence)
     table.insert(menu, {
         text_func = function()
-            return T(_("Word gap (between words): %1"), self:getSetting("word_gap", 0))
+            return T(_("Word gap (between words): %1"), self:getSetting("word_gap", 2))
         end,
         sub_item_table = self:buildWordGapMenu(),
     })
@@ -406,9 +406,9 @@ function Audiobook:buildWordGapMenu()
     -- 0 = default (no extra gap), higher values slow down speech
     local values = {0, 1, 2, 5, 10, 20, 50}
     local labels = {
-        [0] = _("0 (default — no extra gap)"),
+        [0] = _("0 (no extra gap)"),
         [1] = _("1 (10ms)"),
-        [2] = _("2 (20ms)"),
+        [2] = _("2 (20ms — default)"),
         [5] = _("5 (50ms)"),
         [10] = _("10 (100ms)"),
         [20] = _("20 (200ms)"),
@@ -419,7 +419,7 @@ function Audiobook:buildWordGapMenu()
         table.insert(menu, {
             text = labels[v] or tostring(v),
             checked_func = function()
-                return self:getSetting("word_gap", 0) == v
+                return self:getSetting("word_gap", 2) == v
             end,
             callback = function()
                 self:setSetting("word_gap", v)
@@ -596,7 +596,7 @@ function Audiobook:buildBTDisconnectMenu()
                 return self:getSetting("bt_disconnect_check", 30) == opt.value
             end,
             callback = function()
-                self:saveSetting("bt_disconnect_check", opt.value)
+                self:setSetting("bt_disconnect_check", opt.value)
             end,
         })
     end
@@ -1186,21 +1186,9 @@ function Audiobook:getCurrentPageText()
     end
 
     if text and text ~= "" then
-        -- Trim to last complete sentence so we don't cut mid-word at page boundary.
-        -- Find the last sentence-ending punctuation (.?!) followed by whitespace or end.
-        local last_end = nil
-        for pos in text:gmatch("()[%.%?!]%s") do
-            last_end = pos  -- pos is the index of the punctuation mark
-        end
-        -- Also check if text ends with sentence-ending punctuation
-        if text:match("[%.%?!]%s*$") then
-            last_end = #text
-        end
-        if last_end and last_end < #text and last_end > 20 then
-            -- Trim: keep up to and including the punctuation mark
-            text = text:sub(1, last_end):match("^(.-)%s*$")  -- also strip trailing space
-            logger.dbg("Audiobook: Trimmed to last sentence end at pos", last_end)
-        end
+        -- Don't trim to last complete sentence — the visible text rectangle
+        -- from getTextFromPositions doesn't overlap between pages, so partial
+        -- sentences at page boundaries must be kept or they'll be skipped.
         logger.dbg("Audiobook: Got page text, length:", #text)
         return text
     end

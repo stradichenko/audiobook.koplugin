@@ -46,7 +46,7 @@ local PlaybackBar = InputContainer:extend{
 
 function PlaybackBar:init()
     self.width = self.width or Screen:getWidth()
-    self.height = self.height or Screen:scaleBySize(80)
+    self.height = self.height or Screen:scaleBySize(100)
     
     self.dimen = Geom:new{
         w = self.width,
@@ -76,7 +76,6 @@ function PlaybackBar:setupUI()
             self:onRewindHold()
         end,
         bordersize = Size.border.button,
-        radius = Size.radius.button,
         show_parent = self,
     }
     
@@ -91,7 +90,6 @@ function PlaybackBar:setupUI()
             self:onPlayPause()
         end,
         bordersize = Size.border.button,
-        radius = Size.radius.button,
         show_parent = self,
     }
     
@@ -109,7 +107,6 @@ function PlaybackBar:setupUI()
             self:onForwardHold()
         end,
         bordersize = Size.border.button,
-        radius = Size.radius.button,
         show_parent = self,
     }
     
@@ -124,7 +121,6 @@ function PlaybackBar:setupUI()
             self:onRealign()
         end,
         bordersize = Size.border.button,
-        radius = Size.radius.button,
         show_parent = self,
     }
 
@@ -139,7 +135,6 @@ function PlaybackBar:setupUI()
             self:onClose()
         end,
         bordersize = Size.border.button,
-        radius = Size.radius.button,
         show_parent = self,
     }
     
@@ -151,11 +146,17 @@ function PlaybackBar:setupUI()
         truncate_left = true,
     }
     
-    -- Progress bar
+    -- Progress bar — tall enough to be clearly visible on e-ink
     self.progress_bar = ProgressWidget:new{
         width = self.width - Size.padding.large * 2,
-        height = Screen:scaleBySize(6),
+        height = Screen:scaleBySize(10),
         percentage = self.progress / 100,
+        fillcolor = Blitbuffer.COLOR_BLACK,
+        bgcolor = Blitbuffer.COLOR_LIGHT_GRAY,
+        bordersize = 0,
+        margin_h = 0,
+        margin_v = 0,
+        radius = Screen:scaleBySize(5),
         ticks = nil,
         tick_width = 0,
         last = nil,
@@ -175,7 +176,8 @@ function PlaybackBar:setupUI()
         self.close_button,
     }
     
-    -- Main layout
+    -- Main layout — generous spacing so progress bar and buttons
+    -- are clearly separated from each other and the bottom edge.
     local content = VerticalGroup:new{
         align = "center",
         VerticalSpan:new{ width = Size.padding.small },
@@ -183,17 +185,17 @@ function PlaybackBar:setupUI()
             dimen = Geom:new{ w = self.width, h = self.word_display:getSize().h },
             self.word_display,
         },
-        VerticalSpan:new{ width = Size.padding.small },
+        VerticalSpan:new{ width = Size.padding.default },
         CenterContainer:new{
             dimen = Geom:new{ w = self.width, h = self.progress_bar:getSize().h },
             self.progress_bar,
         },
-        VerticalSpan:new{ width = Size.padding.default },
+        VerticalSpan:new{ width = Size.padding.large },
         CenterContainer:new{
             dimen = Geom:new{ w = self.width, h = button_height },
             button_row,
         },
-        VerticalSpan:new{ width = Size.padding.small },
+        VerticalSpan:new{ width = Size.padding.fullscreen },
     }
     
     -- Frame with background
@@ -342,7 +344,7 @@ function PlaybackBar:onSetDimensions()
     UIManager:close(self)
     -- Re-derive width and height from the (potentially rotated) screen
     self.width = Screen:getWidth()
-    self.height = Screen:scaleBySize(80)
+    self.height = Screen:scaleBySize(100)
     -- Rebuild the UI tree with new dimensions
     self:setupUI()
     -- Restore state into the fresh widgets

@@ -205,10 +205,13 @@ end
 
 --[[--
 Begin audio playback for one sentence.
+Uses GStreamer's concat element to chain ALL remaining sentences on the
+page into a single BT stream, eliminating every A2DP re-negotiation gap.
 @param sentence table Sentence object
 --]]
 function SyncController:beginSentencePlayback(sentence)
-    logger.warn("SyncController: beginSentencePlayback sentence", sentence.index, "has_audio=", self.tts_engine.current_audio_file ~= nil)
+    logger.warn("SyncController: beginSentencePlayback sentence", sentence.index,
+        "has_audio=", self.tts_engine.current_audio_file ~= nil)
     self.state = self.STATE.PLAYING
     self.current_sentence = sentence
     self.current_sentence_index = sentence.index
@@ -222,6 +225,74 @@ function SyncController:beginSentencePlayback(sentence)
         self.playback_bar:updateProgress(self:getProgress())
     end
 
+    -- Build concat pipeline with ALL remaining sentences on the page.
+    -- Each extra sentence takes ~100-300 ms to synthesize on ARM — far
+    -- less than the ~1.5 s BT A2DP re-negotiation gap it eliminates.
+    local concat_files = nil         -- array of {file, duration_ms} for play()
+    local concat_sentences = {}      -- sentence objects (N+1, N+2, …)
+    local concat_split_points = {}   -- cumulative-ms boundaries for the sync loop
+    local concat_wav_files = {}      -- WAV paths to clean up later
+
+    if self.parsed_data and self.tts_engine.audio_player_type == "gst-bt" then
+        local synth_t0 = UIManager:getTime()
+        local first_dur = self.tts_engine:getAudioDurationMs()
+        local cumulative_ms = first_dur
+        concat_files = {}
+
+        for idx = self.reading_sentence_idx + 1, self.total_sentences do
+            local sent = self.parsed_data.sentences[idx]
+            if not sent or not sent.text or sent.text == "" then
+                break
+            end
+
+            -- Reuse existing prefetch, or synthesize synchronously
+            local pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
+            if not pf_file then
+                self.tts_engine:prefetch(sent.text)
+                pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
+            end
+            if not pf_file or pf_dur <= 0 then
+                logger.warn("SyncController: Concat synthesis failed at sentence", idx)
+                break
+            end
+
+            -- Apply and scale timing so word highlighting works
+            controller:applySentenceTiming(sent, pf_timing)
+            if sent.words and #sent.words > 0 then
+                local last_w = sent.words[#sent.words]
+                if last_w.end_time and last_w.end_time > 0 then
+                    local scale = pf_dur / last_w.end_time
+                    for _, w in ipairs(sent.words) do
+                        if w.start_time then w.start_time = math.floor(w.start_time * scale) end
+                        if w.end_time   then w.end_time   = math.floor(w.end_time   * scale) end
+                        if w.duration   then w.duration   = math.floor(w.duration   * scale) end
+                    end
+                end
+            end
+
+            table.insert(concat_split_points, cumulative_ms)   -- this sentence starts here
+            cumulative_ms = cumulative_ms + pf_dur
+
+            table.insert(concat_files, { file = pf_file, duration_ms = pf_dur })
+            table.insert(concat_sentences, sent)
+            table.insert(concat_wav_files, pf_file)
+
+            -- Protect file from _cleanPrefetch deletion during next iteration
+            self.tts_engine._prefetch_in_use = true
+
+            logger.warn("SyncController: Concat +sentence", idx,
+                "dur=", pf_dur, "ms  cumulative=", cumulative_ms, "ms")
+        end
+
+        if #concat_files == 0 then concat_files = nil end
+
+        logger.warn("SyncController: Concat synthesis total:",
+            time.to_ms(UIManager:getTime() - synth_t0), "ms for",
+            #concat_sentences, "extra sentences")
+    end
+
+    local sentences_in_play = 1 + #concat_sentences
+
     -- Start TTS audio playback with callbacks
     local play_ok = self.tts_engine:play(
         -- Word callback
@@ -231,19 +302,27 @@ function SyncController:beginSentencePlayback(sentence)
                 controller:highlightCurrentWord(word)
             end
         end,
-        -- Completion callback — chain to next sentence with a configurable delay
-        -- that depends on whether the sentence ended at a paragraph break or mid-line.
+        -- Completion callback — entire concat stream finished
         function()
-            logger.warn("SyncController: Completion callback for sentence", sentence.index, "state=", controller.state)
+            local last_idx = sentence.index + sentences_in_play - 1
+            logger.warn("SyncController: Completion callback, concat ending at sentence",
+                last_idx, "state=", controller.state)
             controller.highlight_manager:clearHighlights()
-            -- Choose delay based on the sentence's end_type tag
-            local delay = 0.2  -- fallback
-            if sentence.end_type == "paragraph" then
+            controller:_cleanConcatFiles()
+
+            -- Skip reading index past all sentences played in this concat
+            controller.reading_sentence_idx = controller.reading_sentence_idx + (sentences_in_play - 1)
+
+            -- Pause duration based on the LAST sentence in the concat
+            local last_sent = #concat_sentences > 0
+                and concat_sentences[#concat_sentences] or sentence
+            local delay = 0.2
+            if last_sent.end_type == "paragraph" then
                 delay = (controller.plugin and controller.plugin:getSetting("paragraph_pause", 0.8)) or 0.8
             else
                 delay = (controller.plugin and controller.plugin:getSetting("sentence_pause", 0.1)) or 0.1
             end
-            logger.warn("SyncController: Scheduling next sentence in", delay, "s, state=", controller.state)
+            logger.warn("SyncController: Scheduling next sentence in", delay, "s")
             UIManager:scheduleIn(delay, function()
                 if controller.state ~= controller.STATE.STOPPED then
                     controller:readNextSentence()
@@ -252,49 +331,90 @@ function SyncController:beginSentencePlayback(sentence)
                 end
             end)
         end,
-        -- Failure callback — BT audio launch failed asynchronously (after
-        -- the non-blocking retry). Stop the entire reading chain rather
-        -- than looping endlessly on dead BT connections.
+        -- Failure callback
         function()
             logger.warn("SyncController: Async BT launch failure, stopping read-along")
+            controller:_cleanConcatFiles()
             controller:stop()
-        end
+        end,
+        -- concat_files for gapless BT playback
+        concat_files
     )
 
     if play_ok then
-        -- Prefetch the NEXT sentence's audio while this one plays.
-        -- This eliminates the espeak-ng synthesis delay between sentences.
-        self:_prefetchNextSentence()
+        -- Scale the FIRST sentence's word timings to match the real WAV
+        -- duration.  play() scales engine.timing_data but the sync loop
+        -- reads sentence.words which still have the raw espeak estimates.
+        local first_dur = self.tts_engine._current_audio_duration_ms or 0
+        if first_dur > 0 and sentence.words and #sentence.words > 0 then
+            local last_w = sentence.words[#sentence.words]
+            if last_w.end_time and last_w.end_time > 0 then
+                local scale = first_dur / last_w.end_time
+                for _, w in ipairs(sentence.words) do
+                    if w.start_time then w.start_time = math.floor(w.start_time * scale) end
+                    if w.end_time   then w.end_time   = math.floor(w.end_time   * scale) end
+                    if w.duration   then w.duration   = math.floor(w.duration   * scale) end
+                end
+                logger.dbg("SyncController: Scaled sentence", sentence.index, "words by", scale)
+            end
+        end
 
-        -- Highlight the sentence being read (deferred so it doesn't block audio)
+        -- Track how many sentences are in this play() for progress reporting
+        self._sentences_in_play = sentences_in_play
+
+        if #concat_sentences > 0 then
+            self._concat_sentences = concat_sentences
+            self._concat_split_points = concat_split_points
+            self._concat_boundary_idx = 0
+            self._concat_wav_files = concat_wav_files
+            -- Schedule next-page prefetch in background so it's ready
+            -- when we finish all sentences on this page.
+            self:_prefetchNextPage()
+        else
+            self._concat_sentences = nil
+            self._concat_split_points = nil
+            self._concat_boundary_idx = nil
+            self._concat_wav_files = nil
+            -- Single sentence — prefetch the next one
+            self:_prefetchNextSentence()
+        end
+
+        -- Highlight the sentence being read — show immediately so the user
+        -- can see what is about to be spoken.  The highlight stays until the
+        -- sync loop switches to the next sentence.
         if self.plugin and self.plugin:getSetting("highlight_sentences", true) then
-            UIManager:scheduleIn(0.1, function()
+            UIManager:scheduleIn(0.05, function()
+                if controller.state == controller.STATE.STOPPED then return end
                 local ok, err = pcall(controller.highlightCurrentSentence, controller, sentence)
                 if not ok then
                     logger.warn("SyncController: Sentence highlight failed:", err)
                 end
             end)
         end
+
         -- Start sync loop for highlighting during this sentence
+        self._latency_locked = false  -- will be computed from actual launch time
         self:startSentenceSyncLoop(sentence)
     else
-        -- play() failed (BT not connected, no audio device, etc.)
-        -- Stop the entire reading chain rather than skipping endlessly.
+        self:_cleanConcatFiles()
         logger.warn("SyncController: play() failed, stopping read-along")
         self:stop()
     end
 
-    logger.dbg("SyncController: Playback started for sentence", sentence.index)
+    logger.dbg("SyncController: Playback started for sentence", sentence.index,
+        #concat_sentences > 0 and ("(+concat " .. #concat_sentences .. " more)") or "")
 end
 
 --[[--
-Prefetch the next sentence's audio in the background.
+Prefetch a future sentence's audio in the background.
 Called right after the current sentence starts playing, so espeak-ng
 runs its synthesis while audio is streaming. When the current sentence
 finishes, the next one's WAV is already on disk.
+@param explicit_idx number|nil  If provided, prefetch this sentence index
+                                instead of reading_sentence_idx + 1.
 --]]
-function SyncController:_prefetchNextSentence()
-    local next_idx = self.reading_sentence_idx + 1
+function SyncController:_prefetchNextSentence(explicit_idx)
+    local next_idx = explicit_idx or (self.reading_sentence_idx + 1)
     if not self.parsed_data or next_idx > self.total_sentences then
         return -- nothing to prefetch
     end
@@ -310,6 +430,80 @@ function SyncController:_prefetchNextSentence()
     local text = next_sentence.text
     UIManager:scheduleIn(0.05, function()
         engine:prefetch(text)
+    end)
+end
+
+--[[--
+Clean up WAV files created for a multi-sentence concat pipeline.
+Called when the pipeline finishes, is stopped, or is skipped.
+--]]
+function SyncController:_cleanConcatFiles()
+    if self._concat_wav_files then
+        for _, f in ipairs(self._concat_wav_files) do
+            os.remove(f)
+        end
+    end
+    self._concat_wav_files = nil
+    self._concat_sentences = nil
+    self._concat_split_points = nil
+    self._concat_boundary_idx = nil
+    -- Allow engine cleanup to proceed
+    if self.tts_engine then
+        self.tts_engine._prefetch_in_use = false
+    end
+end
+
+--[[--
+Prefetch the next page's text in the background.
+Called when we're near the end of the current page's sentences so the
+page transition is near-instant.
+--]]
+function SyncController:_prefetchNextPage()
+    if self._next_page_prefetched then return end
+    if not self.plugin or not self.plugin.ui then return end
+
+    self._next_page_prefetched = true
+    local plugin = self.plugin
+    local controller = self
+
+    -- Defer to avoid blocking the sync loop
+    UIManager:scheduleIn(0.1, function()
+        if controller.state == controller.STATE.STOPPED then return end
+        local ui = plugin.ui
+        if not ui or not ui.document then return end
+        local Screen = require("device").screen
+
+        if ui.rolling then
+            -- Save position, peek forward one page, grab text, restore.
+            -- No screen refresh occurs because we restore before UIManager
+            -- gets a chance to repaint.
+            local saved_pos = ui.document:getCurrentPos()
+            -- Move the internal document position forward by one screen
+            local page_height = Screen:getHeight()
+            local next_pos = saved_pos + page_height
+            ui.document:gotoPos(next_pos)
+            local ok, res = pcall(ui.document.getTextFromPositions, ui.document,
+                {x = 0, y = 0},
+                {x = Screen:getWidth(), y = Screen:getHeight()},
+                true)  -- do_not_draw_selection
+            -- Restore immediately
+            ui.document:gotoPos(saved_pos)
+
+            if ok and res and res.text and res.text ~= "" then
+                controller._next_page_text = res.text
+                -- Pre-synthesize the first sentence
+                local parsed = controller.text_parser:parse(res.text)
+                if parsed and parsed.sentences and #parsed.sentences > 0 then
+                    local first_text = parsed.sentences[1].text
+                    if first_text and first_text ~= "" then
+                        controller.tts_engine:prefetch(first_text)
+                    end
+                end
+                logger.warn("SyncController: Next page prefetched,", #res.text, "chars")
+            else
+                logger.warn("SyncController: Next page prefetch — no text")
+            end
+        end
     end)
 end
 
@@ -443,15 +637,20 @@ function SyncController:startSentenceSyncLoop(sentence)
         if self.playback_bar and self.playback_bar._isOverlayActive and self.playback_bar:_isOverlayActive() then
             if not self._auto_paused_by_overlay then
                 self._auto_paused_by_overlay = true
-                self:pause()
+                self:pause(true)   -- auto=true: overlay-initiated pause
             end
             -- Keep polling so we can resume when the overlay closes
             UIManager:scheduleIn(0.3, syncUpdate)
             return
         elseif self._auto_paused_by_overlay then
             self._auto_paused_by_overlay = false
-            self:resume()
-            return -- resume restarts the sync loop
+            self:resume(true)      -- auto=true: only resumes if user didn't explicitly pause
+            if self.state == self.STATE.PAUSED then
+                -- User had explicitly paused — keep the sync loop alive
+                -- but stay in the paused polling branch below.
+                UIManager:scheduleIn(0.1, syncUpdate)
+            end
+            return -- if resume succeeded it restarts the sync loop itself
         end
 
         -- Skip word-highlighting work when not actively playing
@@ -460,16 +659,86 @@ function SyncController:startSentenceSyncLoop(sentence)
             return
         end
 
+        -- Dynamic BT latency detection: poll GStreamer's stderr for the
+        -- PLAYING transition.  Once detected, anchor the sync timer to NOW
+        -- with only a small codec-buffering offset (~150ms).
+        -- Fallback: if the process launched but we never see PLAYING (e.g.
+        -- non-BT player), use 3000ms from launch as the static estimate.
+        if not self._latency_locked then
+            if self.tts_engine:isGstPlaying() then
+                -- GStreamer just transitioned to PLAYING — audio is flowing.
+                -- Offset for BT codec buffering + transmission to earbuds.
+                self.sentence_sync_start = UIManager:getTime()
+                self._locked_latency_ms = 1500
+                self._latency_locked = true
+                logger.warn("SyncController: Sync anchored to GST PLAYING state")
+            elseif self.tts_engine._audio_launched_at then
+                -- Fallback: if 5s passed since launch without PLAYING, lock
+                -- to the launch time with a static estimate.
+                local since_launch = time.to_ms(UIManager:getTime() - self.tts_engine._audio_launched_at)
+                if since_launch > 5000 then
+                    self.sentence_sync_start = self.tts_engine._audio_launched_at
+                    self._locked_latency_ms = 3000
+                    self._latency_locked = true
+                    logger.warn("SyncController: Sync fallback — 5s without PLAYING, using 3000ms")
+                end
+            end
+        end
+
         local elapsed = time.to_ms(UIManager:getTime() - self.sentence_sync_start)
-        -- Offset by BT latency — audio doesn't start until A2DP connects
-        local latency = self.tts_engine.playback_latency_ms or 0
+        local latency = self._locked_latency_ms or self.tts_engine.playback_latency_ms or 0
         local adjusted = elapsed - latency
 
-        -- Find current word in this sentence by time
+        -- Multi-sentence concat boundary detection: advance through split
+        -- points as elapsed time crosses each one.
+        if self._concat_sentences and self._concat_split_points then
+            local switched = false
+            while true do
+                local next_b = (self._concat_boundary_idx or 0) + 1
+                if next_b <= #self._concat_split_points
+                        and adjusted >= self._concat_split_points[next_b] then
+                    self._concat_boundary_idx = next_b
+                    switched = true
+                else
+                    break
+                end
+            end
+            if switched then
+                local bi = self._concat_boundary_idx
+                local next_sent = self._concat_sentences[bi]
+                sentence = next_sent
+                self.current_sentence = next_sent
+                self.current_sentence_index = next_sent.index
+                self.current_word_index = 0
+                logger.warn("SyncController: Concat boundary → sentence", next_sent.index)
+                self.highlight_manager:clearHighlights()
+                if self.plugin and self.plugin:getSetting("highlight_sentences", true) then
+                    pcall(self.highlightCurrentSentence, self, next_sent)
+                end
+                if self.playback_bar then
+                    self.playback_bar:updateProgress(self:getProgress())
+                end
+                -- When we reach the last 2 sentences, trigger next-page prefetch
+                if bi >= #self._concat_sentences - 1 and not self._next_page_prefetched then
+                    self:_prefetchNextPage()
+                end
+            end
+        end
+
+        -- Time offset for word lookup within the active concat sentence
+        local active_sentence = sentence
+        local time_offset = 0
+        if self._concat_boundary_idx and self._concat_boundary_idx > 0
+                and self._concat_split_points then
+            time_offset = self._concat_split_points[self._concat_boundary_idx]
+        end
+
+        -- Find current word in the active sentence by time
         if adjusted > 0 then
-            for _, word in ipairs(sentence.words) do
+            local word_time = adjusted - time_offset
+            for _, word in ipairs(active_sentence.words) do
                 if word.start_time and word.end_time then
-                    if adjusted >= word.start_time and adjusted < word.end_time then
+                    if word_time >= word.start_time and word_time < word.end_time then
                         if word.index ~= self.current_word_index then
                             self:highlightCurrentWord(word)
                         end
@@ -482,11 +751,11 @@ function SyncController:startSentenceSyncLoop(sentence)
         -- Update playback bar
         self:updatePlaybackBar()
 
-        -- Continue loop
-        UIManager:scheduleIn(0.03, syncUpdate)
+        -- Continue loop (20Hz is plenty for e-ink word highlighting)
+        UIManager:scheduleIn(0.05, syncUpdate)
     end
 
-    UIManager:scheduleIn(0.03, syncUpdate)
+    UIManager:scheduleIn(0.05, syncUpdate)
 end
 
 --[[--
@@ -538,45 +807,74 @@ function SyncController:advanceToNextPage()
     -- Navigate forward one page/view
     ui:handleEvent(Event:new("GotoViewRel", 1))
 
-    -- Wait for page to render, then continue reading the new page
-    UIManager:scheduleIn(0.5, function()
-        -- Bail out if the user pressed stop during the page advance
-        if self.state == self.STATE.STOPPED then
-            return
-        end
-        local text = self.plugin:getCurrentPageText()
-        if text and text ~= "" then
-            self:start(text) -- start() preserves playback bar across pages
-        else
-            logger.dbg("SyncController: No more text to read")
-            self:stop()
-        end
-    end)
+    -- If we prefetched the next page's text+audio, use it immediately
+    -- after a minimal settle delay for the page turn animation.
+    if self._next_page_text then
+        local prefetched_text = self._next_page_text
+        self._next_page_text = nil
+        self._next_page_prefetched = false
+        logger.warn("SyncController: Using prefetched next page text")
+        UIManager:scheduleIn(0.05, function()
+            if self.state == self.STATE.STOPPED then return end
+            self:start(prefetched_text)
+        end)
+    else
+        -- No prefetch available — wait for page render, get text, start.
+        self._next_page_prefetched = false
+        UIManager:scheduleIn(0.15, function()
+            if self.state == self.STATE.STOPPED then return end
+            local text = self.plugin:getCurrentPageText()
+            if text and text ~= "" then
+                self:start(text)
+            else
+                logger.dbg("SyncController: No more text to read")
+                self:stop()
+            end
+        end)
+    end
 end
 
 --[[--
 Pause playback.
+@param auto bool  true when called by the overlay auto-pause logic
 --]]
-function SyncController:pause()
+function SyncController:pause(auto)
     if self.state == self.STATE.PLAYING then
         self.state = self.STATE.PAUSED
         self.pause_time = UIManager:getTime()
         self.tts_engine:pause()
 
+        -- Track whether the pause originated from a user action (button tap)
+        -- vs the automatic overlay detector.  On overlay close we only
+        -- auto-resume when the user did NOT explicitly pause.
+        if not auto then
+            self._user_paused = true
+        end
+
         if self.playback_bar then
             self.playback_bar:updatePlayState(false)
         end
 
-        logger.dbg("SyncController: Paused")
+        logger.dbg("SyncController: Paused (auto=", auto, ", user_paused=", self._user_paused, ")")
     end
 end
 
 --[[--
 Resume playback.
+@param auto bool  true when called by the overlay auto-resume logic
 --]]
-function SyncController:resume()
+function SyncController:resume(auto)
     if self.state == self.STATE.PAUSED then
+        -- If this is an auto-resume (overlay closed) but the user had
+        -- explicitly paused, stay paused.
+        if auto and self._user_paused then
+            logger.dbg("SyncController: Skipping auto-resume — user paused")
+            return
+        end
+
         self.state = self.STATE.PLAYING
+        -- Clear the user-paused flag on any successful resume
+        self._user_paused = false
 
         -- Adjust sentence sync start to account for pause duration
         if self.sentence_sync_start and self.pause_time then
@@ -639,6 +937,13 @@ function SyncController:stop()
     self.sentence_sync_start = nil
     self.pause_time = nil
     self.reading_page_xpointer = nil
+    self._user_paused = false
+    self._auto_paused_by_overlay = false
+    self._latency_locked = false
+    self._locked_latency_ms = nil
+    self._next_page_text = nil
+    self._next_page_prefetched = false
+    self:_cleanConcatFiles()
 
     logger.dbg("SyncController: Stopped")
 end
@@ -651,7 +956,14 @@ function SyncController:nextSentence()
         return
     end
 
-    -- Stop current sentence playback
+    -- If we're mid-concat, advance reading index to the sentence currently
+    -- being heard so readNextSentence skips past it.
+    if self._concat_sentences and self._concat_boundary_idx
+            and self._concat_boundary_idx > 0 then
+        self.reading_sentence_idx = self._concat_sentences[self._concat_boundary_idx].index
+    end
+
+    self:_cleanConcatFiles()
     pcall(function() self.tts_engine:stop() end)
     self.highlight_manager:clearHighlights()
 
@@ -667,12 +979,19 @@ function SyncController:prevSentence()
         return
     end
 
-    -- Stop current sentence playback
+    -- If mid-concat, figure out which sentence we're currently hearing
+    local current_idx = self.reading_sentence_idx
+    if self._concat_sentences and self._concat_boundary_idx
+            and self._concat_boundary_idx > 0 then
+        current_idx = self._concat_sentences[self._concat_boundary_idx].index
+    end
+
+    self:_cleanConcatFiles()
     pcall(function() self.tts_engine:stop() end)
     self.highlight_manager:clearHighlights()
 
     -- Go back 2 because readNextSentence() will increment by 1
-    self.reading_sentence_idx = math.max(0, self.reading_sentence_idx - 2)
+    self.reading_sentence_idx = math.max(0, current_idx - 2)
     self:readNextSentence()
 end
 
@@ -751,7 +1070,15 @@ Based on how many sentences of the current page have been read.
 --]]
 function SyncController:getProgress()
     if self.total_sentences > 0 then
-        return math.min(100, ((self.reading_sentence_idx - 1) / self.total_sentences) * 100)
+        -- During a concat pipeline, the reading_sentence_idx points to
+        -- sentence 1, but we may already be hearing sentence 5.  Use the
+        -- concat boundary index to show real progress.
+        local effective_idx = self.reading_sentence_idx
+        if self._concat_sentences and self._concat_boundary_idx
+                and self._concat_boundary_idx > 0 then
+            effective_idx = self._concat_sentences[self._concat_boundary_idx].index
+        end
+        return math.min(100, (effective_idx / self.total_sentences) * 100)
     end
     return 0
 end

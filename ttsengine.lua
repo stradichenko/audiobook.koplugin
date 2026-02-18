@@ -539,24 +539,72 @@ function TTSEngine:usePrefetched(text)
 end
 
 --[[--
+Peek at the prefetched audio without consuming it.
+Returns file path, timing data and WAV duration if the prefetch matches the
+given text.  The prefetch slot is NOT cleared — call usePrefetched() or
+_cleanPrefetch() when the file is no longer needed.
+@param text string  Expected sentence text
+@return string|nil  WAV file path (or nil)
+@return table|nil   Timing data
+@return number      Duration in ms
+--]]
+function TTSEngine:peekPrefetch(text)
+    if self._prefetch_file and self._prefetch_text == text then
+        local dur = self:getWavDurationMs(self._prefetch_file)
+        return self._prefetch_file, self._prefetch_timing, dur
+    end
+    return nil, nil, 0
+end
+
+--[[--
+Get WAV duration from an arbitrary file path.
+@param path string  WAV file path
+@return number  Duration in ms, 0 on error
+--]]
+function TTSEngine:getWavDurationMs(path)
+    if not path then return 0 end
+    local f = io.open(path, "rb")
+    if not f then return 0 end
+    local size = f:seek("end")
+    f:seek("set", 28)
+    local raw = f:read(4)
+    f:close()
+    if not raw or #raw < 4 then return 0 end
+    local b1, b2, b3, b4 = raw:byte(1, 4)
+    local byte_rate = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+    if byte_rate <= 0 then return 0 end
+    local data_bytes = size - 44
+    if data_bytes <= 0 then return 0 end
+    return math.floor((data_bytes / byte_rate) * 1000)
+end
+
+--[[--
 Clean up prefetch state.
 --]]
 function TTSEngine:_cleanPrefetch()
     if self._prefetch_file then
-        os.remove(self._prefetch_file)
+        -- Don't delete the file if it's being used by a concat pipeline
+        if not self._prefetch_in_use then
+            os.remove(self._prefetch_file)
+        end
         self._prefetch_file = nil
     end
     self._prefetch_timing = nil
     self._prefetch_text = nil
+    self._prefetch_in_use = false
 end
 
 --[[--
 Play the synthesized audio.
 @param on_word function Callback for word timing updates
 @param on_complete function Callback when playback completes
+@param on_fail function Callback on async BT launch failure
+@param concat_files table|nil Optional extra WAV files for seamless concat playback
+       Each entry: {file=path, duration_ms=number}
 @return boolean Success
 --]]
-function TTSEngine:play(on_word, on_complete, on_fail)
+function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
+    local t0 = UIManager:getTime()
     logger.warn("TTSEngine: play() called, audio_file=", self.current_audio_file, "is_speaking=", self.is_speaking)
     if not self.current_audio_file then
         logger.err("TTSEngine: No audio file to play")
@@ -573,8 +621,11 @@ function TTSEngine:play(on_word, on_complete, on_fail)
     self.is_speaking = true
     self.is_paused = false
     
-    -- Start playback using system player
-    local player = self:findAudioPlayer()
+    -- Start playback using system player (cached after first probe)
+    local player = self._cached_player or self:findAudioPlayer()
+    if player then
+        self._cached_player = player
+    end
     if not player then
         logger.err("TTSEngine: No audio player found")
         self.player_error = true
@@ -591,14 +642,20 @@ function TTSEngine:play(on_word, on_complete, on_fail)
     
     logger.dbg("TTSEngine: Using player:", player)
     logger.dbg("TTSEngine: Audio file:", self.current_audio_file)
+    logger.warn("TTSEngine: play() findPlayer took", time.to_ms(UIManager:getTime() - t0), "ms")
     
     -- Calculate real audio duration from WAV file
     local real_duration_ms = self:getAudioDurationMs()
     self._current_audio_duration_ms = real_duration_ms
     logger.dbg("TTSEngine: Real WAV duration:", real_duration_ms, "ms")
     
-    -- BT audio has significant startup latency (A2DP negotiation)
-    self.playback_latency_ms = (self.audio_player_type == "gst-bt") and 1500 or 0
+    -- BT audio has significant startup latency (A2DP negotiation).
+    -- On chained sentences the socket is still warm, so latency is lower.
+    if self.audio_player_type == "gst-bt" then
+        self.playback_latency_ms = self._socket_clean and 500 or 1500
+    else
+        self.playback_latency_ms = 0
+    end
     
     -- Scale timing data to match real audio duration
     if real_duration_ms > 0 and #self.timing_data > 0 then
@@ -616,13 +673,35 @@ function TTSEngine:play(on_word, on_complete, on_fail)
     -- Build command WITHOUT trailing &; we'll add '& echo $!' for PID capture
     local play_cmd
     if self.audio_player_type == "gst-bt" then
-        -- GStreamer pipeline: convert to S16LE/48kHz/stereo for Kobo BT A2DP sink
-        play_cmd = string.format(
-            'gst-launch-1.0 filesrc location="%s" ! wavparse ! audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink',
-            self.current_audio_file
-        )
+        -- GStreamer pipeline: convert to S16LE/48kHz/stereo for Kobo BT A2DP sink.
+        -- When concat_files is provided, use the concat element to chain multiple
+        -- WAV files into a single continuous BT stream (no A2DP re-negotiation gap).
+        if concat_files and #concat_files > 0 then
+            -- Multi-sentence concat pipeline
+            local sink = 'audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink'
+            local sources = string.format('filesrc location="%s" ! wavparse ! c. ', self.current_audio_file)
+            for _, cf in ipairs(concat_files) do
+                sources = sources .. string.format('filesrc location="%s" ! wavparse ! c. ', cf.file)
+            end
+            play_cmd = string.format('gst-launch-1.0 concat name=c ! %s %s', sink, sources)
+            -- Store combined duration for the sync controller
+            self._concat_durations = { self._current_audio_duration_ms }
+            for _, cf in ipairs(concat_files) do
+                table.insert(self._concat_durations, cf.duration_ms)
+            end
+            logger.warn("TTSEngine: Concat pipeline with", 1 + #concat_files, "files, durations=",
+                table.concat(self._concat_durations, "+"))
+        else
+            -- Single-sentence pipeline (fallback / non-concat)
+            play_cmd = string.format(
+                'gst-launch-1.0 filesrc location="%s" ! wavparse ! audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink',
+                self.current_audio_file
+            )
+            self._concat_durations = nil
+        end
     else
         play_cmd = string.format('%s "%s"', player, self.current_audio_file)
+        self._concat_durations = nil
     end
     
     -- Cancel any previously scheduled launchAndStart from an earlier play()
@@ -634,13 +713,22 @@ function TTSEngine:play(on_word, on_complete, on_fail)
 
     -- Force-kill any lingering audio — SIGKILL + killall to release the
     -- @kobo:mtkbtmwrpc abstract socket held by stale gst-launch processes.
-    self:_killAudioProcess()
+    -- Skip when socket is clean — process already exited, nothing to kill.
+    if not self._socket_clean then
+        self:_killAudioProcess()
+    end
 
     -- Bump generation to invalidate any stale timing/watcher loops
     self.play_generation = (self.play_generation or 0) + 1
 
-    -- Build PID-capturing launch command and save for potential async retry
-    local pid_cmd = play_cmd .. " >/dev/null 2>&1 & echo $!"
+    logger.warn("TTSEngine: play() pre-launch took", time.to_ms(UIManager:getTime() - t0), "ms")
+
+    -- Build PID-capturing launch command and save for potential async retry.
+    -- Redirect stderr to a status file so the sync controller can detect
+    -- when GStreamer transitions to PLAYING (= audio is actually flowing).
+    self._gst_status_file = "/tmp/.gst_status"
+    os.remove(self._gst_status_file)
+    local pid_cmd = play_cmd .. ' >/dev/null 2>>' .. self._gst_status_file .. ' & echo $!'
     self._last_pid_cmd = pid_cmd
 
     -- Launch the audio process, start timing loop and process watcher.
@@ -663,12 +751,16 @@ function TTSEngine:play(on_word, on_complete, on_fail)
         -- Launch in background and capture PID for reliable process tracking.
         -- io.popen runs: sh -c '<play_cmd> >/dev/null 2>&1 & echo $!'
         -- The shell backgrounds the player, prints its PID, and exits.
+        local launch_t0 = UIManager:getTime()
         logger.dbg("TTSEngine: Launching:", pid_cmd)
         local handle = io.popen(pid_cmd)
         local pid_str = handle and handle:read("*a") or ""
         if handle then handle:close() end
         engine.audio_pid = tonumber(pid_str:match("(%d+)"))
-        logger.dbg("TTSEngine: Audio PID:", engine.audio_pid)
+        -- Record when the audio process was actually launched so the
+        -- sync controller can anchor its timing to reality, not an estimate.
+        engine._audio_launched_at = UIManager:getTime()
+        logger.warn("TTSEngine: io.popen launch took", time.to_ms(UIManager:getTime() - launch_t0), "ms, PID=", engine.audio_pid)
 
         -- Start timing loop for word highlighting (does NOT detect completion)
         engine:startTimingLoop()
@@ -767,77 +859,32 @@ end
 
 --[[--
 Start the timing loop to call word callbacks.
+NOTE: The actual word-highlight polling is handled by SyncController's
+sync loop (startSentenceSyncLoop) which already runs at 20Hz.  This
+method now only records the playback_start_time so that pause/resume
+can adjust it correctly.  The 20Hz polling loop was removed to cut
+redundant CPU wakeups and save battery.
 --]]
 function TTSEngine:startTimingLoop()
     self.playback_start_time = UIManager:getTime()
     self.current_word_index = 0
-    self:_runTimingLoop()
+    -- No polling loop — SyncController handles word highlighting.
 end
 
 --[[--
-Run the timing update loop.
-Separated from startTimingLoop so that resume can restart the loop
-without resetting playback_start_time.
+Restart the timing bookkeeping after a resume (no polling loop needed).
 --]]
 function TTSEngine:_runTimingLoop()
-    local my_gen = self.play_generation or 0
-    local function updateTiming()
-        if not self.is_speaking or self.is_paused then
-            return
-        end
-        -- Exit if superseded by a newer play() call
-        if (self.play_generation or 0) ~= my_gen then
-            return
-        end
-        
-        -- FTS values are plain numbers (µs precision); time.to_ms converts diff to ms
-        local elapsed = time.to_ms(UIManager:getTime() - self.playback_start_time)
-        -- Offset by BT latency: audio doesn't start until A2DP negotiation completes
-        local adjusted = elapsed - (self.playback_latency_ms or 0)
-        
-        if adjusted > 0 then
-            -- Find current word based on timing
-            for i, timing in ipairs(self.timing_data) do
-                if adjusted >= timing.start_time and adjusted < timing.end_time then
-                    if i ~= self.current_word_index then
-                        self.current_word_index = i
-                        if self.on_word_callback then
-                            self.on_word_callback(timing, i)
-                        end
-                    end
-                    break
-                end
-            end
-        end
-        
-        -- NOTE: Completion is detected by the process watcher, not here.
-        -- Schedule next update
-        UIManager:scheduleIn(0.05, updateTiming)
-    end
-    
-    UIManager:scheduleIn(0.05, updateTiming)
+    -- No-op: SyncController's sync loop handles word highlighting.
+    -- Kept as a function so resume() doesn't need changes.
 end
 
 --[[--
-Get actual audio duration from the WAV file header.
+Get actual audio duration from the current WAV file.
 @return number Duration in milliseconds, or 0 on error
 --]]
 function TTSEngine:getAudioDurationMs()
-    if not self.current_audio_file then return 0 end
-    local f = io.open(self.current_audio_file, "rb")
-    if not f then return 0 end
-    local size = f:seek("end")
-    -- Read byte rate from WAV header (offset 28, 4 bytes little-endian)
-    f:seek("set", 28)
-    local raw = f:read(4)
-    f:close()
-    if not raw or #raw < 4 then return 0 end
-    local b1, b2, b3, b4 = raw:byte(1, 4)
-    local byte_rate = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
-    if byte_rate <= 0 then return 0 end
-    local data_bytes = size - 44
-    if data_bytes <= 0 then return 0 end
-    return math.floor((data_bytes / byte_rate) * 1000)
+    return self:getWavDurationMs(self.current_audio_file)
 end
 
 --[[--
@@ -969,11 +1016,10 @@ function TTSEngine:onPlaybackComplete()
     self.is_speaking = false
     -- Bump generation so stale watcher/timing loops exit
     self.play_generation = (self.play_generation or 0) + 1
-    -- Force-kill the audio process (SIGKILL to release the BT socket immediately)
-    self:_killAudioProcess()
-    -- The process watcher confirmed the process exited, so the BT abstract
-    -- socket is already released.  Mark clean so the next play() call skips
-    -- the 300ms wait entirely.
+    -- The process watcher confirmed the process exited naturally, so the BT
+    -- abstract socket is already released.  No need to killall — that would
+    -- just waste ~200ms spawning a shell on the ARM CPU.
+    self.audio_pid = nil
     self._socket_clean = true
     self:cleanup()
     
@@ -1043,8 +1089,27 @@ function TTSEngine:stop()
         self._socket_clean = false
     end
     
+    -- Clear concat/prefetch-in-use flag so fullCleanup can delete files
+    self._prefetch_in_use = false
+    self._concat_durations = nil
+    self._audio_launched_at = nil
+    self._gst_status_file = nil
     self:fullCleanup()
     logger.dbg("TTSEngine: Stopped, had_process=", had_process, "_socket_clean=", self._socket_clean)
+end
+
+--[[--
+Check if GStreamer has reached the PLAYING state by reading its stderr
+output.  Returns true once the pipeline is actually outputting audio.
+@return boolean
+--]]
+function TTSEngine:isGstPlaying()
+    if not self._gst_status_file then return false end
+    local f = io.open(self._gst_status_file, "r")
+    if not f then return false end
+    local content = f:read("*a")
+    f:close()
+    return content and content:find("PLAYING") ~= nil
 end
 
 --[[--%
