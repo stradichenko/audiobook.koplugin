@@ -616,7 +616,12 @@ Updates word highlighting based on elapsed time.
 @param sentence table The sentence being played
 --]]
 function SyncController:startSentenceSyncLoop(sentence)
-    self.sentence_sync_start = UIManager:getTime()
+    -- Only set sentence_sync_start on a fresh start, not on resume.
+    -- resume() already adjusts sentence_sync_start for pause duration.
+    if not self._resuming_sync then
+        self.sentence_sync_start = UIManager:getTime()
+    end
+    self._resuming_sync = false
     -- Generation counter: old sync loops exit when a new one starts
     self.sync_generation = (self.sync_generation or 0) + 1
     local my_generation = self.sync_generation
@@ -668,10 +673,13 @@ function SyncController:startSentenceSyncLoop(sentence)
             if self.tts_engine:isGstPlaying() then
                 -- GStreamer just transitioned to PLAYING — audio is flowing.
                 -- Offset for BT codec buffering + transmission to earbuds.
+                -- Warm BT (socket already active) has lower codec buffering
+                -- than a cold start where A2DP must fully negotiate.
                 self.sentence_sync_start = UIManager:getTime()
-                self._locked_latency_ms = 1500
+                local warm = self.tts_engine._socket_clean
+                self._locked_latency_ms = warm and 500 or 1500
                 self._latency_locked = true
-                logger.warn("SyncController: Sync anchored to GST PLAYING state")
+                logger.warn("SyncController: Sync anchored to GST PLAYING state (warm=", warm, ", offset=", self._locked_latency_ms, "ms)")
             elseif self.tts_engine._audio_launched_at then
                 -- Fallback: if 5s passed since launch without PLAYING, lock
                 -- to the launch time with a static estimate.
@@ -682,6 +690,13 @@ function SyncController:startSentenceSyncLoop(sentence)
                     self._latency_locked = true
                     logger.warn("SyncController: Sync fallback — 5s without PLAYING, using 3000ms")
                 end
+            end
+            -- While waiting for PLAYING, don't advance highlighting at all.
+            -- This prevents the highlight from rushing ahead on page transitions
+            -- before BT audio actually starts.
+            if not self._latency_locked then
+                UIManager:scheduleIn(0.05, syncUpdate)
+                return
             end
         end
 
@@ -903,8 +918,11 @@ function SyncController:resume(auto)
         -- will fire again and re-highlight the current word.
         self.current_word_index = 0
 
-        -- Restart the sync loop for the current sentence
+        -- Restart the sync loop for the current sentence.
+        -- Set _resuming_sync so startSentenceSyncLoop doesn't reset
+        -- the timing anchor that we just adjusted for pause duration.
         if self.current_sentence then
+            self._resuming_sync = true
             self:startSentenceSyncLoop(self.current_sentence)
         end
 
