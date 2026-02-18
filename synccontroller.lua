@@ -216,6 +216,9 @@ function SyncController:beginSentencePlayback(sentence)
     self.current_sentence = sentence
     self.current_sentence_index = sentence.index
     self.current_word_index = 0
+    -- Remember the first sentence's text so _remapAfterRotation can find
+    -- reading_sentence_idx in a re-parsed page.
+    self._first_play_sentence_text = sentence.text
 
     local controller = self
 
@@ -313,9 +316,48 @@ function SyncController:beginSentencePlayback(sentence)
             -- Skip reading index past all sentences played in this concat
             controller.reading_sentence_idx = controller.reading_sentence_idx + (sentences_in_play - 1)
 
-            -- Pause duration based on the LAST sentence in the concat
+            -- If the screen was rotated while this concat was playing,
+            -- the page now shows different text.  Re-read the current page,
+            -- find the last sentence we actually played, and update
+            -- total_sentences / reading_sentence_idx so the "end of page?"
+            -- check in readNextSentence() uses the new layout.
             local last_sent = #concat_sentences > 0
                 and concat_sentences[#concat_sentences] or sentence
+            if controller._rotated_during_playback then
+                controller._rotated_during_playback = false
+                local fresh_text = controller.plugin and controller.plugin:getCurrentPageText()
+                if fresh_text then
+                    local fresh_parsed = controller.text_parser:parse(fresh_text)
+                    if fresh_parsed and #fresh_parsed.sentences > 0 then
+                        -- Find the last-played sentence in the new page parse
+                        local function ws(s) return s:gsub("%s+", " "):match("^%s*(.-)%s*$") end
+                        local last_text = ws(last_sent.text)
+                        local found_idx = nil
+                        for i, s in ipairs(fresh_parsed.sentences) do
+                            if ws(s.text) == last_text then
+                                found_idx = i
+                                break
+                            end
+                        end
+                        if found_idx then
+                            logger.warn("SyncController: Post-rotation re-check: last played sentence",
+                                found_idx, "/", #fresh_parsed.sentences, "in new layout")
+                            controller.parsed_data = fresh_parsed
+                            controller.total_sentences = #fresh_parsed.sentences
+                            controller.reading_sentence_idx = found_idx
+                            -- readNextSentence() will +1 → found_idx+1
+                            -- If > total_sentences → advance; else play remaining
+                        else
+                            -- Last played sentence not found on current page
+                            -- (it scrolled off entirely) — force page advance
+                            logger.warn("SyncController: Post-rotation: last sentence not on page, advancing")
+                            controller.reading_sentence_idx = controller.total_sentences
+                        end
+                    end
+                end
+            end
+
+            -- Pause duration based on the LAST sentence in the concat
             local delay = 0.2
             if last_sent.end_type == "paragraph" then
                 delay = (controller.plugin and controller.plugin:getSetting("paragraph_pause", 0.8)) or 0.8
@@ -611,6 +653,205 @@ function SyncController:updatePlaybackBar()
 end
 
 --[[--
+Re-parse the visible page after a screen rotation and remap the currently-
+playing sentence into the fresh parse.  Updates parsed_data, total_sentences,
+reading_sentence_idx, current_sentence, and the concat_sentences array so
+that highlight positioning, progress reporting, and page-end detection all
+use the new layout.
+--]]
+function SyncController:_remapAfterRotation()
+    if not self.plugin then return end
+
+    local fresh_text = self.plugin:getCurrentPageText()
+    if not fresh_text then
+        logger.warn("SyncController: _remapAfterRotation — no page text")
+        -- At minimum re-apply the highlight with the old sentence
+        if self.current_sentence then
+            pcall(self.highlightCurrentSentence, self, self.current_sentence)
+        end
+        return
+    end
+
+    local fresh_parsed = self.text_parser:parse(fresh_text)
+    if not fresh_parsed or #fresh_parsed.sentences == 0 then
+        logger.warn("SyncController: _remapAfterRotation — parse empty")
+        if self.current_sentence then
+            pcall(self.highlightCurrentSentence, self, self.current_sentence)
+        end
+        return
+    end
+
+    -- Helper to normalise whitespace for comparison
+    local function ws(s) return s:gsub("%s+", " "):match("^%s*(.-)%s*$") end
+
+    -- Find the currently-playing sentence in the fresh parse
+    local cur_text = self.current_sentence and ws(self.current_sentence.text) or ""
+    local found_idx = nil
+    for i, s in ipairs(fresh_parsed.sentences) do
+        if ws(s.text) == cur_text then
+            found_idx = i
+            break
+        end
+    end
+
+    if not found_idx then
+        -- Sentence scrolled off-screen after rotation.  Scan nearby pages
+        -- (up to ±2 screens) to find it and scroll the view there.
+        logger.warn("SyncController: _remapAfterRotation — sentence not on visible page, scanning nearby")
+        local ui = self.plugin and self.plugin.ui
+        if ui and ui.rolling and ui.document then
+            local doc = ui.document
+            local Screen = require("device").screen
+            local page_h = Screen:getHeight()
+            local saved_pos = doc:getCurrentPos()
+            local target_pos = nil
+            local scan_offsets = { -page_h, page_h, -2*page_h, 2*page_h }
+
+            for _, offset in ipairs(scan_offsets) do
+                local try_pos = math.max(0, saved_pos + offset)
+                doc:gotoPos(try_pos)
+                local ok, res = pcall(doc.getTextFromPositions, doc,
+                    {x = 0, y = 0},
+                    {x = Screen:getWidth(), y = Screen:getHeight()},
+                    true)
+                if ok and res and res.text then
+                    local scan_parsed = self.text_parser:parse(res.text)
+                    if scan_parsed then
+                        for i, s in ipairs(scan_parsed.sentences) do
+                            if ws(s.text) == cur_text then
+                                found_idx = i
+                                fresh_parsed = scan_parsed
+                                fresh_text = res.text
+                                target_pos = try_pos
+                                logger.warn("SyncController: Found sentence at offset", offset, "idx", i)
+                                break
+                            end
+                        end
+                    end
+                end
+                if found_idx then break end
+            end
+
+            -- Always restore first — then navigate properly if we found it
+            doc:gotoPos(saved_pos)
+
+            if found_idx and target_pos then
+                -- Navigate the view to the page containing our sentence.
+                local delta_pages = math.floor((target_pos - saved_pos) / page_h + 0.5)
+                if delta_pages ~= 0 then
+                    ui:handleEvent(Event:new("GotoViewRel", delta_pages))
+                    -- Update the reading xpointer for the re-align button
+                    pcall(function()
+                        self.reading_page_xpointer = doc:getXPointer()
+                    end)
+                    -- Re-read the actual visible text after navigation
+                    -- (GotoViewRel may snap differently than raw gotoPos)
+                    local nav_text = self.plugin:getCurrentPageText()
+                    if nav_text then
+                        local nav_parsed = self.text_parser:parse(nav_text)
+                        if nav_parsed then
+                            -- Re-find our sentence in the actual visible text
+                            local nav_found = nil
+                            for i, s in ipairs(nav_parsed.sentences) do
+                                if ws(s.text) == cur_text then
+                                    nav_found = i
+                                    break
+                                end
+                            end
+                            if nav_found then
+                                found_idx = nav_found
+                                fresh_parsed = nav_parsed
+                            end
+                        end
+                    end
+                end
+            else
+                -- Not found nearby — keep current view
+                logger.warn("SyncController: Sentence not found within ±2 pages, keeping view")
+                return
+            end
+        else
+            return
+        end
+    end
+
+    logger.warn("SyncController: _remapAfterRotation — mapped to sentence",
+        found_idx, "/", #fresh_parsed.sentences)
+
+    -- Carry forward the word timing from the old sentence objects into the
+    -- matching new ones.  The concat audio is still playing, so the timing
+    -- values (start_time, end_time) must stay identical.
+    local old_sentences = self.parsed_data and self.parsed_data.sentences or {}
+    for _, old_s in ipairs(old_sentences) do
+        local old_t = ws(old_s.text)
+        for _, new_s in ipairs(fresh_parsed.sentences) do
+            if ws(new_s.text) == old_t then
+                -- Copy word timings
+                if old_s.words and new_s.words and #old_s.words == #new_s.words then
+                    for wi, ow in ipairs(old_s.words) do
+                        new_s.words[wi].start_time = ow.start_time
+                        new_s.words[wi].end_time = ow.end_time
+                        new_s.words[wi].duration = ow.duration
+                    end
+                end
+                -- Copy end_type for pause calculation
+                new_s.end_type = old_s.end_type or new_s.end_type
+                break
+            end
+        end
+    end
+
+    -- Update core state
+    self.parsed_data = fresh_parsed
+    self.total_sentences = #fresh_parsed.sentences
+    self.current_sentence = fresh_parsed.sentences[found_idx]
+    self.current_sentence_index = found_idx
+
+    -- The reading_sentence_idx tracks where the concat started — remap it
+    -- so the completion callback's arithmetic stays correct.
+    -- reading_sentence_idx currently points to the first sentence of the
+    -- concat.  Find that sentence in the new parse too.
+    if self._concat_sentences then
+        -- Remap each concat sentence to its new-parse counterpart
+        for ci, old_cs in ipairs(self._concat_sentences) do
+            local ct = ws(old_cs.text)
+            for _, new_s in ipairs(fresh_parsed.sentences) do
+                if ws(new_s.text) == ct then
+                    self._concat_sentences[ci] = new_s
+                    break
+                end
+            end
+        end
+    end
+
+    -- Fix reading_sentence_idx: it should point to the first sentence in
+    -- the current play batch (the one before the concat extras)
+    local first_text = self._first_play_sentence_text
+    if first_text then
+        for i, s in ipairs(fresh_parsed.sentences) do
+            if ws(s.text) == ws(first_text) then
+                self.reading_sentence_idx = i
+                break
+            end
+        end
+    end
+
+    -- Force word re-highlight on next tick
+    self.current_word_index = 0
+
+    -- Re-apply sentence highlight with the new sentence object
+    if self.plugin and self.plugin:getSetting("highlight_sentences", true) then
+        self.highlight_manager:clearHighlights()
+        pcall(self.highlightCurrentSentence, self, self.current_sentence)
+    end
+
+    -- Update progress bar
+    if self.playback_bar then
+        self.playback_bar:updateProgress(self:getProgress())
+    end
+end
+
+--[[--
 Sync loop for the current sentence.
 Updates word highlighting based on elapsed time.
 @param sentence table The sentence being played
@@ -657,6 +898,32 @@ function SyncController:startSentenceSyncLoop(sentence)
             end
             return -- if resume succeeded it restarts the sync loop itself
         end
+
+        -- Detect screen rotation: CRe's native selection is wiped on redraw,
+        -- and the visible text reflows (different sentences/word count on page).
+        -- We must re-parse the page and remap all state to the new layout.
+        local Screen = require("device").screen
+        local cur_w, cur_h = Screen:getWidth(), Screen:getHeight()
+        if self._last_screen_w and self._last_screen_h
+                and (cur_w ~= self._last_screen_w or cur_h ~= self._last_screen_h) then
+            self._last_screen_w = cur_w
+            self._last_screen_h = cur_h
+            -- Flag so the completion callback re-checks page boundaries
+            self._rotated_during_playback = true
+            -- Invalidate prefetched next page — page boundary shifted
+            self._next_page_text = nil
+            self._next_page_prefetched = false
+            logger.warn("SyncController: Rotation detected during playback")
+
+            -- Re-parse the visible page and remap current sentence
+            local controller_ref = self
+            UIManager:scheduleIn(0.3, function()
+                if controller_ref.state == controller_ref.STATE.STOPPED then return end
+                controller_ref:_remapAfterRotation()
+            end)
+        end
+        self._last_screen_w = self._last_screen_w or cur_w
+        self._last_screen_h = self._last_screen_h or cur_h
 
         -- Skip word-highlighting work when not actively playing
         if self.state ~= self.STATE.PLAYING then
@@ -740,8 +1007,10 @@ function SyncController:startSentenceSyncLoop(sentence)
             end
         end
 
-        -- Time offset for word lookup within the active concat sentence
-        local active_sentence = sentence
+        -- Time offset for word lookup within the active concat sentence.
+        -- Always read from self.current_sentence so that after rotation
+        -- remapping the sync loop uses the fresh-parse sentence object.
+        local active_sentence = self.current_sentence or sentence
         local time_offset = 0
         if self._concat_boundary_idx and self._concat_boundary_idx > 0
                 and self._concat_split_points then
@@ -961,6 +1230,10 @@ function SyncController:stop()
     self._locked_latency_ms = nil
     self._next_page_text = nil
     self._next_page_prefetched = false
+    self._last_screen_w = nil
+    self._last_screen_h = nil
+    self._rotated_during_playback = false
+    self._first_play_sentence_text = nil
     self:_cleanConcatFiles()
 
     logger.dbg("SyncController: Stopped")
