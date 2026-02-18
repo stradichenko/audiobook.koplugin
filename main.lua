@@ -174,6 +174,16 @@ function Audiobook:addToMainMenu(menu_items)
             },
             {
                 text_func = function()
+                    local val = self:getSetting("bt_disconnect_check", 30)
+                    if val == 0 then
+                        return _("BT disconnect alert: off")
+                    end
+                    return T(_("BT disconnect alert: %1s"), val)
+                end,
+                sub_item_table = self:buildBTDisconnectMenu(),
+            },
+            {
+                text_func = function()
                     return self:btMenuLabel()
                 end,
                 sub_item_table_func = function()
@@ -570,6 +580,29 @@ function Audiobook:buildHighlightStyleMenu()
     return menu
 end
 
+--- Build the BT disconnect alert interval submenu.
+function Audiobook:buildBTDisconnectMenu()
+    local options = {
+        { label = _("Off"),  value = 0 },
+        { label = _("15 s"), value = 15 },
+        { label = _("30 s"), value = 30 },
+        { label = _("60 s"), value = 60 },
+    }
+    local items = {}
+    for _, opt in ipairs(options) do
+        table.insert(items, {
+            text = opt.label,
+            checked_func = function()
+                return self:getSetting("bt_disconnect_check", 30) == opt.value
+            end,
+            callback = function()
+                self:saveSetting("bt_disconnect_check", opt.value)
+            end,
+        })
+    end
+    return items
+end
+
 --- Top-level label for the Bluetooth menu entry.
 -- Shows connected device name when available.
 function Audiobook:btMenuLabel()
@@ -901,6 +934,20 @@ function Audiobook:startReadAlong(text, start_pos)
         return
     end
 
+    -- If we're using Bluetooth audio, start a lightweight watcher that
+    -- will notify the user if all audio BT devices disconnect while
+    -- read-along is active.  This runs infrequently and only while the
+    -- plugin is in use to avoid extra battery drain.
+    pcall(function()
+        -- Ensure audio_player_type is initialized
+        if not self.tts_engine.audio_player_type then
+            self.tts_engine:findAudioPlayer()
+        end
+        if self.tts_engine.audio_player_type == "gst-bt" then
+            self:_startBTDisconnectWatcher()
+        end
+    end)
+
     self.sync_controller:start(page_text)
 end
 
@@ -1007,6 +1054,7 @@ end
 
 function Audiobook:stopReadAlong()
     logger.dbg("Audiobook: Stopping read-along")
+    pcall(function() self:_stopBTDisconnectWatcher() end)
     pcall(function() self.sync_controller:stop() end)
     pcall(function() self.highlight_manager:clearHighlights() end)
     -- Always kill orphan audio processes, even if we think we're not playing.
@@ -1021,6 +1069,73 @@ end
 
 function Audiobook:resumeReadAlong()
     self.sync_controller:resume()
+end
+
+-- Start a low-frequency Bluetooth disconnect watcher while read-along
+-- is active.  It checks, via D-Bus, whether any audio-related BT
+-- device is still connected, and shows a notification if everything
+-- disconnects.  Runs only while this plugin is in use to avoid
+-- unnecessary battery drain.
+function Audiobook:_startBTDisconnectWatcher()
+    local interval = self:getSetting("bt_disconnect_check", 30)
+    if interval == 0 then
+        return  -- user disabled the alert
+    end
+    if self._bt_disconnect_watching then
+        return
+    end
+    self._bt_disconnect_watching = true
+    self._bt_last_connected = nil
+    self:_scheduleBTDisconnectCheck()
+end
+
+function Audiobook:_stopBTDisconnectWatcher()
+    self._bt_disconnect_watching = false
+end
+
+function Audiobook:_scheduleBTDisconnectCheck()
+    if not self._bt_disconnect_watching then
+        return
+    end
+    -- Check at a coarse interval to keep overhead and wakeups low.
+    local interval = self:getSetting("bt_disconnect_check", 30)
+    if interval == 0 then
+        self._bt_disconnect_watching = false
+        return
+    end
+    UIManager:scheduleIn(interval, function()
+        if not self._bt_disconnect_watching then
+            return
+        end
+
+        local any_connected = false
+        local ok, devices = pcall(self.bt_manager.listAudioDevices, self.bt_manager)
+        if ok and devices then
+            for _, dev in ipairs(devices) do
+                if dev.connected then
+                    any_connected = true
+                    break
+                end
+            end
+        end
+
+        if self._bt_last_connected == nil then
+            self._bt_last_connected = any_connected
+        elseif self._bt_last_connected and not any_connected then
+            self._bt_last_connected = any_connected
+            UIManager:show(InfoMessage:new{
+                text = _("Bluetooth audio device disconnected."),
+                timeout = 4,
+            })
+        else
+            self._bt_last_connected = any_connected
+        end
+
+        -- Reschedule next check while watcher is active
+        if self._bt_disconnect_watching then
+            self:_scheduleBTDisconnectCheck()
+        end
+    end)
 end
 
 function Audiobook:getCurrentPageText()
