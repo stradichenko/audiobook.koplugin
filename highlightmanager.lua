@@ -175,12 +175,18 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc)
     end
     start_x = math.max(sb.x, math.min(sb.x + sb.w - 1, start_x))
 
-    -- Estimate x within the end line
+    -- Estimate x within the end line.
+    -- Use a slightly conservative estimate so CRe's word-boundary snapping
+    -- picks the LAST word of the sentence rather than bleeding into the next.
+    -- Proportional fonts make char-based x estimates imprecise; pulling back
+    -- by ~1 character width avoids overshooting into the next word.
     local el_total = cum[end_line] - cum[end_line - 1]
     local el_off   = vis_end - cum[end_line - 1]
     local end_x
     if el_total > 0 then
-        end_x = eb.x + math.floor((el_off / el_total) * eb.w)
+        -- Estimate one character width on this line
+        local char_w = math.max(1, math.floor(eb.w / math.max(1, el_total)))
+        end_x = eb.x + math.floor((el_off / el_total) * eb.w) - char_w
     else
         end_x = eb.x + eb.w
     end

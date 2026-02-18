@@ -625,6 +625,13 @@ function TTSEngine:play(on_word, on_complete, on_fail)
         play_cmd = string.format('%s "%s"', player, self.current_audio_file)
     end
     
+    -- Cancel any previously scheduled launchAndStart from an earlier play()
+    -- call.  This prevents stale closures from firing after we supersede them.
+    if self._pending_launch_fn then
+        UIManager:unschedule(self._pending_launch_fn)
+        self._pending_launch_fn = nil
+    end
+
     -- Force-kill any lingering audio — SIGKILL + killall to release the
     -- @kobo:mtkbtmwrpc abstract socket held by stale gst-launch processes.
     self:_killAudioProcess()
@@ -642,6 +649,7 @@ function TTSEngine:play(on_word, on_complete, on_fail)
     local engine = self
     local my_gen = self.play_generation
     local function launchAndStart()
+        engine._pending_launch_fn = nil
         -- Guard: bail if a newer play()/stop() call superseded us
         if (engine.play_generation or 0) ~= my_gen then
             logger.warn("TTSEngine: launchAndStart ABORTED — stale gen", my_gen, "vs", engine.play_generation)
@@ -688,6 +696,7 @@ function TTSEngine:play(on_word, on_complete, on_fail)
             end
             logger.warn("TTSEngine: BT socket wait =", need_wait, "s, gen=", self.play_generation)
             if need_wait > 0.02 then
+                self._pending_launch_fn = launchAndStart
                 UIManager:scheduleIn(need_wait, launchAndStart)
             else
                 launchAndStart()
@@ -1017,13 +1026,25 @@ function TTSEngine:stop()
     self.is_speaking = false
     self.is_paused = false
     self.play_generation = (self.play_generation or 0) + 1
+
+    -- Cancel any pending launchAndStart so it can't fire after stop()
+    if self._pending_launch_fn then
+        UIManager:unschedule(self._pending_launch_fn)
+        self._pending_launch_fn = nil
+    end
     
-    -- Force-kill audio player (SIGKILL to release BT socket immediately)
+    -- Only clear _socket_clean if there was a live audio process to kill.
+    -- If the process already exited naturally (onPlaybackComplete set
+    -- _socket_clean=true), preserve that flag so the next play() can
+    -- skip the 0.3s BT socket wait entirely.
+    local had_process = self.audio_pid ~= nil
     self:_killAudioProcess()
-    self._socket_clean = false
+    if had_process then
+        self._socket_clean = false
+    end
     
     self:fullCleanup()
-    logger.dbg("TTSEngine: Stopped")
+    logger.dbg("TTSEngine: Stopped, had_process=", had_process, "_socket_clean=", self._socket_clean)
 end
 
 --[[--%
@@ -1035,6 +1056,11 @@ gracefully and not leave the BT firmware in a bad state.
 --]]
 function TTSEngine:forceKillAll()
     self._socket_clean = false
+    -- Cancel any pending launchAndStart
+    if self._pending_launch_fn then
+        UIManager:unschedule(self._pending_launch_fn)
+        self._pending_launch_fn = nil
+    end
     if self.audio_pid then
         os.execute("kill -TERM " .. self.audio_pid .. " 2>/dev/null")
         self.audio_pid = nil
