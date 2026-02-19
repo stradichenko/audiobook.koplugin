@@ -242,10 +242,50 @@ function SyncController:beginSentencePlayback(sentence)
         local cumulative_ms = first_dur
         concat_files = {}
 
+        -- Read pause settings (seconds → milliseconds)
+        local sent_pause_s = (self.plugin and self.plugin:getSetting("sentence_pause", 0.1)) or 0.1
+        local para_pause_s = (self.plugin and self.plugin:getSetting("paragraph_pause", 0.8)) or 0.8
+        local sent_pause_ms = math.floor(sent_pause_s * 1000)
+        local para_pause_ms = math.floor(para_pause_s * 1000)
+
+        -- The first sentence just started playing.  Determine the
+        -- inter-sentence pause that follows it.
+        local prev_sent = sentence
+        -- Track whether we padded the first sentence's WAV so play()
+        -- uses the original (speech-only) duration for word timing.
+        local first_padded = false
+
         for idx = self.reading_sentence_idx + 1, self.total_sentences do
             local sent = self.parsed_data.sentences[idx]
             if not sent or not sent.text or sent.text == "" then
                 break
+            end
+
+            -- Calculate inter-sentence pause based on the PREVIOUS sentence's end_type.
+            -- Instead of separate silence WAV files (which cause GStreamer concat
+            -- stutter), pad the previous sentence's WAV with trailing silence.
+            local pause_ms = 0
+            if prev_sent then
+                if prev_sent.end_type == "paragraph" then
+                    pause_ms = para_pause_ms
+                else
+                    pause_ms = sent_pause_ms
+                end
+            end
+            if pause_ms > 0 then
+                if prev_sent == sentence then
+                    -- Pad the first sentence's WAV (the "main" file for play())
+                    self.tts_engine:appendSilenceToWav(self.tts_engine.current_audio_file, pause_ms)
+                    first_padded = true
+                elseif #concat_files > 0 then
+                    -- Pad the previous concat file's WAV
+                    local prev_cf = concat_files[#concat_files]
+                    if prev_cf and prev_cf.file then
+                        self.tts_engine:appendSilenceToWav(prev_cf.file, pause_ms)
+                        prev_cf.duration_ms = prev_cf.duration_ms + pause_ms
+                    end
+                end
+                cumulative_ms = cumulative_ms + pause_ms
             end
 
             -- Reuse existing prefetch, or synthesize synchronously
@@ -279,6 +319,7 @@ function SyncController:beginSentencePlayback(sentence)
             table.insert(concat_files, { file = pf_file, duration_ms = pf_dur })
             table.insert(concat_sentences, sent)
             table.insert(concat_wav_files, pf_file)
+            prev_sent = sent
 
             -- Protect file from _cleanPrefetch deletion during next iteration
             self.tts_engine._prefetch_in_use = true
@@ -288,6 +329,12 @@ function SyncController:beginSentencePlayback(sentence)
         end
 
         if #concat_files == 0 then concat_files = nil end
+
+        -- Tell play() to use the original (unpadded) duration for the first
+        -- sentence's word-timing scaling if we padded it with silence.
+        if first_padded then
+            self.tts_engine._unpadded_duration_ms = first_dur
+        end
 
         logger.warn("SyncController: Concat synthesis total:",
             time.to_ms(UIManager:getTime() - synth_t0), "ms for",

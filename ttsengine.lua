@@ -43,6 +43,7 @@ function TTSEngine:new(o)
     o.volume = o.volume or self.DEFAULT_VOLUME
     o.voice = o.voice or "en"  -- espeak-ng voice id
     o.word_gap = o.word_gap or 0  -- espeak-ng word gap (units of 10ms)
+    o.clause_pause = o.clause_pause or 0  -- extra pause at clause punctuation (seconds)
     o.backend = nil
     o.is_speaking = false
     o.is_paused = false
@@ -197,6 +198,15 @@ function TTSEngine:setWordGap(gap)
     logger.dbg("TTSEngine: Word gap set to", self.word_gap)
 end
 
+--[[
+Set the extra pause at clause punctuation (commas, semicolons, etc.).
+@param pause number Pause in seconds (0 = off)
+--]]
+function TTSEngine:setClausePause(pause)
+    self.clause_pause = pause or 0
+    logger.dbg("TTSEngine: Clause pause set to", self.clause_pause)
+end
+
 --[[--
 Synthesize text and return timing metadata.
 @param text string Text to synthesize
@@ -276,10 +286,48 @@ function TTSEngine:synthesizeCommand(text, callback)
         if word_gap > 0 then
             gap_flag = string.format(" -g %d", word_gap)
         end
-        cmd = string.format(
-            '%s%s -v %s -s %d -p %d -a %d%s -w "%s" "%s" 2>&1',
-            exec_prefix, self.backend_cmd, voice, speed, pitch, amplitude, gap_flag, audio_file, self:escapeText(text)
-        )
+        -- Clause pause: inject SSML <break> tags after clause punctuation
+        -- (, ; : — –).  Write SSML to a temp file and use -m -f to avoid
+        -- shell escaping issues and ensure ebook text is XML-safe.
+        local clause_pause = self.clause_pause or 0
+        if clause_pause > 0 then
+            local break_ms = math.floor(clause_pause * 1000)
+            local break_tag = string.format('<break time="%dms"/>', break_ms)
+            -- Minimal XML-escape: only & and < are strictly required in text
+            -- nodes.  Strip < and > entirely (HTML artifacts from ebook) and
+            -- escape &.  Avoid &apos;/&quot; which espeak-ng may not handle.
+            local safe_text = text:gsub("&", "&amp;"):gsub("[<>]", "")
+            -- Insert breaks after ASCII clause punctuation
+            safe_text = safe_text:gsub("([,;:])(%s)", "%1" .. break_tag .. "%2")
+            -- IMPORTANT: Use literal string gsub for multi-byte UTF-8 dashes.
+            -- A Lua character class like [—–] matches individual BYTES, which
+            -- would corrupt smart quotes, ellipsis, and other characters that
+            -- share the 0xe2 0x80 prefix bytes.
+            safe_text = safe_text:gsub("—(%s?)", "—" .. break_tag .. "%1")
+            safe_text = safe_text:gsub("–(%s?)", "–" .. break_tag .. "%1")
+            -- Wrap in SSML speak tags
+            safe_text = '<speak>' .. safe_text .. '</speak>'
+            -- Write SSML to a temp file (avoids shell escaping entirely)
+            self.file_counter = (self.file_counter or 0) + 1
+            local ssml_file = temp_dir .. "/audiobook_ssml_" .. os.time() .. "_" .. self.file_counter .. ".xml"
+            local sf = io.open(ssml_file, "w")
+            if sf then
+                sf:write(safe_text)
+                sf:close()
+                cmd = string.format(
+                    '%s%s -v %s -s %d -p %d -a %d%s -m -f "%s" -w "%s" 2>&1',
+                    exec_prefix, self.backend_cmd, voice, speed, pitch, amplitude, gap_flag, ssml_file, audio_file
+                )
+                -- Clean up SSML file after synthesis completes
+                self._ssml_temp_file = ssml_file
+            end
+        end
+        if not cmd then
+            cmd = string.format(
+                '%s%s -v %s -s %d -p %d -a %d%s -w "%s" "%s" 2>&1',
+                exec_prefix, self.backend_cmd, voice, speed, pitch, amplitude, gap_flag, audio_file, self:escapeText(text)
+            )
+        end
     elseif self.backend == self.BACKENDS.PICO then
         cmd = string.format(
             'pico2wave -l en-US -w "%s" "%s" 2>&1',
@@ -313,6 +361,12 @@ function TTSEngine:synthesizeCommand(text, callback)
     
     -- Run synthesis synchronously for reliability on e-ink devices
     local result = os.execute(cmd)
+
+    -- Clean up SSML temp file if one was created
+    if self._ssml_temp_file then
+        os.remove(self._ssml_temp_file)
+        self._ssml_temp_file = nil
+    end
     logger.dbg("TTSEngine: Command result:", result)
     
     -- Check if file was created
@@ -477,6 +531,95 @@ function TTSEngine:escapeText(text)
 end
 
 --[[--
+XML-escape text for safe embedding inside SSML markup.
+Escapes &, <, >, ", ' so that ebook content cannot break the SSML parser.
+@param text string Raw text
+@return string XML-safe text
+--]]
+function TTSEngine:xmlEscapeText(text)
+    text = text:gsub("&", "&amp;")
+    text = text:gsub("<", "&lt;")
+    text = text:gsub(">", "&gt;")
+    text = text:gsub('"', "&quot;")
+    text = text:gsub("'", "&apos;")
+    return text
+end
+
+--[[--
+Append silence (zero samples) to the end of an existing WAV file.
+Reads the byte rate from the WAV header to match the file's format exactly,
+then appends zero bytes and updates the RIFF/data chunk sizes.
+This is used to bake inter-sentence pauses directly into speech WAV files,
+avoiding separate silence files in the GStreamer concat pipeline.
+@param path string  WAV file path
+@param duration_ms number  Silence duration in milliseconds
+@return boolean  true on success
+--]]
+function TTSEngine:appendSilenceToWav(path, duration_ms)
+    if not path or not duration_ms or duration_ms <= 0 then return false end
+
+    local f = io.open(path, "r+b")
+    if not f then return false end
+
+    -- Read byte rate from WAV header (offset 28, 4 bytes LE)
+    f:seek("set", 28)
+    local raw = f:read(4)
+    if not raw or #raw < 4 then f:close(); return false end
+    local b1, b2, b3, b4 = raw:byte(1, 4)
+    local byte_rate = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+    if byte_rate <= 0 then f:close(); return false end
+
+    -- Read block align from WAV header (offset 32, 2 bytes LE)
+    f:seek("set", 32)
+    raw = f:read(2)
+    if not raw or #raw < 2 then f:close(); return false end
+    local ba1, ba2 = raw:byte(1, 2)
+    local block_align = ba1 + ba2 * 256
+    if block_align <= 0 then block_align = 2 end  -- fallback for 16-bit mono
+
+    -- Current file size
+    local file_size = f:seek("end")
+
+    -- Calculate silence bytes (aligned to block_align)
+    local silence_bytes = math.floor(byte_rate * (duration_ms / 1000))
+    silence_bytes = silence_bytes - (silence_bytes % block_align)
+    if silence_bytes <= 0 then f:close(); return false end
+
+    -- Append zero bytes at end of file
+    f:seek("end")
+    local chunk_size = 8192
+    local chunk = string.rep("\0", chunk_size)
+    local written = 0
+    while written < silence_bytes do
+        local to_write = math.min(chunk_size, silence_bytes - written)
+        if to_write < chunk_size then
+            f:write(chunk:sub(1, to_write))
+        else
+            f:write(chunk)
+        end
+        written = written + to_write
+    end
+
+    -- Update RIFF file size at offset 4
+    local new_file_size = file_size + silence_bytes
+    local function le32(n)
+        return string.char(n % 256, math.floor(n / 256) % 256,
+                           math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+    end
+    f:seek("set", 4)
+    f:write(le32(new_file_size - 8))
+
+    -- Update data chunk size at offset 40
+    f:seek("set", 40)
+    f:write(le32(new_file_size - 44))
+
+    f:close()
+    logger.dbg("TTSEngine: Appended", duration_ms, "ms silence to", path,
+        "(", silence_bytes, "bytes)")
+    return true
+end
+
+--[[--
 Pre-synthesize audio for the next sentence while the current one plays.
 This runs espeak-ng to generate the WAV file and timing data in advance,
 so when the current sentence finishes we can skip straight to playback.
@@ -579,6 +722,60 @@ function TTSEngine:getWavDurationMs(path)
 end
 
 --[[--
+Generate a WAV file containing silence of the given duration.
+Matches espeak-ng output format: 22050 Hz, mono, 16-bit PCM.
+@param duration_ms number  Duration in milliseconds
+@return string|nil  Path to the generated WAV file
+--]]
+function TTSEngine:generateSilenceWav(duration_ms)
+    if not duration_ms or duration_ms <= 0 then return nil end
+    local temp_dir = "/tmp"
+    self.file_counter = (self.file_counter or 0) + 1
+    local path = temp_dir .. "/audiobook_silence_" .. os.time() .. "_" .. self.file_counter .. ".wav"
+
+    local sample_rate = 22050
+    local channels = 1
+    local bits_per_sample = 16
+    local num_samples = math.floor(sample_rate * (duration_ms / 1000))
+    local data_size = num_samples * channels * (bits_per_sample / 8)
+    local file_size = 36 + data_size
+
+    local function le32(n)
+        return string.char(n % 256, math.floor(n / 256) % 256,
+                           math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+    end
+    local function le16(n)
+        return string.char(n % 256, math.floor(n / 256) % 256)
+    end
+
+    local byte_rate = sample_rate * channels * (bits_per_sample / 8)
+    local block_align = channels * (bits_per_sample / 8)
+
+    local header = "RIFF" .. le32(file_size) .. "WAVE"
+                 .. "fmt " .. le32(16)
+                 .. le16(1)
+                 .. le16(channels)
+                 .. le32(sample_rate)
+                 .. le32(byte_rate)
+                 .. le16(block_align)
+                 .. le16(bits_per_sample)
+                 .. "data" .. le32(data_size)
+
+    local f = io.open(path, "wb")
+    if not f then return nil end
+    f:write(header)
+    local chunk = string.rep("\0", math.min(data_size, 8192))
+    local written = 0
+    while written < data_size do
+        local to_write = math.min(#chunk, data_size - written)
+        f:write(chunk:sub(1, to_write))
+        written = written + to_write
+    end
+    f:close()
+    return path
+end
+
+--[[--
 Clean up prefetch state.
 --]]
 function TTSEngine:_cleanPrefetch()
@@ -644,10 +841,14 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     logger.dbg("TTSEngine: Audio file:", self.current_audio_file)
     logger.warn("TTSEngine: play() findPlayer took", time.to_ms(UIManager:getTime() - t0), "ms")
     
-    -- Calculate real audio duration from WAV file
-    local real_duration_ms = self:getAudioDurationMs()
+    -- Calculate real audio duration from WAV file.
+    -- If _unpadded_duration_ms is set, the WAV was padded with trailing
+    -- silence by SyncController.  Use the original (speech-only) duration
+    -- for word-timing scaling so highlights stay correct.
+    local real_duration_ms = self._unpadded_duration_ms or self:getAudioDurationMs()
+    self._unpadded_duration_ms = nil
     self._current_audio_duration_ms = real_duration_ms
-    logger.dbg("TTSEngine: Real WAV duration:", real_duration_ms, "ms")
+    logger.dbg("TTSEngine: Real WAV duration:", real_duration_ms, "ms (unpadded)")
     
     -- BT audio has significant startup latency (A2DP negotiation).
     -- On chained sentences the socket is still warm, so latency is lower.

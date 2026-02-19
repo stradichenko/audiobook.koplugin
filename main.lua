@@ -57,6 +57,7 @@ function Audiobook:init()
     end
     self.tts_engine:setVoice(full_voice)
     self.tts_engine:setWordGap(self:getSetting("word_gap", 2))
+    self.tts_engine:setClausePause(self:getSetting("clause_pause", 0))
     self.highlight_manager = HighlightManager:new{
         plugin = self,
         ui = self.ui,
@@ -262,10 +263,10 @@ function Audiobook:buildVoiceSettingsMenu()
         sub_item_table = self:buildVolumeMenu(),
     })
 
-    -- Pause between sentences (after . ? ! ; :)
+    -- Pause between sentences (after . ? !)
     table.insert(menu, {
         text_func = function()
-            return T(_("Sentence pause (. ? ! ; :): %1s"), self:getSetting("sentence_pause", 0.1))
+            return T(_("Sentence pause (. ? !): %1s"), self:getSetting("sentence_pause", 0.1))
         end,
         sub_item_table = self:buildSentencePauseMenu(),
     })
@@ -276,6 +277,14 @@ function Audiobook:buildVoiceSettingsMenu()
             return T(_("Paragraph pause (newlines): %1s"), self:getSetting("paragraph_pause", 0.8))
         end,
         sub_item_table = self:buildParagraphPauseMenu(),
+    })
+
+    -- Pause at clause-level punctuation (, ; : — !)
+    table.insert(menu, {
+        text_func = function()
+            return T(_("Clause pause (, ; : —): %1s"), self:getSetting("clause_pause", 0))
+        end,
+        sub_item_table = self:buildClausePauseMenu(),
     })
 
     -- Word gap (silence between words within a sentence)
@@ -395,6 +404,28 @@ function Audiobook:buildParagraphPauseMenu()
             end,
             callback = function()
                 self:setSetting("paragraph_pause", v)
+            end,
+        })
+    end
+    return menu
+end
+
+function Audiobook:buildClausePauseMenu()
+    -- Pause at clause-level punctuation (commas, semicolons, colons, hyphens)
+    -- Injected as silence in the espeak text via SSML-like pauses
+    local values = {0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5}
+    local menu = {}
+    for _i, v in ipairs(values) do
+        local label = string.format("%.2fs", v)
+        if v == 0 then label = label .. _(" (default / off)") end
+        table.insert(menu, {
+            text = label,
+            checked_func = function()
+                return self:getSetting("clause_pause", 0) == v
+            end,
+            callback = function()
+                self:setSetting("clause_pause", v)
+                self.tts_engine:setClausePause(v)
             end,
         })
     end
