@@ -153,8 +153,69 @@ function SyncController:readNextSentence()
         return
     end
 
+    -- For Piper: if a prefetch is pending/queued, wait for it instead of
+    -- launching a duplicate synthesis (which wastes ~11s and RAM).
+    local piper_status = self.tts_engine:getPiperPrefetchStatus(sentence.text)
+    if piper_status == "pending" or piper_status == "queued" then
+        logger.warn("SyncController: Waiting for Piper prefetch (status:", piper_status,
+            ") for sentence", self.reading_sentence_idx)
+        local poll_count = 0
+        local max_polls = 120  -- 60s timeout
+        local function waitForPiperPrefetch()
+            if controller.state == controller.STATE.STOPPED then return end
+            poll_count = poll_count + 1
+            local ok = controller.tts_engine:usePrefetched(sentence.text)
+            if ok then
+                logger.warn("SyncController: Piper prefetch arrived for sentence",
+                    controller.reading_sentence_idx, "after", poll_count * 0.5, "s")
+                controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
+                controller:beginSentencePlayback(sentence)
+                return
+            end
+            -- Check if it failed
+            local st = controller.tts_engine:getPiperPrefetchStatus(sentence.text)
+            if st == "failed" or (not st) then
+                logger.warn("SyncController: Piper prefetch failed/gone, falling back to synthesize")
+                controller.tts_engine:synthesize(sentence.text, function(synth_success, timing_data)
+                    if not synth_success then
+                        controller:readNextSentence()
+                        return
+                    end
+                    controller:applySentenceTiming(sentence, timing_data)
+                    controller:beginSentencePlayback(sentence)
+                end)
+                return
+            end
+            if poll_count < max_polls then
+                UIManager:scheduleIn(0.5, waitForPiperPrefetch)
+            else
+                logger.err("SyncController: Piper prefetch wait timed out, skipping sentence")
+                controller:readNextSentence()
+            end
+        end
+        UIManager:scheduleIn(0.5, waitForPiperPrefetch)
+        return
+    end
+
     -- No prefetch available — synthesize now (first sentence, or prefetch missed)
     logger.warn("SyncController: Synthesizing sentence", self.reading_sentence_idx, "(", sentence.text:sub(1,40), ")")
+
+    -- For Piper: kick off prefetch for the next batch while the first
+    -- sentence is being synthesized (~11s), so by the time it finishes
+    -- the serial queue has a head start on upcoming sentences.
+    if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+        local PIPER_LOOKAHEAD = 5
+        for offset = 1, PIPER_LOOKAHEAD do
+            local ahead_idx = self.reading_sentence_idx + offset
+            if self.parsed_data and ahead_idx <= self.total_sentences then
+                local ahead_sent = self.parsed_data.sentences[ahead_idx]
+                if ahead_sent and ahead_sent.text and ahead_sent.text ~= "" then
+                    self.tts_engine:piperPrefetchAsync(ahead_sent.text)
+                end
+            end
+        end
+    end
+
     local success = self.tts_engine:synthesize(sentence.text, function(synth_success, timing_data)
         if not synth_success then
             logger.warn("SyncController: Synthesis failed for sentence", controller.reading_sentence_idx)

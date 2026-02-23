@@ -404,6 +404,8 @@ function TTSEngine:synthesizeCommand(text, callback)
             '(%s; echo $? > "%s") &',
             cmd, done_marker
         )
+        -- Flag: block prefetch queue from launching concurrently
+        self._piper_synthesizing = true
         logger.dbg("TTSEngine: Launching Piper async:", bg_cmd)
         os.execute(bg_cmd)
         -- Save state for the async completion handler
@@ -433,6 +435,9 @@ function TTSEngine:synthesizeCommand(text, callback)
                         engine.current_audio_file = audio_file
                         engine:generateTimingEstimates(text)
                         logger.dbg("TTSEngine: Piper async done, file size:", size)
+                        engine._piper_synthesizing = false
+                        -- Chain: launch next queued prefetch now that the process slot is free
+                        engine:_launchNextPiperPrefetch()
                         if callback then
                             callback(true, engine.timing_data)
                         end
@@ -440,6 +445,8 @@ function TTSEngine:synthesizeCommand(text, callback)
                     end
                 end
                 logger.err("TTSEngine: Piper async failed, exit_code:", exit_code)
+                engine._piper_synthesizing = false
+                engine:_launchNextPiperPrefetch()
                 if callback then
                     callback(false, nil)
                 end
@@ -453,6 +460,8 @@ function TTSEngine:synthesizeCommand(text, callback)
                 -- Clean up
                 if piper_text_file then os.remove(piper_text_file) end
                 os.remove(done_marker)
+                engine._piper_synthesizing = false
+                engine:_launchNextPiperPrefetch()
                 if callback then
                     callback(false, nil)
                 end
@@ -1422,6 +1431,12 @@ function TTSEngine:stop()
         self._socket_clean = false
     end
     
+    -- Kill any background Piper synthesis processes immediately
+    if self.backend == self.BACKENDS.PIPER then
+        self:_killPiperProcesses()
+        self._piper_synthesizing = false
+    end
+    
     -- Clear concat/prefetch-in-use flag so fullCleanup can delete files
     self._prefetch_in_use = false
     self._concat_durations = nil
@@ -1464,6 +1479,8 @@ function TTSEngine:forceKillAll()
         self.audio_pid = nil
     end
     os.execute("killall -TERM gst-launch-1.0 2>/dev/null")
+    -- Kill any background Piper synthesis processes
+    self:_killPiperProcesses()
     self:fullCleanup()
 end
 
@@ -1758,6 +1775,10 @@ Called after piperPrefetchAsync() adds an entry, and again when a
 running synthesis finishes.
 --]]
 function TTSEngine:_launchNextPiperPrefetch()
+    -- Don't launch if a main synthesis is in progress
+    if self._piper_synthesizing then
+        return
+    end
     -- Check if something is already running
     for _, entry in pairs(self._piper_queue) do
         if entry.status == "pending" then
@@ -1868,10 +1889,23 @@ function TTSEngine:isPiperPrefetchReady(text)
 end
 
 --[[--
+Check if a Piper prefetch entry exists (pending or ready) for the given text.
+@param text string
+@return string|nil  "ready", "pending", "queued", "failed", or nil
+--]]
+function TTSEngine:getPiperPrefetchStatus(text)
+    local entry = self._piper_queue[text]
+    if entry then return entry.status end
+    return nil
+end
+
+--[[--
 Clean up the Piper async prefetch queue.
 Removes all WAV files and cancels pending entries.
 --]]
 function TTSEngine:_cleanPiperQueue()
+    -- Kill any running piper processes FIRST, before removing their files
+    self:_killPiperProcesses()
     for text, entry in pairs(self._piper_queue) do
         if entry.file then
             os.remove(entry.file)
@@ -1885,6 +1919,16 @@ function TTSEngine:_cleanPiperQueue()
     end
     self._piper_queue = {}
     self._piper_queue_order = {}
+end
+
+--[[--
+Kill all running piper TTS processes.
+Called when playback is stopped/cancelled to prevent orphaned piper
+processes from consuming CPU and memory in the background.
+--]]
+function TTSEngine:_killPiperProcesses()
+    os.execute("killall -9 piper 2>/dev/null")
+    logger.dbg("TTSEngine: Killed all piper processes")
 end
 
 return TTSEngine
