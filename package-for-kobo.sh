@@ -1,14 +1,41 @@
 #!/usr/bin/env bash
-# Package espeak-ng + plugin for Kobo deployment
+# Package espeak-ng + Piper TTS + plugin for Kobo deployment
 # Everything lives inside audiobook.koplugin/ — just copy to your plugins dir
-# Usage: bash package-for-kobo.sh
+# Usage: bash package-for-kobo.sh [--with-piper] [--piper-voice VOICE]
 # Output: kobo-tts-bundle/audiobook.koplugin/
+#
+# Options:
+#   --with-piper         Also bundle Piper TTS neural engine (~24 MB)
+#   --piper-voice VOICE  Download a specific Piper voice (default: en_US-lessac-medium)
+#                        Use "low" quality for smaller size (~15 MB), "medium" for better quality (~60 MB)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUNDLE_DIR="$SCRIPT_DIR/kobo-tts-bundle"
 PLUGIN_DEST="$BUNDLE_DIR/audiobook.koplugin"
 ESPEAK_DEST="$PLUGIN_DEST/espeak-ng"
+PIPER_DEST="$PLUGIN_DEST/piper"
+
+# Parse arguments
+WITH_PIPER=false
+PIPER_VOICE="en_US-lessac-medium"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --with-piper)
+            WITH_PIPER=true
+            shift
+            ;;
+        --piper-voice)
+            PIPER_VOICE="$2"
+            WITH_PIPER=true
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
 
 echo "=== Building espeak-ng for armv7l via Nix cross-compilation ==="
 ESPEAK_OUT=$(nix-build "$SCRIPT_DIR/cross-build-espeak.nix" --no-out-link 2>/dev/null)
@@ -36,7 +63,7 @@ cp "$ESPEAK_OUT/lib/libespeak-ng.so.1.52.0.1" "$ESPEAK_DEST/lib/"
 GLIBC_STORE=$(nix-shell -p binutils --run "readelf -l $ESPEAK_OUT/bin/espeak-ng" 2>/dev/null \
     | grep -oP '/nix/store/[^/]+' | head -1)
 echo "Bundling glibc from: $GLIBC_STORE"
-for lib in ld-linux-armhf.so.3 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0; do
+for lib in ld-linux-armhf.so.3 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1; do
     if [ -f "$GLIBC_STORE/lib/$lib" ]; then
         cp "$GLIBC_STORE/lib/$lib" "$ESPEAK_DEST/lib/"
         echo "  + $lib"
@@ -81,6 +108,82 @@ if [ -d "$ESPEAK_OUT/share/espeak-ng-data/voices/!v" ]; then
 fi
 
 chmod +x "$ESPEAK_DEST/bin/espeak-ng"
+
+# ── Piper TTS (optional) ──────────────────────────────────────────────
+if [ "$WITH_PIPER" = true ]; then
+    echo ""
+    echo "=== Bundling Piper TTS (neural voice engine) ==="
+    mkdir -p "$PIPER_DEST"
+
+    PIPER_VERSION="2023.11.14-2"
+    PIPER_TAR="piper_linux_armv7l.tar.gz"
+    PIPER_URL="https://github.com/rhasspy/piper/releases/download/${PIPER_VERSION}/${PIPER_TAR}"
+    PIPER_CACHE="$SCRIPT_DIR/.cache/piper"
+    mkdir -p "$PIPER_CACHE"
+
+    # Download Piper armv7l binary (cached)
+    if [ ! -f "$PIPER_CACHE/$PIPER_TAR" ]; then
+        echo "Downloading Piper armv7l binary..."
+        curl -L -o "$PIPER_CACHE/$PIPER_TAR" "$PIPER_URL"
+    else
+        echo "Using cached Piper binary: $PIPER_CACHE/$PIPER_TAR"
+    fi
+
+    # Extract just the piper binary + libs (not the full tarball tree)
+    echo "Extracting Piper binary..."
+    tar xzf "$PIPER_CACHE/$PIPER_TAR" -C "$PIPER_CACHE/"
+    cp "$PIPER_CACHE/piper/piper" "$PIPER_DEST/"
+    chmod +x "$PIPER_DEST/piper"
+    # Copy Piper's bundled shared libs (onnxruntime, espeak-ng, piper_phonemize).
+    # NOTE: The Piper tarball puts .so files FLAT next to the binary (no lib/ subdir).
+    # We gather them into lib/ for a clean layout and easier LD_LIBRARY_PATH.
+    mkdir -p "$PIPER_DEST/lib"
+    for so in "$PIPER_CACHE/piper/"*.so*; do
+        [ -e "$so" ] && cp -P "$so" "$PIPER_DEST/lib/"
+    done
+    # Also copy the tashkeel model (Arabic diacritization) if present
+    [ -f "$PIPER_CACHE/piper/libtashkeel_model.ort" ] && cp "$PIPER_CACHE/piper/libtashkeel_model.ort" "$PIPER_DEST/lib/"
+    # Copy helper binaries (piper_phonemize, espeak-ng) needed at runtime
+    for helper in piper_phonemize espeak-ng; do
+        [ -f "$PIPER_CACHE/piper/$helper" ] && cp "$PIPER_CACHE/piper/$helper" "$PIPER_DEST/" && chmod +x "$PIPER_DEST/$helper"
+    done
+    echo "Piper libs:"
+    ls -la "$PIPER_DEST/lib/"
+    # Copy espeak-ng-data directory (phonemizer data used by Piper internally)
+    if [ -d "$PIPER_CACHE/piper/espeak-ng-data" ]; then
+        cp -r "$PIPER_CACHE/piper/espeak-ng-data" "$PIPER_DEST/"
+    fi
+
+    # Download a default voice model
+    echo "Downloading Piper voice: $PIPER_VOICE ..."
+    VOICE_BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US"
+    # Parse voice name parts: e.g. en_US-lessac-medium → speaker=lessac, quality=medium
+    VOICE_SPEAKER=$(echo "$PIPER_VOICE" | sed 's/^en_US-//' | sed 's/-[^-]*$//')
+    VOICE_QUALITY=$(echo "$PIPER_VOICE" | sed 's/.*-//')
+    VOICE_DIR="$VOICE_BASE_URL/$VOICE_SPEAKER/$VOICE_QUALITY"
+
+    ONNX_FILE="${PIPER_VOICE}.onnx"
+    JSON_FILE="${PIPER_VOICE}.onnx.json"
+
+    if [ ! -f "$PIPER_CACHE/$ONNX_FILE" ]; then
+        curl -L -o "$PIPER_CACHE/$ONNX_FILE" "$VOICE_DIR/$ONNX_FILE"
+    else
+        echo "Using cached voice model: $ONNX_FILE"
+    fi
+    if [ ! -f "$PIPER_CACHE/$JSON_FILE" ]; then
+        curl -L -o "$PIPER_CACHE/$JSON_FILE" "$VOICE_DIR/$JSON_FILE"
+    else
+        echo "Using cached voice config: $JSON_FILE"
+    fi
+
+    cp "$PIPER_CACHE/$ONNX_FILE" "$PIPER_DEST/"
+    cp "$PIPER_CACHE/$JSON_FILE" "$PIPER_DEST/"
+
+    echo ""
+    echo "=== Piper TTS bundled ==="
+    du -sh "$PIPER_DEST"
+    echo "Voice model: $PIPER_VOICE"
+fi
 
 echo ""
 echo "=== Bundle ready ==="

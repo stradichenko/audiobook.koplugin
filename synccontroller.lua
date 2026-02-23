@@ -464,8 +464,17 @@ function SyncController:beginSentencePlayback(sentence)
             self._concat_split_points = nil
             self._concat_boundary_idx = nil
             self._concat_wav_files = nil
-            -- Single sentence — prefetch the next one
-            self:_prefetchNextSentence()
+            -- Single sentence — prefetch upcoming ones.
+            -- For Piper (~2.5× real-time), queue 3-5 sentences so the
+            -- serial prefetch pipeline stays warm across playback.
+            if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+                local PIPER_LOOKAHEAD = 5
+                for offset = 1, PIPER_LOOKAHEAD do
+                    self:_prefetchNextSentence(self.reading_sentence_idx + offset)
+                end
+            else
+                self:_prefetchNextSentence()
+            end
         end
 
         -- Highlight the sentence being read — show immediately so the user

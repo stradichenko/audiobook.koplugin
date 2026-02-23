@@ -1,6 +1,9 @@
 # Build output
 kobo-tts-bundle/
 
+# Piper download cache
+.cache/
+
 # Bundled binaries (packaged by package-for-kobo.sh)
 espeak-ng/
 

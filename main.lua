@@ -44,6 +44,11 @@ function Audiobook:init()
         plugin = self,
         plugin_dir = PLUGIN_PATH:sub(1, -2), -- strip trailing slash
     }
+    -- Restore saved TTS backend selection (if user explicitly chose one)
+    local saved_backend = self:getSetting("tts_backend", nil)
+    if saved_backend then
+        self.tts_engine:setBackend(saved_backend)
+    end
     -- Restore saved voice settings
     self.tts_engine:setRate(self:getSetting("speech_rate", 1.0))
     self.tts_engine:setPitch(self:getSetting("speech_pitch", 50))
@@ -58,6 +63,12 @@ function Audiobook:init()
     self.tts_engine:setVoice(full_voice)
     self.tts_engine:setWordGap(self:getSetting("word_gap", 2))
     self.tts_engine:setClausePause(self:getSetting("clause_pause", 0))
+    -- Restore Piper-specific settings
+    local piper_model = self:getSetting("piper_model", nil)
+    if piper_model then
+        self.tts_engine:setPiperModel(piper_model)
+    end
+    self.tts_engine:setPiperSpeaker(self:getSetting("piper_speaker", 0))
     self.highlight_manager = HighlightManager:new{
         plugin = self,
         ui = self.ui,
@@ -123,6 +134,10 @@ function Audiobook:addToMainMenu(menu_items)
             },
             {
                 text_func = function()
+                    if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+                        local model_label = self:getSetting("piper_model_label", "default")
+                        return T(_("Voice settings (Piper — %1)"), model_label)
+                    end
                     local voice_label = self:getSetting("tts_voice_label", "English (GB)")
                     local variant_label = self:getSetting("tts_variant_label", "")
                     if variant_label ~= "" and variant_label ~= "Default (male)" then
@@ -239,6 +254,25 @@ end
 function Audiobook:buildVoiceSettingsMenu()
     local menu = {}
 
+    -- TTS Engine selector (espeak-ng vs Piper)
+    table.insert(menu, {
+        text_func = function()
+            local backend = self.tts_engine.backend or "none"
+            local labels = {
+                espeak = _("espeak-ng"),
+                piper = _("Piper (neural)"),
+                pico = _("Pico TTS"),
+                flite = _("Flite"),
+                festival = _("Festival"),
+                android = _("Android"),
+            }
+            return T(_("TTS engine: %1"), labels[backend] or backend)
+        end,
+        sub_item_table_func = function()
+            return self:buildEngineSelectMenu()
+        end,
+    })
+
     -- Speech rate submenu
     table.insert(menu, {
         text_func = function()
@@ -247,13 +281,15 @@ function Audiobook:buildVoiceSettingsMenu()
         sub_item_table = self:buildSpeechRateMenu(),
     })
 
-    -- Pitch submenu
-    table.insert(menu, {
-        text_func = function()
-            return T(_("Pitch: %1"), self:getSetting("speech_pitch", 50))
-        end,
-        sub_item_table = self:buildPitchMenu(),
-    })
+    -- Pitch submenu (espeak-ng only)
+    if self.tts_engine.backend == self.tts_engine.BACKENDS.ESPEAK then
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Pitch: %1"), self:getSetting("speech_pitch", 50))
+            end,
+            sub_item_table = self:buildPitchMenu(),
+        })
+    end
 
     -- Volume submenu
     table.insert(menu, {
@@ -279,29 +315,43 @@ function Audiobook:buildVoiceSettingsMenu()
         sub_item_table = self:buildParagraphPauseMenu(),
     })
 
-    -- Pause at clause-level punctuation (, ; : — !)
-    table.insert(menu, {
-        text_func = function()
-            return T(_("Clause pause (, ; : —): %1s"), self:getSetting("clause_pause", 0))
-        end,
-        sub_item_table = self:buildClausePauseMenu(),
-    })
+    -- Clause pause (espeak-ng only — uses SSML)
+    if self.tts_engine.backend == self.tts_engine.BACKENDS.ESPEAK then
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Clause pause (, ; : —): %1s"), self:getSetting("clause_pause", 0))
+            end,
+            sub_item_table = self:buildClausePauseMenu(),
+        })
 
-    -- Word gap (silence between words within a sentence)
-    table.insert(menu, {
-        text_func = function()
-            return T(_("Word gap (between words): %1"), self:getSetting("word_gap", 2))
-        end,
-        sub_item_table = self:buildWordGapMenu(),
-    })
+        -- Word gap (espeak-ng only)
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Word gap (between words): %1"), self:getSetting("word_gap", 2))
+            end,
+            sub_item_table = self:buildWordGapMenu(),
+        })
+    end
 
-    -- Voice / accent selection
-    table.insert(menu, {
-        text_func = function()
-            return T(_("Voice: %1"), self:getSetting("tts_voice_label", "English (GB)"))
-        end,
-        sub_item_table = self:buildVoiceMenu(),
-    })
+    -- Voice / accent selection (differs by backend)
+    if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+        table.insert(menu, {
+            text_func = function()
+                local model = self:getSetting("piper_model_label", "default")
+                return T(_("Piper voice: %1"), model)
+            end,
+            sub_item_table_func = function()
+                return self:buildPiperVoiceMenu()
+            end,
+        })
+    else
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Voice: %1"), self:getSetting("tts_voice_label", "English (GB)"))
+            end,
+            sub_item_table = self:buildVoiceMenu(),
+        })
+    end
 
     return menu
 end
@@ -608,6 +658,118 @@ function Audiobook:buildHighlightStyleMenu()
         })
     end
     
+    return menu
+end
+
+--[[--
+Build TTS engine selection menu.
+Lists all detected backends so the user can switch between espeak-ng and Piper.
+--]]
+function Audiobook:buildEngineSelectMenu()
+    local menu = {}
+    local engine = self.tts_engine
+
+    -- Build a list of available backends with friendly labels
+    local available = {}
+
+    -- espeak-ng: available if we detected it during init
+    if engine.espeak_lib_path or self:_commandOnPath("espeak-ng") or self:_commandOnPath("espeak") then
+        table.insert(available, {
+            id = engine.BACKENDS.ESPEAK,
+            label = _("espeak-ng (formant, fast, robotic)"),
+        })
+    end
+
+    -- Piper: available if bundled binary or on PATH
+    if engine.piper_cmd or self:_commandOnPath("piper") then
+        table.insert(available, {
+            id = engine.BACKENDS.PIPER,
+            label = _("Piper (neural, natural-sounding)"),
+        })
+    end
+
+    -- Other system backends
+    if self:_commandOnPath("pico2wave") then
+        table.insert(available, { id = engine.BACKENDS.PICO, label = _("Pico TTS") })
+    end
+    if self:_commandOnPath("flite") then
+        table.insert(available, { id = engine.BACKENDS.FLITE, label = _("Flite") })
+    end
+    if self:_commandOnPath("festival") then
+        table.insert(available, { id = engine.BACKENDS.FESTIVAL, label = _("Festival") })
+    end
+
+    if #available == 0 then
+        table.insert(menu, {
+            text = _("No TTS engines found"),
+            enabled = false,
+        })
+        return menu
+    end
+
+    for _, backend in ipairs(available) do
+        table.insert(menu, {
+            text = backend.label,
+            checked_func = function()
+                return engine.backend == backend.id
+            end,
+            callback = function()
+                engine:setBackend(backend.id)
+                self:setSetting("tts_backend", backend.id)
+            end,
+        })
+    end
+
+    return menu
+end
+
+--- Quick check if a command is on the system PATH (for menu building).
+function Audiobook:_commandOnPath(cmd)
+    local handle = io.popen("which " .. cmd .. " 2>/dev/null")
+    if handle then
+        local result = handle:read("*a")
+        handle:close()
+        return result and result ~= ""
+    end
+    return false
+end
+
+--[[--
+Build Piper voice model selection menu.
+Lists .onnx files found in the bundled piper/ directory.
+--]]
+function Audiobook:buildPiperVoiceMenu()
+    local menu = {}
+    local voices = self.tts_engine:listPiperVoices()
+
+    if #voices == 0 then
+        table.insert(menu, {
+            text = _("No voice models found"),
+            enabled = false,
+        })
+        table.insert(menu, {
+            text = _("Place .onnx files in plugins/audiobook.koplugin/piper/"),
+            enabled = false,
+        })
+        return menu
+    end
+
+    for _, voice in ipairs(voices) do
+        local size_mb = voice.size and string.format(" (%.0f MB)", voice.size / 1024 / 1024) or ""
+        table.insert(menu, {
+            text = voice.name .. size_mb,
+            checked_func = function()
+                return self:getSetting("piper_model", nil) == voice.path
+                    or self.tts_engine.piper_model == voice.path
+            end,
+            callback = function()
+                self.tts_engine:setPiperModel(voice.path)
+                self:setSetting("piper_model", voice.path)
+                self:setSetting("piper_model_label", voice.name)
+            end,
+        })
+    end
+
     return menu
 end
 

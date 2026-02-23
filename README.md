@@ -13,7 +13,7 @@ A Text-to-Speech plugin with synchronized word highlighting for KOReader e-reade
   - ✕ Close/Stop reading
   - Progress bar showing reading position
   - Current word display
-- **Multiple TTS Engines**: Support for espeak, pico2wave, flite, festival, and Android TTS
+- **Multiple TTS Engines**: Support for **Piper** (neural, natural-sounding), espeak-ng, pico2wave, flite, festival, and Android TTS
 - **Adjustable Speech Rate**: 0.5x to 2.0x speed control
 - **Multiple Highlight Styles**: Background, underline, box, or invert
 - **Auto-Advance**: Automatically moves to the next page when reading completes
@@ -172,6 +172,69 @@ aplay /tmp/test.wav
 
 ---
 
+#### Optional: Install Piper TTS (Neural Voice)
+
+Piper TTS is a **neural text-to-speech engine** that sounds far more natural than espeak-ng. It runs locally on the Kobo's ARM processor — no internet required during playback.
+
+**Requirements:** ~85 MB total (24 MB engine + 15–60 MB voice model)
+
+##### Method 1: Bundle with the packaging script (recommended)
+
+On your build machine, run:
+
+```bash
+bash package-for-kobo.sh --with-piper
+```
+
+This downloads the Piper armv7l binary and the `en_US-lessac-medium` voice model, and bundles them into the plugin directory automatically.
+
+To use a different voice or quality level:
+
+```bash
+# Smaller (~15 MB model, faster synthesis, slightly lower quality)
+bash package-for-kobo.sh --piper-voice en_US-lessac-low
+
+# Higher quality (~60 MB model, slower synthesis)
+bash package-for-kobo.sh --piper-voice en_US-lessac-medium
+```
+
+Voice samples: [rhasspy.github.io/piper-samples](https://rhasspy.github.io/piper-samples/)
+
+##### Method 2: Manual install
+
+1. Download the armv7l binary from [github.com/rhasspy/piper/releases](https://github.com/rhasspy/piper/releases/tag/2023.11.14-2):
+   - `piper_linux_armv7l.tar.gz` (~24 MB)
+
+2. Download a voice model from [HuggingFace](https://huggingface.co/rhasspy/piper-voices):
+   - You need both the `.onnx` file and the `.onnx.json` config file
+
+3. Extract and copy to your Kobo:
+   ```
+   .adds/koreader/plugins/audiobook.koplugin/
+   └── piper/
+       ├── piper              (the binary)
+       ├── lib/               (shared libraries from the tarball)
+       ├── espeak-ng-data/    (phonemizer data from the tarball)
+       ├── en_US-lessac-medium.onnx
+       └── en_US-lessac-medium.onnx.json
+   ```
+
+4. In KOReader, go to **Tools → Audiobook Read-Along → Voice settings → TTS engine** and select **Piper (neural)**.
+
+##### Switching between engines
+
+You can have **both espeak-ng and Piper installed** simultaneously and switch between them from:
+
+**Tools → Audiobook Read-Along → Voice settings → TTS engine**
+
+| Engine | Sound quality | Speed | Size |
+|--------|-------------|-------|------|
+| espeak-ng | Robotic/formant | Very fast | ~4 MB |
+| Piper (low) | Natural/neural | Fast | ~40 MB |
+| Piper (medium) | Natural/neural | Moderate | ~85 MB |
+
+---
+
 ### Linux/Desktop
 One of the following TTS engines must be installed:
 - **espeak-ng** (recommended): `sudo apt install espeak-ng`
@@ -248,6 +311,15 @@ audiobook.koplugin/
 ├── highlightmanager.lua # Visual highlighting (moving word highlight)
 ├── playbackbar.lua      # Bottom playback control bar widget
 ├── synccontroller.lua   # Coordination, timing, and playback state
+├── espeak-ng/           # Bundled espeak-ng (formant TTS)
+│   ├── bin/espeak-ng
+│   ├── lib/             # Cross-compiled glibc + shared libs
+│   └── share/           # Phoneme data + English dictionary
+├── piper/               # Bundled Piper (neural TTS, optional)
+│   ├── piper            # ARM binary
+│   ├── lib/             # onnxruntime + shared libs
+│   ├── espeak-ng-data/  # Phonemizer data (used by Piper internally)
+│   └── *.onnx           # Voice model file(s)
 └── README.md            # This file
 ```
 

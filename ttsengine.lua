@@ -21,6 +21,7 @@ local TTSEngine = {
         FLITE = "flite",
         FESTIVAL = "festival",
         ANDROID = "android",
+        PIPER = "piper",
     },
     
     -- Default settings
@@ -52,10 +53,17 @@ function TTSEngine:new(o)
     o.on_word_callback = nil
     o.on_complete_callback = nil
     o.audio_pid = nil
+    -- Piper TTS state
+    o.piper_model = o.piper_model or nil  -- path or name of .onnx voice model
+    o.piper_speaker = o.piper_speaker or 0  -- speaker id for multi-speaker models
     -- Prefetch state: holds pre-synthesized audio for the next sentence
     o._prefetch_file = nil
     o._prefetch_timing = nil
     o._prefetch_text = nil
+    -- Piper async prefetch queue: keyed by sentence text
+    -- Each entry: {file=path, timing=table, status="pending"|"ready"|"failed"}
+    o._piper_queue = {}
+    o._piper_queue_order = {}  -- ordered list of texts for cleanup
     
     o:detectBackend()
     
@@ -72,20 +80,43 @@ function TTSEngine:detectBackend()
         return
     end
 
-    -- Check for bundled espeak-ng inside our own plugin directory
-    -- Installed at: /mnt/onboard/.adds/koreader/plugins/audiobook.koplugin/espeak-ng/
+    -- Detect all available bundled engines first, then pick the best default.
     local plugin_dir = self.plugin_dir or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin"
+
+    -- Check for bundled espeak-ng
     local bundled_base = plugin_dir .. "/espeak-ng"
     local bundled_bin = bundled_base .. "/bin/espeak-ng"
+    local found_espeak = false
     local f = io.open(bundled_bin, "r")
     if f then
         f:close()
-        self.backend = self.BACKENDS.ESPEAK
+        found_espeak = true
         self.backend_cmd = bundled_bin
         self.espeak_lib_path = bundled_base .. "/lib"
         self.espeak_data_path = bundled_base .. "/share"
         self.espeak_linker = bundled_base .. "/lib/ld-linux-armhf.so.3"
         logger.dbg("TTSEngine: Found bundled espeak-ng at", bundled_bin)
+    end
+
+    -- Check for bundled Piper TTS binary
+    local bundled_piper_bin = plugin_dir .. "/piper/piper"
+    local found_piper = false
+    f = io.open(bundled_piper_bin, "r")
+    if f then
+        f:close()
+        found_piper = true
+        self.piper_cmd = bundled_piper_bin
+        self.piper_model_dir = plugin_dir .. "/piper"
+        logger.dbg("TTSEngine: Found bundled Piper TTS at", bundled_piper_bin)
+    end
+
+    -- Pick default backend: espeak-ng first (lighter), then Piper
+    if found_espeak then
+        self.backend = self.BACKENDS.ESPEAK
+        return
+    elseif found_piper then
+        self.backend = self.BACKENDS.PIPER
+        self.backend_cmd = bundled_piper_bin
         return
     end
 
@@ -93,6 +124,7 @@ function TTSEngine:detectBackend()
     local backends_to_try = {
         {name = self.BACKENDS.ESPEAK, cmd = "espeak-ng"},
         {name = self.BACKENDS.ESPEAK, cmd = "espeak"},
+        {name = self.BACKENDS.PIPER, cmd = "piper"},
         {name = self.BACKENDS.PICO, cmd = "pico2wave"},
         {name = self.BACKENDS.FLITE, cmd = "flite"},
         {name = self.BACKENDS.FESTIVAL, cmd = "festival"},
@@ -328,6 +360,10 @@ function TTSEngine:synthesizeCommand(text, callback)
                 exec_prefix, self.backend_cmd, voice, speed, pitch, amplitude, gap_flag, audio_file, self:escapeText(text)
             )
         end
+    elseif self.backend == self.BACKENDS.PIPER then
+        local text_file
+        cmd, text_file = self:_buildPiperCommand(text, audio_file)
+        self._piper_text_file = text_file
     elseif self.backend == self.BACKENDS.PICO then
         cmd = string.format(
             'pico2wave -l en-US -w "%s" "%s" 2>&1',
@@ -359,13 +395,88 @@ function TTSEngine:synthesizeCommand(text, callback)
     
     logger.dbg("TTSEngine: Running:", cmd)
     
-    -- Run synthesis synchronously for reliability on e-ink devices
+    -- Piper TTS is slow (~8-11s per sentence on Kobo ARM).
+    -- Run it asynchronously so the UI stays responsive.
+    if self.backend == self.BACKENDS.PIPER then
+        -- Wrap: run synthesis in background, write a marker file when done
+        local done_marker = audio_file .. ".done"
+        local bg_cmd = string.format(
+            '(%s; echo $? > "%s") &',
+            cmd, done_marker
+        )
+        logger.dbg("TTSEngine: Launching Piper async:", bg_cmd)
+        os.execute(bg_cmd)
+        -- Save state for the async completion handler
+        local piper_text_file = self._piper_text_file
+        self._piper_text_file = nil  -- prevent premature cleanup
+        local engine = self
+        local poll_count = 0
+        local max_polls = 120  -- 60 seconds max (120 × 0.5s)
+        local function pollPiperDone()
+            poll_count = poll_count + 1
+            -- Check if the done marker file exists
+            local mf = io.open(done_marker, "r")
+            if mf then
+                local exit_code = mf:read("*a"):gsub("%s+", "")
+                mf:close()
+                os.remove(done_marker)
+                -- Clean up text input file
+                if piper_text_file then
+                    os.remove(piper_text_file)
+                end
+                -- Check if audio file was created
+                local af = io.open(audio_file, "r")
+                if af then
+                    af:close()
+                    local size = engine:getFileSize(audio_file)
+                    if size and size > 0 then
+                        engine.current_audio_file = audio_file
+                        engine:generateTimingEstimates(text)
+                        logger.dbg("TTSEngine: Piper async done, file size:", size)
+                        if callback then
+                            callback(true, engine.timing_data)
+                        end
+                        return
+                    end
+                end
+                logger.err("TTSEngine: Piper async failed, exit_code:", exit_code)
+                if callback then
+                    callback(false, nil)
+                end
+                return
+            end
+            -- Not done yet — keep polling
+            if poll_count < max_polls then
+                UIManager:scheduleIn(0.5, pollPiperDone)
+            else
+                logger.err("TTSEngine: Piper timed out after", max_polls * 0.5, "seconds")
+                -- Clean up
+                if piper_text_file then os.remove(piper_text_file) end
+                os.remove(done_marker)
+                if callback then
+                    callback(false, nil)
+                end
+            end
+        end
+        -- Start polling after a short initial delay
+        UIManager:scheduleIn(0.5, pollPiperDone)
+        -- Return nil (not false) to indicate async — caller should NOT
+        -- treat this as an immediate failure.
+        return nil
+    end
+
+    -- Non-Piper backends: run synchronously (espeak-ng is fast ~100ms)
     local result = os.execute(cmd)
 
     -- Clean up SSML temp file if one was created
     if self._ssml_temp_file then
         os.remove(self._ssml_temp_file)
         self._ssml_temp_file = nil
+    end
+    -- Clean up Piper text input file if one was created
+    if self._piper_text_file then
+        os.remove(self._piper_text_file)
+        self._piper_text_file = nil
     end
     logger.dbg("TTSEngine: Command result:", result)
     
@@ -630,6 +741,11 @@ function TTSEngine:prefetch(text)
     if not self.backend or not text or text == "" then
         return false
     end
+    -- Piper: delegate to the async queue-based prefetcher
+    if self.backend == self.BACKENDS.PIPER then
+        self:piperPrefetchAsync(text)
+        return true  -- launched (or already in queue)
+    end
     -- Don't prefetch the same text twice
     if self._prefetch_text == text and self._prefetch_file then
         return true
@@ -664,18 +780,33 @@ Check if prefetched audio matches the given text and swap it in.
 @return boolean true if prefetch was used
 --]]
 function TTSEngine:usePrefetched(text)
+    -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
-        -- Clean up current audio file before swapping
         if self.current_audio_file then
             os.remove(self.current_audio_file)
         end
         self.current_audio_file = self._prefetch_file
         self.timing_data = self._prefetch_timing
-        -- Clear prefetch slot (now promoted to current)
         self._prefetch_file = nil
         self._prefetch_timing = nil
         self._prefetch_text = nil
         logger.dbg("TTSEngine: Using prefetched audio")
+        return true
+    end
+    -- Check Piper async queue
+    local entry = self._piper_queue[text]
+    if entry and entry.status == "ready" and entry.file then
+        if self.current_audio_file then
+            os.remove(self.current_audio_file)
+        end
+        self.current_audio_file = entry.file
+        self.timing_data = entry.timing
+        -- Remove from queue (promoted to current)
+        self._piper_queue[text] = nil
+        for i, t in ipairs(self._piper_queue_order) do
+            if t == text then table.remove(self._piper_queue_order, i); break end
+        end
+        logger.dbg("TTSEngine: Using Piper queued audio")
         return true
     end
     return false
@@ -780,7 +911,6 @@ Clean up prefetch state.
 --]]
 function TTSEngine:_cleanPrefetch()
     if self._prefetch_file then
-        -- Don't delete the file if it's being used by a concat pipeline
         if not self._prefetch_in_use then
             os.remove(self._prefetch_file)
         end
@@ -789,6 +919,8 @@ function TTSEngine:_cleanPrefetch()
     self._prefetch_timing = nil
     self._prefetch_text = nil
     self._prefetch_in_use = false
+    -- Clean Piper async queue
+    self:_cleanPiperQueue()
 end
 
 --[[--
@@ -1381,6 +1513,378 @@ Get timing data.
 --]]
 function TTSEngine:getTimingData()
     return self.timing_data
+end
+
+-- ── Piper TTS helpers ────────────────────────────────────────────────
+
+--[[--
+Resolve the Piper voice model path.
+Searches for .onnx files in the bundled piper/ directory and any
+user-configured model path.
+@return string|nil Absolute path to .onnx file, or nil
+--]]
+function TTSEngine:_resolvePiperModel()
+    -- Explicit model path set by user or config
+    if self.piper_model then
+        -- If it's already an absolute path, use it directly
+        if self.piper_model:sub(1, 1) == "/" then
+            local f = io.open(self.piper_model, "r")
+            if f then f:close(); return self.piper_model end
+        end
+        -- Try relative to model dir
+        if self.piper_model_dir then
+            local try = self.piper_model_dir .. "/" .. self.piper_model
+            local f = io.open(try, "r")
+            if f then f:close(); return try end
+            -- Also try with .onnx suffix
+            try = try .. ".onnx"
+            f = io.open(try, "r")
+            if f then f:close(); return try end
+        end
+    end
+    -- Auto-detect: find the first .onnx file in the piper model dir
+    if self.piper_model_dir then
+        local handle = io.popen('find "' .. self.piper_model_dir .. '" -name "*.onnx" -type f 2>/dev/null | head -1')
+        if handle then
+            local result = handle:read("*a"):gsub("%s+$", "")
+            handle:close()
+            if result and result ~= "" then
+                logger.dbg("TTSEngine: Auto-detected Piper model:", result)
+                return result
+            end
+        end
+    end
+    return nil
+end
+
+--[[--
+Set the Piper voice model.
+@param model string Model name or path (e.g. "en_US-lessac-medium" or full path)
+--]]
+function TTSEngine:setPiperModel(model)
+    self.piper_model = model
+    logger.dbg("TTSEngine: Piper model set to", self.piper_model)
+end
+
+--[[--
+Set the Piper speaker id (for multi-speaker models).
+@param id number Speaker id (0-based)
+--]]
+function TTSEngine:setPiperSpeaker(id)
+    self.piper_speaker = id or 0
+    logger.dbg("TTSEngine: Piper speaker set to", self.piper_speaker)
+end
+
+--[[--
+Switch the active TTS backend.
+@param backend string One of TTSEngine.BACKENDS values
+--]]
+function TTSEngine:setBackend(backend)
+    -- Validate
+    local valid = false
+    for _, v in pairs(self.BACKENDS) do
+        if v == backend then valid = true; break end
+    end
+    if not valid then
+        logger.warn("TTSEngine: Invalid backend:", backend)
+        return
+    end
+    self.backend = backend
+    logger.dbg("TTSEngine: Backend switched to", backend)
+    -- Restore correct backend_cmd for the selected backend
+    if backend == self.BACKENDS.PIPER then
+        self.backend_cmd = self.piper_cmd or "piper"
+    elseif backend == self.BACKENDS.ESPEAK then
+        -- Restore bundled espeak-ng path if available
+        local plugin_dir = self.plugin_dir or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin"
+        local bundled_bin = plugin_dir .. "/espeak-ng/bin/espeak-ng"
+        local f = io.open(bundled_bin, "r")
+        if f then
+            f:close()
+            self.backend_cmd = bundled_bin
+        else
+            self.backend_cmd = "espeak-ng"
+        end
+    end
+end
+
+--[[--
+List available Piper voice models in the bundled piper/ directory.
+Returns an array of {name=, path=, size=} tables.
+@return table Array of voice info tables
+--]]
+function TTSEngine:listPiperVoices()
+    local voices = {}
+    if not self.piper_model_dir then return voices end
+    local handle = io.popen('find "' .. self.piper_model_dir .. '" -name "*.onnx" -type f 2>/dev/null')
+    if handle then
+        for line in handle:lines() do
+            local path = line:gsub("%s+$", "")
+            if path ~= "" then
+                -- Extract a friendly name from the filename
+                local name = path:match("([^/]+)%.onnx$") or path
+                local size = self:getFileSize(path)
+                table.insert(voices, {
+                    name = name,
+                    path = path,
+                    size = size,
+                })
+            end
+        end
+        handle:close()
+    end
+    return voices
+end
+
+-- ── Piper command builder & async prefetch queue ─────────────────────
+
+--[[--
+Build the shell command for Piper TTS synthesis.
+Extracts the command construction so both synthesizeCommand() and
+piperPrefetchAsync() can reuse it.
+@param text string  Text to synthesize
+@param audio_file string  Output WAV file path
+@return string cmd  Shell command
+@return string text_file  Path to the temporary text input file
+--]]
+function TTSEngine:_buildPiperCommand(text, audio_file)
+    local temp_dir = "/tmp"
+    local piper_bin = self.piper_cmd or self.backend_cmd or "piper"
+    local model_flag = ""
+    local model_path = self:_resolvePiperModel()
+    if model_path then
+        model_flag = string.format(' --model "%s"', model_path)
+    end
+    local speaker_flag = ""
+    if self.piper_speaker and self.piper_speaker > 0 then
+        speaker_flag = string.format(' --speaker %d', self.piper_speaker)
+    end
+    local length_scale = 1.0 / math.max(0.25, self.rate)
+    local length_flag = ""
+    if math.abs(length_scale - 1.0) > 0.01 then
+        length_flag = string.format(' --length_scale %.2f', length_scale)
+    end
+    -- Piper ships its own libs (onnxruntime, espeak-ng phonemizer data).
+    -- On Kobo, Piper needs the bundled glibc/libstdc++ (from espeak-ng/lib).
+    -- We invoke Piper through the bundled ld-linux-armhf.so.3 dynamic linker.
+    local exec_prefix = ""
+    if self.piper_model_dir then
+        local piper_lib = self.piper_model_dir .. "/lib"
+        local probe = io.open(piper_lib .. "/libonnxruntime.so.1.14.1", "r")
+        if not probe then
+            probe = io.open(self.piper_model_dir .. "/libonnxruntime.so.1.14.1", "r")
+            if probe then piper_lib = self.piper_model_dir end
+        end
+        if probe then probe:close() end
+        local plugin_dir = self.plugin_dir or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin"
+        local espeak_lib = plugin_dir .. "/espeak-ng/lib"
+        local ld_linux = espeak_lib .. "/ld-linux-armhf.so.3"
+        local ld_f = io.open(ld_linux, "r")
+        if ld_f then
+            ld_f:close()
+            local lib_path = piper_lib .. ":" .. espeak_lib
+            exec_prefix = string.format(
+                '"%s" --library-path "%s" ',
+                ld_linux, lib_path
+            )
+            local espeak_data_dir = self.piper_model_dir .. "/espeak-ng-data"
+            local ed_f = io.open(espeak_data_dir .. "/phontab", "r")
+            if ed_f then
+                ed_f:close()
+                model_flag = model_flag .. string.format(' --espeak_data "%s"', espeak_data_dir)
+            end
+        else
+            exec_prefix = string.format(
+                'LD_LIBRARY_PATH="%s" ESPEAK_DATA_PATH="%s" ',
+                piper_lib, self.piper_model_dir
+            )
+        end
+    end
+    -- Write text to a temp file to avoid shell escaping issues
+    self.file_counter = (self.file_counter or 0) + 1
+    local text_file = temp_dir .. "/audiobook_piper_in_" .. os.time() .. "_" .. self.file_counter .. ".txt"
+    local tf = io.open(text_file, "w")
+    if tf then
+        local clean = text:gsub("\n", " "):gsub("\r", "")
+        tf:write(clean .. "\n")
+        tf:close()
+    end
+    local cmd = string.format(
+        '%s%s%s%s%s --output_file "%s" < "%s" 2>&1',
+        exec_prefix, piper_bin, model_flag, speaker_flag, length_flag, audio_file, text_file
+    )
+    return cmd, text_file
+end
+
+--[[--
+Add a sentence to the Piper prefetch queue.  Only ONE Piper process
+runs at a time (each instance loads the full ONNX model into RAM).
+When the running process finishes, the next queued entry is launched
+automatically via _launchNextPiperPrefetch().
+@param text string  Sentence text
+--]]
+function TTSEngine:piperPrefetchAsync(text)
+    if not text or text == "" then return end
+    -- Already in queue (queued / pending / ready)?
+    if self._piper_queue[text] then return end
+
+    local temp_dir = "/tmp"
+    self.file_counter = (self.file_counter or 0) + 1
+    local audio_file = temp_dir .. "/audiobook_piper_pf_" .. os.time() .. "_" .. self.file_counter .. ".wav"
+    local done_marker = audio_file .. ".done"
+
+    -- Register in queue as "queued" (waiting to be launched)
+    self._piper_queue[text] = {
+        file = audio_file,
+        text_file = nil,       -- filled in when launched
+        done_marker = done_marker,
+        timing = nil,
+        status = "queued",
+    }
+    table.insert(self._piper_queue_order, text)
+
+    logger.dbg("TTSEngine: Piper prefetch queued:", text:sub(1, 40),
+        "(queue size:", #self._piper_queue_order, ")")
+
+    -- Kick the serial launcher — it will start this entry if nothing
+    -- else is currently running.
+    self:_launchNextPiperPrefetch()
+end
+
+--[[--
+Launch the next queued Piper prefetch entry, but only if no other
+entry is currently "pending" (= actively synthesising).
+Called after piperPrefetchAsync() adds an entry, and again when a
+running synthesis finishes.
+--]]
+function TTSEngine:_launchNextPiperPrefetch()
+    -- Check if something is already running
+    for _, entry in pairs(self._piper_queue) do
+        if entry.status == "pending" then
+            return  -- one process at a time
+        end
+    end
+
+    -- Find the first "queued" entry in insertion order
+    local text_to_launch = nil
+    for _, text in ipairs(self._piper_queue_order) do
+        local entry = self._piper_queue[text]
+        if entry and entry.status == "queued" then
+            text_to_launch = text
+            break
+        end
+    end
+    if not text_to_launch then return end  -- nothing to do
+
+    local entry = self._piper_queue[text_to_launch]
+    local audio_file = entry.file
+    local done_marker = entry.done_marker
+
+    local cmd, text_file = self:_buildPiperCommand(text_to_launch, audio_file)
+    entry.text_file = text_file
+    entry.status = "pending"
+
+    local bg_cmd = string.format('(%s; echo $? > "%s") &', cmd, done_marker)
+    logger.dbg("TTSEngine: Piper prefetch launching:", text_to_launch:sub(1, 40))
+    os.execute(bg_cmd)
+
+    -- Poll for completion, then chain to the next queued entry
+    local engine = self
+    local poll_count = 0
+    local max_polls = 120  -- 60s timeout
+    local function pollDone()
+        local e = engine._piper_queue[text_to_launch]
+        if not e then
+            -- Cleaned while pending — tidy temp files
+            os.remove(audio_file)
+            os.remove(done_marker)
+            if text_file then os.remove(text_file) end
+            -- Chain: maybe more entries were queued in the meantime
+            engine:_launchNextPiperPrefetch()
+            return
+        end
+        poll_count = poll_count + 1
+        local mf = io.open(done_marker, "r")
+        if mf then
+            local exit_code = mf:read("*a"):gsub("%s+", "")
+            mf:close()
+            os.remove(done_marker)
+            if text_file then os.remove(text_file) end
+            local af = io.open(audio_file, "r")
+            if af then
+                af:close()
+                local size = engine:getFileSize(audio_file)
+                if size and size > 0 then
+                    engine:generateTimingEstimates(text_to_launch)
+                    e.timing = engine.timing_data
+                    e.status = "ready"
+                    logger.dbg("TTSEngine: Piper prefetch ready:",
+                        text_to_launch:sub(1, 40), "size:", size)
+                    -- ── Chain: launch next queued entry ──
+                    engine:_launchNextPiperPrefetch()
+                    return
+                end
+            end
+            e.status = "failed"
+            logger.err("TTSEngine: Piper prefetch failed:",
+                text_to_launch:sub(1, 40), "exit:", exit_code)
+            engine:_launchNextPiperPrefetch()
+            return
+        end
+        if poll_count < max_polls then
+            UIManager:scheduleIn(0.5, pollDone)
+        else
+            e.status = "failed"
+            logger.err("TTSEngine: Piper prefetch timed out:", text_to_launch:sub(1, 40))
+            if text_file then os.remove(text_file) end
+            os.remove(done_marker)
+            engine:_launchNextPiperPrefetch()
+        end
+    end
+    UIManager:scheduleIn(0.5, pollDone)
+end
+
+--[[--
+Kick off Piper prefetch for multiple upcoming sentences.
+@param texts table  Array of sentence texts to prefetch
+--]]
+function TTSEngine:piperPrefetchBatch(texts)
+    if self.backend ~= self.BACKENDS.PIPER then return end
+    for _, text in ipairs(texts) do
+        if text and text ~= "" then
+            self:piperPrefetchAsync(text)
+        end
+    end
+end
+
+--[[--
+Check if a Piper prefetch entry is ready for the given text.
+@param text string
+@return boolean
+--]]
+function TTSEngine:isPiperPrefetchReady(text)
+    local entry = self._piper_queue[text]
+    return entry and entry.status == "ready"
+end
+
+--[[--
+Clean up the Piper async prefetch queue.
+Removes all WAV files and cancels pending entries.
+--]]
+function TTSEngine:_cleanPiperQueue()
+    for text, entry in pairs(self._piper_queue) do
+        if entry.file then
+            os.remove(entry.file)
+        end
+        if entry.done_marker then
+            os.remove(entry.done_marker)
+        end
+        if entry.text_file then
+            os.remove(entry.text_file)
+        end
+    end
+    self._piper_queue = {}
+    self._piper_queue_order = {}
 end
 
 return TTSEngine
