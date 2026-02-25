@@ -634,21 +634,6 @@ function TTSEngine:escapeText(text)
 end
 
 --[[--
-XML-escape text for safe embedding inside SSML markup.
-Escapes &, <, >, ", ' so that ebook content cannot break the SSML parser.
-@param text string Raw text
-@return string XML-safe text
---]]
-function TTSEngine:xmlEscapeText(text)
-    text = text:gsub("&", "&amp;")
-    text = text:gsub("<", "&lt;")
-    text = text:gsub(">", "&gt;")
-    text = text:gsub('"', "&quot;")
-    text = text:gsub("'", "&apos;")
-    return text
-end
-
---[[--
 Append silence (zero samples) to the end of an existing WAV file.
 Delegates to WavUtils.
 @param path string  WAV file path
@@ -700,6 +685,11 @@ function TTSEngine:espeakSynthesizeFallback(text)
         f:close()
         -- Smooth boundary clicks at start/end
         WavUtils.applyFade(audio_file, 15)
+        -- Resample espeak output (22050Hz) to match Piper model rate if needed
+        local target_sr = self._piper_sample_rate or 22050
+        if target_sr ~= 22050 then
+            WavUtils.resampleFile(audio_file, target_sr)
+        end
         -- Generate timing estimates for the espeak audio
         self:generateTimingEstimates(text)
         self.current_audio_file = audio_file
@@ -901,6 +891,15 @@ end
 -- switches to real audio on demand.  gst-launch never stops.
 local PIPE_BUFFER_DELAY_64KB = 1500 -- 64KB pipe buffer at 44100 B/s ≈ 1.45s
 local PIPE_BUFFER_DELAY_16KB = 370  -- 16KB pipe buffer at 44100 B/s ≈ 370ms
+
+--- Compute pipe buffer delay for a given sample rate and buffer size.
+-- @param sample_rate number  Audio sample rate (default 22050)
+-- @param buf_kb number  Pipe buffer size in KB (16 or 64)
+-- @return number  Delay in milliseconds
+local function pipeBufferDelay(sample_rate, buf_kb)
+    local byte_rate = (sample_rate or 22050) * 2  -- 16-bit mono
+    return math.floor((buf_kb * 1024) / byte_rate * 1000)
+end
 local PIPELINE_CTRL_DIR = "/tmp/audiobook_ctrl"
 local PIPELINE_FIFO = "/tmp/audiobook_fifo"
 local PIPELINE_SCRIPT = "/tmp/audiobook_pipeline.sh"
@@ -1013,14 +1012,12 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             self._concat_durations = nil
         end
 
-        -- Calculate expected audio duration
-        if self._concat_durations then
-            local total = 0
-            for _, d in ipairs(self._concat_durations) do total = total + d end
-            self._expected_play_duration_ms = total
-        else
-            self._expected_play_duration_ms = self._current_audio_duration_ms
-        end
+        -- Calculate expected audio duration from actual WAV file.
+        -- After mergeWavFiles(), the main WAV includes all silence padding
+        -- (inter-sentence gaps, first-sentence padding, trailing gap).
+        -- Reading the WAV header gives the true total duration, avoiding
+        -- the bug where first-sentence padding was excluded from the sum.
+        self._expected_play_duration_ms = self:getAudioDurationMs()
 
         -- Cancel any pending callbacks from previous play()
         if self._completion_timer_fn then
@@ -1084,14 +1081,25 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         -- Start timing loop for word highlighting
         self:startTimingLoop()
 
-        -- Duration-based completion: schedule onPlaybackComplete after the
-        -- expected audio duration plus pipe buffer delay plus margin.
-        -- If pipe resize succeeded (4KB), delay is ~100ms.
-        -- If pipe resize failed (64KB), delay is ~1500ms.
+        -- Duration-based completion: fire onPlaybackComplete when the
+        -- audio has finished playing through the speaker.
+        --
+        -- The expected duration includes all silence padding (inter-sentence
+        -- gaps + trailing gap).  We must NOT fire early (e.g. during the
+        -- trailing gap) because the sync loop is still running: firing
+        -- early stops the current sync loop and starts the next sentence's
+        -- highlighting while old audio (trailing gap) is still playing
+        -- through the pipe buffer — causing visible desync ("gap appears
+        -- before end of sentence" / "after start of next sentence").
+        --
+        -- The pipe buffer adds ~512ms of latency.  Add it plus a small
+        -- margin to ensure the audio has fully drained to the speaker.
         local pipe_buf_ms = self._pipe_buffer_delay_ms or PIPE_BUFFER_DELAY_64KB
-        local engine = self
+        local trailing_gap_ms = self._trailing_gap_ms or 0
+        self._trailing_gap_ms = nil
         local completion_delay_s = (self._expected_play_duration_ms / 1000)
-            + (pipe_buf_ms / 1000) + 0.5
+            + (pipe_buf_ms / 1000) + 0.15
+        local engine = self
         local function fireCompletion()
             if (engine.play_generation or 0) ~= my_gen then return end
             if not engine.is_speaking then return end
@@ -1101,7 +1109,7 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
             end
             logger.warn("TTSEngine: Pipeline completion (duration-based,",
                 engine._expected_play_duration_ms, "ms + pipe_buf",
-                pipe_buf_ms, "ms + 500ms)")
+                pipe_buf_ms, "ms, trailing_gap_in_audio=", trailing_gap_ms, "ms)")
             engine:onPlaybackComplete()
         end
         engine._completion_timer_fn = fireCompletion
@@ -1419,7 +1427,12 @@ The script starts gst-launch reading from a named FIFO and feeds it
 raw PCM (silence when idle, real audio when playing).
 --]]
 function TTSEngine:_writePipelineScript()
-    local script = [=[
+    local sr = self._piper_sample_rate or 22050
+    -- Silence chunk: ~50ms at sample rate, 16-bit mono
+    -- MUST be even (multiple of block_align=2) to preserve PCM sample alignment!
+    local silence_samples = math.floor(sr * 0.05)
+    local silence_bytes = silence_samples * 2
+    local script = string.format([=[
 #!/bin/sh
 CTRL="/tmp/audiobook_ctrl"
 FIFO="/tmp/audiobook_fifo"
@@ -1427,20 +1440,19 @@ mkdir -p "$CTRL"
 rm -f "$CTRL/stop" "$CTRL/play" "$CTRL/done" "$CTRL/gst_pid"
 rm -f "$FIFO"
 mkfifo "$FIFO"
-# Silence chunk: ~50ms at 22050Hz 16-bit mono = 1102 samples × 2 bytes = 2204 bytes
-# MUST be even (multiple of block_align=2) to preserve PCM sample alignment!
-dd if=/dev/zero bs=2204 count=1 of="$CTRL/s.raw" 2>/dev/null
+# Silence chunk: ~50ms at %dHz 16-bit mono = %d samples × 2 bytes = %d bytes
+dd if=/dev/zero bs=%d count=1 of="$CTRL/s.raw" 2>/dev/null
 # Start gst-launch reading raw PCM from FIFO.
 # sync=true (default) — the sink renders buffers at the timestamp rate.
 # Because the feeder writes silence CONTINUOUSLY (blocked by the pipe at
 # 1x when the buffer is full), the byte-offset timestamps from
 # rawaudioparse stay in sync with the GStreamer clock.  The BT A2DP
 # transport always has data — never suspends.
-# The Lua caller shrinks the pipe buffer to 16KB (~370ms) via
+# The Lua caller shrinks the pipe buffer to 16KB via
 # fcntl(F_SETPIPE_SZ) to reduce latency while keeping enough headroom
 # to absorb CPU stalls during Piper synthesis.
 gst-launch-1.0 filesrc location="$FIFO" \
-  ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=22050 num-channels=1 \
+  ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=%d num-channels=1 \
   ! audioconvert ! audioresample \
   ! "audio/x-raw,format=S16LE,rate=48000,channels=2" \
   ! mtkbtmwrpcaudiosink >/dev/null 2>/dev/null &
@@ -1457,17 +1469,13 @@ trap cleanup EXIT TERM
 # Track total bytes written to detect/fix alignment
 TOTAL_BYTES=0
 # Feeder loop: continuous silence when idle, real audio when play file appears.
-# The pipe buffer is 64KB (~1.45s at 44100 B/s).  When the buffer is full,
-# 'cat s.raw >&3' blocks until the sink consumes data (at 1x rate),
-# so the feeder naturally writes at real-time rate.  This keeps the BT
-# A2DP transport fed continuously and timestamps perfectly in sync.
 # usleep 1000 (1ms) prevents CPU busy-spin during initial pipe fill.
 while kill -0 $GST_PID 2>/dev/null && [ ! -f "$CTRL/stop" ]; do
   if [ -f "$CTRL/play" ]; then
     FILE=$(cat "$CTRL/play")
     rm -f "$CTRL/play" "$CTRL/done"
     # If total bytes written so far is odd, write 1 zero byte to re-align
-    ODD=$((TOTAL_BYTES % 2))
+    ODD=$((TOTAL_BYTES %% 2))
     if [ "$ODD" -ne 0 ]; then
       printf '\0' >&3
       TOTAL_BYTES=$((TOTAL_BYTES + 1))
@@ -1481,11 +1489,11 @@ while kill -0 $GST_PID 2>/dev/null && [ ! -f "$CTRL/stop" ]; do
     touch "$CTRL/done"
   else
     cat "$CTRL/s.raw" >&3
-    TOTAL_BYTES=$((TOTAL_BYTES + 2204))
+    TOTAL_BYTES=$((TOTAL_BYTES + %d))
     usleep 1000
   fi
 done
-]=]
+]=], sr, silence_samples, silence_bytes, silence_bytes, sr, silence_bytes)
     local f = io.open(PIPELINE_SCRIPT, "w")
     if not f then return false end
     f:write(script)
@@ -1531,10 +1539,11 @@ function TTSEngine:_startPersistentPipeline()
     self._persistent_pipeline = true
 
     -- Shrink the FIFO pipe buffer from 64KB to 16KB.
-    -- 16KB (~370ms at 44100 B/s) balances low latency with enough
-    -- headroom to absorb CPU stalls when Piper is synthesising.
-    -- 4KB (~93ms) was too tight and caused audible micro-cuts.
-    self._pipe_buffer_delay_ms = PIPE_BUFFER_DELAY_64KB  -- default: assume 64KB
+    -- At 22050Hz mono 16-bit (44100 B/s): 16KB ≈ 370ms.
+    -- At 16000Hz mono 16-bit (32000 B/s): 16KB ≈ 512ms.
+    -- Balances low latency with headroom for Piper CPU stalls.
+    local sr = self._piper_sample_rate or 22050
+    self._pipe_buffer_delay_ms = pipeBufferDelay(sr, 64)  -- default: assume 64KB
     if gst_pid then
         local O_WRONLY    = 1
         local O_NONBLOCK  = 2048  -- 0x800
@@ -1544,8 +1553,9 @@ function TTSEngine:_startPersistentPipeline()
             -- Pass size as cdata int — required for variadic fcntl on ARM EABI.
             local ret = ffi.C.fcntl(fd, F_SETPIPE_SZ, ffi.new("int", 16384))
             if ret >= 0 then
-                self._pipe_buffer_delay_ms = PIPE_BUFFER_DELAY_16KB
-                logger.warn("TTSEngine: Pipe buffer shrunk to 16KB, ret=", ret)
+                self._pipe_buffer_delay_ms = pipeBufferDelay(sr, 16)
+                logger.warn("TTSEngine: Pipe buffer shrunk to 16KB, ret=", ret,
+                    "delay=", self._pipe_buffer_delay_ms, "ms at", sr, "Hz")
             else
                 logger.warn("TTSEngine: fcntl F_SETPIPE_SZ failed, ret=", ret,
                     "errno=", ffi.errno(), ", trying shell fallback")
@@ -1555,7 +1565,7 @@ function TTSEngine:_startPersistentPipeline()
                     'python3 -c "import fcntl,os; fd=os.open(\'%s\',os.O_WRONLY|os.O_NONBLOCK); fcntl.fcntl(fd,1031,16384); os.close(fd)" 2>/dev/null',
                     PIPELINE_FIFO))
                 if rc == 0 then
-                    self._pipe_buffer_delay_ms = PIPE_BUFFER_DELAY_16KB
+                    self._pipe_buffer_delay_ms = pipeBufferDelay(sr, 16)
                     logger.warn("TTSEngine: Pipe buffer shrunk to 16KB via python3")
                 else
                     logger.warn("TTSEngine: All pipe resize methods failed, using 64KB delay")
@@ -1976,15 +1986,32 @@ function TTSEngine:isPaused()
     return self.is_speaking and self.is_paused
 end
 
---[[--
-Get timing data.
-@return table Timing data array
---]]
-function TTSEngine:getTimingData()
-    return self.timing_data
-end
-
 -- ── Piper TTS helpers ────────────────────────────────────────────────
+
+--[[--
+Read the sample rate from a Piper model's companion JSON config.
+Piper model files come with a .onnx.json sidecar containing
+{"audio":{"sample_rate":22050, ...}}.
+@param model_path string  Path to the .onnx file
+@return number  Sample rate (defaults to 22050 if unreadable)
+--]]
+function TTSEngine:_readModelSampleRate(model_path)
+    if not model_path then return 22050 end
+    local json_path = model_path .. ".json"
+    local f = io.open(json_path, "r")
+    if not f then
+        logger.dbg("TTSEngine: No .onnx.json sidecar for", model_path)
+        return 22050
+    end
+    local content = f:read("*a")
+    f:close()
+    local sr = tonumber(content:match('"sample_rate"%s*:%s*(%d+)'))
+    if sr and sr > 0 then
+        logger.warn("TTSEngine: Model sample rate =", sr, "Hz")
+        return sr
+    end
+    return 22050
+end
 
 --[[--
 Resolve the Piper voice model path.
@@ -2000,18 +2027,40 @@ function TTSEngine:_resolvePiperModel()
             local f = io.open(self.piper_model, "r")
             if f then f:close(); return self.piper_model end
         end
-        -- Try relative to model dir
+        -- Try as-is (relative to CWD – KOReader's base dir)
+        local f = io.open(self.piper_model, "r")
+        if f then
+            f:close()
+            logger.dbg("TTSEngine: Resolved model relative to CWD:", self.piper_model)
+            return self.piper_model
+        end
+        -- Extract basename and try relative to model dir
         if self.piper_model_dir then
+            local basename = self.piper_model:match("([^/]+)$")
+            if basename then
+                local try = self.piper_model_dir .. "/" .. basename
+                f = io.open(try, "r")
+                if f then
+                    f:close()
+                    logger.dbg("TTSEngine: Resolved model via basename:", try)
+                    return try
+                end
+                -- Also try with .onnx suffix
+                if not basename:match("%.onnx$") then
+                    try = self.piper_model_dir .. "/" .. basename .. ".onnx"
+                    f = io.open(try, "r")
+                    if f then f:close(); return try end
+                end
+            end
+            -- Legacy: try full path prepended to model dir
             local try = self.piper_model_dir .. "/" .. self.piper_model
-            local f = io.open(try, "r")
-            if f then f:close(); return try end
-            -- Also try with .onnx suffix
-            try = try .. ".onnx"
             f = io.open(try, "r")
             if f then f:close(); return try end
         end
     end
     -- Auto-detect: find the first .onnx file in the piper model dir
+    logger.warn("TTSEngine: _resolvePiperModel – explicit path failed, falling back to auto-detect. piper_model=",
+        self.piper_model or "(nil)", "piper_model_dir=", self.piper_model_dir or "(nil)")
     if self.piper_model_dir then
         local handle = io.popen('find "' .. self.piper_model_dir .. '" -name "*.onnx" -type f 2>/dev/null | head -1')
         if handle then
@@ -2019,6 +2068,7 @@ function TTSEngine:_resolvePiperModel()
             handle:close()
             if result and result ~= "" then
                 logger.dbg("TTSEngine: Auto-detected Piper model:", result)
+                self._piper_sample_rate = self:_readModelSampleRate(result)
                 return result
             end
         end
@@ -2031,8 +2081,23 @@ Set the Piper voice model.
 @param model string Model name or path (e.g. "en_US-lessac-medium" or full path)
 --]]
 function TTSEngine:setPiperModel(model)
+    local old_model = self.piper_model
     self.piper_model = model
-    logger.dbg("TTSEngine: Piper model set to", self.piper_model)
+    -- Read sample rate from model's JSON config
+    local resolved = self:_resolvePiperModel()
+    if resolved then
+        self._piper_sample_rate = self:_readModelSampleRate(resolved)
+    end
+    logger.dbg("TTSEngine: Piper model set to", self.piper_model,
+        "sample_rate=", self._piper_sample_rate or 22050)
+    -- If model actually changed, servers and pipeline need restart
+    if old_model and old_model ~= model then
+        logger.warn("TTSEngine: Model changed, stopping servers + pipeline")
+        self:_stopPiperServers()
+        self:_stopPersistentPipeline()
+        -- Clear prefetch queue (cached audio is at the old sample rate)
+        self:_cleanPiperQueue()
+    end
 end
 
 --[[--
@@ -2078,8 +2143,16 @@ function TTSEngine:setBackend(backend)
 end
 
 --[[--
+Get the active Piper model's sample rate.
+@return number  Sample rate (default 22050)
+--]]
+function TTSEngine:getPiperSampleRate()
+    return self._piper_sample_rate or 22050
+end
+
+--[[--
 List available Piper voice models in the bundled piper/ directory.
-Returns an array of {name=, path=, size=} tables.
+Returns an array of {name=, path=, size=, quality=, sample_rate=} tables.
 @return table Array of voice info tables
 --]]
 function TTSEngine:listPiperVoices()
@@ -2093,10 +2166,22 @@ function TTSEngine:listPiperVoices()
                 -- Extract a friendly name from the filename
                 local name = path:match("([^/]+)%.onnx$") or path
                 local size = self:getFileSize(path)
+                -- Read quality and sample rate from companion JSON
+                local quality = nil
+                local voice_sr = 22050
+                local jf = io.open(path .. ".json", "r")
+                if jf then
+                    local content = jf:read("*a")
+                    jf:close()
+                    quality = content:match('"quality"%s*:%s*"([^"]+)"')
+                    voice_sr = tonumber(content:match('"sample_rate"%s*:%s*(%d+)')) or 22050
+                end
                 table.insert(voices, {
                     name = name,
                     path = path,
                     size = size,
+                    quality = quality,
+                    sample_rate = voice_sr,
                 })
             end
         end

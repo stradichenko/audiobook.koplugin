@@ -24,6 +24,9 @@ WavUtils.DATA_SIZE_OFFSET = 40
 WavUtils.DEFAULT_SAMPLE_RATE = 22050
 WavUtils.DEFAULT_CHANNELS = 1
 WavUtils.DEFAULT_BITS_PER_SAMPLE = 16
+WavUtils.SAMPLE_RATE_OFFSET = 24
+WavUtils.CHANNELS_OFFSET = 22
+WavUtils.BITS_PER_SAMPLE_OFFSET = 34
 
 --- Encode a 32-bit integer in little-endian format.
 -- @param n number  Integer to encode
@@ -60,6 +63,116 @@ function WavUtils.readLE16(raw)
     if not raw or #raw < 2 then return 0 end
     local b1, b2 = raw:byte(1, 2)
     return b1 + b2 * 256
+end
+
+--- Read sample rate from an open WAV file handle.
+-- @param f file  Open file handle
+-- @return number  Sample rate (0 on error)
+function WavUtils.readSampleRate(f)
+    f:seek("set", WavUtils.SAMPLE_RATE_OFFSET)
+    local raw = f:read(4)
+    if not raw or #raw < 4 then return 0 end
+    return WavUtils.readLE32(raw)
+end
+
+--[[--
+Resample a WAV file in-place to a target sample rate.
+Uses linear interpolation.  Suitable for resampling espeak 22050Hz
+output to match Piper model rates (e.g. 16000Hz).
+@param path string   WAV file path (modified in-place)
+@param target_rate number  Desired sample rate (e.g. 16000)
+@return boolean  true on success
+--]]
+function WavUtils.resampleFile(path, target_rate)
+    if not path or not target_rate or target_rate <= 0 then return false end
+
+    local f = io.open(path, "rb")
+    if not f then return false end
+
+    local header = f:read(WavUtils.HEADER_SIZE)
+    if not header or #header < WavUtils.HEADER_SIZE then f:close(); return false end
+
+    -- Read source format from header
+    local src_rate = WavUtils.readLE32(header:sub(
+        WavUtils.SAMPLE_RATE_OFFSET + 1, WavUtils.SAMPLE_RATE_OFFSET + 4))
+    if src_rate == target_rate then f:close(); return true end  -- already correct
+    if src_rate <= 0 then f:close(); return false end
+
+    local channels = WavUtils.readLE16(header:sub(
+        WavUtils.CHANNELS_OFFSET + 1, WavUtils.CHANNELS_OFFSET + 2))
+    local bps = WavUtils.readLE16(header:sub(
+        WavUtils.BITS_PER_SAMPLE_OFFSET + 1, WavUtils.BITS_PER_SAMPLE_OFFSET + 2))
+    local data_size = WavUtils.readLE32(header:sub(
+        WavUtils.DATA_SIZE_OFFSET + 1, WavUtils.DATA_SIZE_OFFSET + 4))
+
+    if channels ~= 1 or bps ~= 16 then
+        -- Only mono 16-bit supported for resampling
+        f:close()
+        logger.warn("WavUtils: resampleFile: unsupported format ch=", channels, "bps=", bps)
+        return false
+    end
+
+    -- Read all PCM data
+    local pcm_data = f:read(data_size)
+    f:close()
+    if not pcm_data or #pcm_data < 2 then return false end
+
+    local src_frames = math.floor(#pcm_data / 2)  -- 16-bit mono = 2 bytes/frame
+    local dst_frames = math.floor(src_frames * target_rate / src_rate)
+    if dst_frames <= 0 then return false end
+
+    -- Resample using linear interpolation
+    local output = {}
+    local ratio = src_rate / target_rate
+    for i = 0, dst_frames - 1 do
+        local src_pos = i * ratio
+        local idx0 = math.floor(src_pos)
+        local frac = src_pos - idx0
+        local idx1 = math.min(idx0 + 1, src_frames - 1)
+
+        -- Read source samples (signed 16-bit LE)
+        local off0 = idx0 * 2 + 1
+        local off1 = idx1 * 2 + 1
+        local s0 = WavUtils.readLE16(pcm_data:sub(off0, off0 + 1))
+        local s1 = WavUtils.readLE16(pcm_data:sub(off1, off1 + 1))
+        -- Convert unsigned to signed
+        if s0 >= 32768 then s0 = s0 - 65536 end
+        if s1 >= 32768 then s1 = s1 - 65536 end
+
+        -- Interpolate
+        local sample = math.floor(s0 + (s1 - s0) * frac + 0.5)
+        sample = math.max(-32768, math.min(32767, sample))
+
+        -- Convert signed back to unsigned for LE encoding
+        if sample < 0 then sample = sample + 65536 end
+        output[#output + 1] = WavUtils.le16(sample)
+    end
+
+    local new_pcm = table.concat(output)
+    local new_data_size = #new_pcm
+    local new_byte_rate = target_rate * 1 * 2  -- mono, 16-bit
+    local block_align = 2  -- mono, 16-bit
+
+    -- Build new WAV header
+    local new_header = "RIFF" .. WavUtils.le32(new_data_size + 36) .. "WAVE"
+                     .. "fmt " .. WavUtils.le32(16)
+                     .. WavUtils.le16(1)              -- PCM
+                     .. WavUtils.le16(1)              -- mono
+                     .. WavUtils.le32(target_rate)
+                     .. WavUtils.le32(new_byte_rate)
+                     .. WavUtils.le16(block_align)
+                     .. WavUtils.le16(16)             -- 16-bit
+                     .. "data" .. WavUtils.le32(new_data_size)
+
+    local out = io.open(path, "wb")
+    if not out then return false end
+    out:write(new_header)
+    out:write(new_pcm)
+    out:close()
+
+    logger.dbg("WavUtils: Resampled", path, "from", src_rate, "to", target_rate,
+        "Hz (", src_frames, "->", dst_frames, "frames)")
+    return true
 end
 
 --- Read byte rate from a WAV file handle (file must be open).
@@ -303,16 +416,17 @@ end
 
 --[[--
 Generate a WAV file containing silence of the given duration.
-Format: 22050 Hz, mono, 16-bit PCM (matches Piper/espeak-ng output).
+Format: mono, 16-bit PCM.
 
 @param path string  Output file path
 @param duration_ms number  Duration in milliseconds
+@param sample_rate number  Sample rate (default 22050)
 @return boolean  true on success
 --]]
-function WavUtils.generateSilence(path, duration_ms)
+function WavUtils.generateSilence(path, duration_ms, sample_rate)
     if not path or not duration_ms or duration_ms <= 0 then return false end
 
-    local sr = WavUtils.DEFAULT_SAMPLE_RATE
+    local sr = sample_rate or WavUtils.DEFAULT_SAMPLE_RATE
     local ch = WavUtils.DEFAULT_CHANNELS
     local bps = WavUtils.DEFAULT_BITS_PER_SAMPLE
     local num_samples = math.floor(sr * (duration_ms / 1000))

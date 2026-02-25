@@ -1,41 +1,12 @@
 --[[--
 Shared Utility Functions
 Common helpers used across the audiobook plugin modules.
-Eliminates duplication of getPluginPath, commandExists, ws, countSyllables.
+Eliminates duplication of commandExists, ws, countSyllables.
 
 @module utils
 --]]
 
 local Utils = {}
-
---- Get the directory path of the calling Lua file.
--- Uses debug.getinfo to determine the source file's directory.
--- @return string  Directory path (with trailing /)
-function Utils.getPluginPath()
-    -- Walk up 2 frames: 1=this function, 2=caller
-    local info = debug.getinfo(2, "S")
-    if info and info.source and info.source:find("^@") then
-        return info.source:gsub("^@(.*/)[^/]*", "%1")
-    end
-    -- Fallback: use this file's own path
-    info = debug.getinfo(1, "S")
-    if info and info.source and info.source:find("^@") then
-        return info.source:gsub("^@(.*/)[^/]*", "%1")
-    end
-    return "./"
-end
-
---- Resolve the plugin directory from the module file itself.
--- Unlike getPluginPath(), this always returns the directory of utils.lua,
--- not the caller's file.  Use when you need the plugin root dir.
--- @return string  Plugin directory path (with trailing /)
-function Utils.getPluginDir()
-    local info = debug.getinfo(1, "S")
-    if info and info.source and info.source:find("^@") then
-        return info.source:gsub("^@(.*/)[^/]*", "%1")
-    end
-    return "./"
-end
 
 --- Check if a command exists on the system PATH.
 -- @param cmd string  Command name (e.g. "piper", "espeak-ng")

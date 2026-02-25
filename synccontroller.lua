@@ -19,9 +19,9 @@ local PLUGIN_PATH = _utils_dir
 -- ── Constants ────────────────────────────────────────────────────────
 -- Number of sentences to prefetch ahead for Piper TTS.
 -- Piper runs ~4× RTF on single-core ARM; with 2 servers batching 3
--- sentences each, 20 sentences keeps the pipeline well-stocked so
--- both servers always have work queued.
-local PIPER_LOOKAHEAD = 20
+-- sentences each, 9 sentences (3 batches) keeps both servers busy
+-- without flooding the queue and delaying next-page prefetch.
+local PIPER_LOOKAHEAD = 9
 
 -- Number of initial sentences to play via espeak-ng while Piper warms up.
 -- espeak synthesizes in ~300ms vs Piper's 30-75s first batch on ARM.
@@ -79,6 +79,13 @@ function SyncController:start(text)
 
     self.state = self.STATE.LOADING
     logger.dbg("SyncController: Starting read-along with", #text, "characters")
+
+    -- Log rotation baseline for diagnostics
+    local Screen = require("device").screen
+    local scr_w, scr_h = Screen:getWidth(), Screen:getHeight()
+    logger.warn("SyncController: start() — screen", scr_w, "x", scr_h,
+        "mode=", Screen:getScreenMode(),
+        "rotation=", Screen.getRotationMode and Screen:getRotationMode() or "?")
 
     -- Parse the full text into sentences and words
     self.parsed_data = self.text_parser:parse(text)
@@ -283,7 +290,7 @@ function SyncController:readNextSentence()
         -- Show notification while waiting for Piper (no espeak fallback or it failed)
         local InfoMessage = require("ui/widget/infomessage")
         UIManager:show(InfoMessage:new{
-            text = _("Starting neural TTS, please wait…"),
+            text = "Starting neural TTS, please wait…",
             timeout = 3,
         })
 
@@ -412,8 +419,17 @@ function SyncController:beginSentencePlayback(sentence)
         concat_files = {}
 
         -- Read pause settings (seconds → milliseconds)
-        local sent_pause_s = (self.plugin and self.plugin:getSetting("sentence_pause", 0.1)) or 0.1
-        local para_pause_s = (self.plugin and self.plugin:getSetting("paragraph_pause", 0.8)) or 0.8
+        -- For Piper, use the neural-specific gap settings; for espeak, use the legacy ones.
+        local is_piper_backend = self.tts_engine
+            and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+        local sent_pause_s, para_pause_s
+        if is_piper_backend then
+            sent_pause_s = (self.plugin and self.plugin:getSetting("piper_sentence_gap", 0.3)) or 0.3
+            para_pause_s = (self.plugin and self.plugin:getSetting("piper_paragraph_gap", 1.0)) or 1.0
+        else
+            sent_pause_s = (self.plugin and self.plugin:getSetting("sentence_pause", 0.1)) or 0.1
+            para_pause_s = (self.plugin and self.plugin:getSetting("paragraph_pause", 0.8)) or 0.8
+        end
         local sent_pause_ms = math.floor(sent_pause_s * 1000)
         local para_pause_ms = math.floor(para_pause_s * 1000)
 
@@ -430,9 +446,26 @@ function SyncController:beginSentencePlayback(sentence)
                 break
             end
 
-            -- Calculate inter-sentence pause based on the PREVIOUS sentence's end_type.
-            -- Instead of separate silence WAV files (which cause GStreamer concat
-            -- stutter), pad the previous sentence's WAV with trailing silence.
+            -- Check prefetch availability BEFORE applying gap padding.
+            -- This prevents double-padding: if the sentence isn't ready and
+            -- we break, we haven't padded the previous sentence.  The
+            -- trailing-gap code after the loop handles the final padding.
+            local pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
+            if not pf_file then
+                if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+                    logger.warn("SyncController: Concat: Piper sentence", idx, "not ready yet, stopping concat")
+                    break
+                end
+                self.tts_engine:prefetch(sent.text)
+                pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
+            end
+            if not pf_file or pf_dur <= 0 then
+                logger.warn("SyncController: Concat synthesis failed at sentence", idx)
+                break
+            end
+
+            -- Sentence is available — NOW apply inter-sentence gap to the
+            -- PREVIOUS sentence's WAV (trailing silence).
             local pause_ms = 0
             if prev_sent then
                 if prev_sent.end_type == "paragraph" then
@@ -443,11 +476,9 @@ function SyncController:beginSentencePlayback(sentence)
             end
             if pause_ms > 0 then
                 if prev_sent == sentence then
-                    -- Pad the first sentence's WAV (the "main" file for play())
                     self.tts_engine:appendSilenceToWav(self.tts_engine.current_audio_file, pause_ms)
                     first_padded = true
                 elseif #concat_files > 0 then
-                    -- Pad the previous concat file's WAV
                     local prev_cf = concat_files[#concat_files]
                     if prev_cf and prev_cf.file then
                         self.tts_engine:appendSilenceToWav(prev_cf.file, pause_ms)
@@ -455,27 +486,6 @@ function SyncController:beginSentencePlayback(sentence)
                     end
                 end
                 cumulative_ms = cumulative_ms + pause_ms
-            end
-
-            -- Reuse existing prefetch, or synthesize synchronously.
-            -- peekPrefetch() does a sync-finalize check for Piper entries
-            -- that finished between UIManager poll intervals.
-            local pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
-            if not pf_file then
-                -- For Piper: don't try to synthesize inline — it's async and
-                -- would just queue without producing a result.  Only grab
-                -- entries that are already ready.
-                if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
-                    logger.warn("SyncController: Concat: Piper sentence", idx, "not ready yet, stopping concat")
-                    break
-                end
-                -- For espeak-ng: synthesize synchronously (~200ms)
-                self.tts_engine:prefetch(sent.text)
-                pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
-            end
-            if not pf_file or pf_dur <= 0 then
-                logger.warn("SyncController: Concat synthesis failed at sentence", idx)
-                break
             end
 
             -- Apply and scale timing so word highlighting works
@@ -512,6 +522,38 @@ function SyncController:beginSentencePlayback(sentence)
                 "dur=", pf_dur, "ms  cumulative=", cumulative_ms, "ms")
         end
 
+        -- Pad the LAST sentence in the play group with trailing silence
+        -- matching the inter-sentence/paragraph gap.  This keeps the
+        -- pipeline continuously fed with real PCM data across concat
+        -- boundaries, eliminating the ~500ms of feeder idle-silence that
+        -- accumulates in the pipe buffer between play() calls.
+        local trailing_gap_ms = 0
+        if prev_sent then
+            if prev_sent.end_type == "paragraph" then
+                trailing_gap_ms = para_pause_ms
+            else
+                trailing_gap_ms = sent_pause_ms
+            end
+        end
+        if trailing_gap_ms > 0 then
+            if #concat_files > 0 then
+                local last_cf = concat_files[#concat_files]
+                if last_cf and last_cf.file then
+                    self.tts_engine:appendSilenceToWav(last_cf.file, trailing_gap_ms)
+                    last_cf.duration_ms = last_cf.duration_ms + trailing_gap_ms
+                end
+            else
+                -- Single sentence: pad the main audio file
+                self.tts_engine:appendSilenceToWav(self.tts_engine.current_audio_file, trailing_gap_ms)
+                if not first_padded then
+                    first_padded = true
+                end
+            end
+            cumulative_ms = cumulative_ms + trailing_gap_ms
+        end
+        -- Store trailing gap so play() can log it for diagnostics.
+        self.tts_engine._trailing_gap_ms = trailing_gap_ms
+
         if #concat_files == 0 then concat_files = nil end
 
         -- Tell play() to use the original (unpadded) duration for the first
@@ -522,7 +564,8 @@ function SyncController:beginSentencePlayback(sentence)
 
         logger.warn("SyncController: Concat synthesis total:",
             time.to_ms(UIManager:getTime() - synth_t0), "ms for",
-            #concat_sentences, "extra sentences")
+            #concat_sentences, "extra sentences, trailing_gap=", trailing_gap_ms,
+            "ms, sent_gap=", sent_pause_ms, "ms, para_gap=", para_pause_ms, "ms")
     end
 
     local sentences_in_play = 1 + #concat_sentences
@@ -588,8 +631,18 @@ function SyncController:beginSentencePlayback(sentence)
             end
 
             -- Pause duration based on the LAST sentence in the concat
+            -- For neural TTS (Piper), the trailing gap silence is already
+            -- padded into the audio file by the concat builder.  Use a
+            -- minimal UIManager delay so the next sentence starts right
+            -- after the padded silence finishes playing.
+            local is_neural = controller.tts_engine
+                and controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER
             local delay = 0.2
-            if last_sent.end_type == "paragraph" then
+            if is_neural then
+                -- Gap always padded into audio for Piper — minimal scheduling delay
+                delay = 0.05
+                logger.warn("SyncController: Piper gap padded in audio (", last_sent.end_type, "), delay=0.05s")
+            elseif last_sent.end_type == "paragraph" then
                 delay = (controller.plugin and controller.plugin:getSetting("paragraph_pause", 0.8)) or 0.8
             else
                 delay = (controller.plugin and controller.plugin:getSetting("sentence_pause", 0.1)) or 0.1
@@ -783,15 +836,45 @@ function SyncController:_prefetchNextPage()
 
             if ok and res and res.text and res.text ~= "" then
                 controller._next_page_text = res.text
-                -- Pre-synthesize the first sentence
+                -- Parse the full next page and pre-queue ALL sentences.
+                -- For Piper, this feeds them into the prefetch queue so
+                -- both servers start synthesizing while the current page's
+                -- audio is still playing.  By page-turn time, most or all
+                -- of the next page's sentences will already be ready.
                 local parsed = controller.text_parser:parse(res.text)
                 if parsed and parsed.sentences and #parsed.sentences > 0 then
-                    local first_text = parsed.sentences[1].text
-                    if first_text and first_text ~= "" then
-                        controller.tts_engine:prefetch(first_text)
+                    local is_piper = controller.tts_engine
+                        and controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER
+                    if is_piper then
+                        -- Queue the first 6 next-page sentences (2 batches
+                        -- of 3) into the Piper prefetch system.  We don't
+                        -- queue ALL sentences because that floods the queue
+                        -- behind current-page work.  The remaining sentences
+                        -- will be queued by readNextSentence's own lookahead
+                        -- once the page actually turns.
+                        local MAX_NEXT_PAGE_PREFETCH = 6
+                        local queued = 0
+                        for i, sent in ipairs(parsed.sentences) do
+                            if i > MAX_NEXT_PAGE_PREFETCH then break end
+                            if sent.text and sent.text ~= "" then
+                                controller.tts_engine:piperPrefetchAsync(sent.text)
+                                queued = queued + 1
+                            end
+                        end
+                        -- Kick the launcher so batches start immediately
+                        controller.tts_engine:_launchNextPiperPrefetch()
+                        logger.warn("SyncController: Next page prefetched,",
+                            #res.text, "chars,", queued, "of",
+                            #parsed.sentences, "sentences queued for Piper")
+                    else
+                        -- espeak: just prefetch the first sentence (fast ~200ms)
+                        local first_text = parsed.sentences[1].text
+                        if first_text and first_text ~= "" then
+                            controller.tts_engine:prefetch(first_text)
+                        end
+                        logger.warn("SyncController: Next page prefetched,", #res.text, "chars")
                     end
                 end
-                logger.warn("SyncController: Next page prefetched,", #res.text, "chars")
             else
                 logger.warn("SyncController: Next page prefetch — no text")
             end
@@ -1160,7 +1243,9 @@ function SyncController:startSentenceSyncLoop(sentence)
             -- Invalidate prefetched next page — page boundary shifted
             self._next_page_text = nil
             self._next_page_prefetched = false
-            logger.warn("SyncController: Rotation detected during playback")
+            logger.warn("SyncController: Rotation detected during playback",
+                "old=", self._last_screen_w, "x", self._last_screen_h,
+                "new=", cur_w, "x", cur_h)
 
             -- Re-parse the visible page and remap current sentence
             local controller_ref = self
@@ -1249,9 +1334,14 @@ function SyncController:startSentenceSyncLoop(sentence)
                 self.current_sentence_index = next_sent.index
                 self.current_word_index = 0
                 logger.warn("SyncController: Concat boundary → sentence", next_sent.index)
-                self.highlight_manager:clearHighlights()
+                -- Skip the separate clearHighlights() call — highlightSentence()
+                -- already clears the old selection internally.  Calling both
+                -- triggers TWO e-ink refreshes in rapid succession, which
+                -- causes enough CPU load on ARM to starve the audio pipeline.
                 if self.plugin and self.plugin:getSetting("highlight_sentences", true) then
                     pcall(self.highlightCurrentSentence, self, next_sent)
+                else
+                    self.highlight_manager:clearHighlights()
                 end
                 if self.playback_bar then
                     self.playback_bar:updateProgress(self:getProgress())

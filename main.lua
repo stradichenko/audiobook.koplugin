@@ -307,21 +307,39 @@ function Audiobook:buildVoiceSettingsMenu()
         sub_item_table = self:buildVolumeMenu(),
     })
 
-    -- Pause between sentences (after . ? !)
-    table.insert(menu, {
-        text_func = function()
-            return T(_("Sentence pause (. ? !): %1s"), self:getSetting("sentence_pause", 0.1))
-        end,
-        sub_item_table = self:buildSentencePauseMenu(),
-    })
+    -- Pause between sentences / paragraphs (espeak-ng only — neural TTS has natural prosody)
+    if self.tts_engine.backend == self.tts_engine.BACKENDS.ESPEAK then
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Sentence pause (. ? !): %1s"), self:getSetting("sentence_pause", 0.1))
+            end,
+            sub_item_table = self:buildSentencePauseMenu(),
+        })
 
-    -- Pause between paragraphs (at newlines)
-    table.insert(menu, {
-        text_func = function()
-            return T(_("Paragraph pause (newlines): %1s"), self:getSetting("paragraph_pause", 0.8))
-        end,
-        sub_item_table = self:buildParagraphPauseMenu(),
-    })
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Paragraph pause (newlines): %1s"), self:getSetting("paragraph_pause", 0.8))
+            end,
+            sub_item_table = self:buildParagraphPauseMenu(),
+        })
+    end
+
+    -- Piper inter-sentence gaps (natural pacing + synthesis buffer)
+    if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Sentence gap (. ? !): %1s"), self:getSetting("piper_sentence_gap", 0.3))
+            end,
+            sub_item_table = self:buildPiperSentenceGapMenu(),
+        })
+
+        table.insert(menu, {
+            text_func = function()
+                return T(_("Paragraph gap (newlines): %1s"), self:getSetting("piper_paragraph_gap", 1.0))
+            end,
+            sub_item_table = self:buildPiperParagraphGapMenu(),
+        })
+    end
 
     -- Clause pause (espeak-ng only — uses SSML)
     if self.tts_engine.backend == self.tts_engine.BACKENDS.ESPEAK then
@@ -462,6 +480,48 @@ function Audiobook:buildParagraphPauseMenu()
             end,
             callback = function()
                 self:setSetting("paragraph_pause", v)
+            end,
+        })
+    end
+    return menu
+end
+
+-- Piper sentence gap: silence inserted between sentences for natural pacing.
+-- Also acts as a synthesis buffer — the pipeline plays silence while Piper
+-- keeps working on the next batch.
+function Audiobook:buildPiperSentenceGapMenu()
+    local values = {0, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0}
+    local menu = {}
+    for _i, v in ipairs(values) do
+        local label = string.format("%.1fs", v)
+        if v == 0.3 then label = label .. _(" (default)") end
+        table.insert(menu, {
+            text = label,
+            checked_func = function()
+                return self:getSetting("piper_sentence_gap", 0.3) == v
+            end,
+            callback = function()
+                self:setSetting("piper_sentence_gap", v)
+            end,
+        })
+    end
+    return menu
+end
+
+-- Piper paragraph gap: longer silence at paragraph boundaries (newlines).
+function Audiobook:buildPiperParagraphGapMenu()
+    local values = {0, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0}
+    local menu = {}
+    for _i, v in ipairs(values) do
+        local label = string.format("%.1fs", v)
+        if v == 1.0 then label = label .. _(" (default)") end
+        table.insert(menu, {
+            text = label,
+            checked_func = function()
+                return self:getSetting("piper_paragraph_gap", 1.0) == v
+            end,
+            callback = function()
+                self:setSetting("piper_paragraph_gap", v)
             end,
         })
     end
@@ -757,10 +817,26 @@ function Audiobook:buildPiperVoiceMenu()
         return menu
     end
 
+    -- Sort: medium before low (better quality first)
+    table.sort(voices, function(a, b)
+        local order = { high = 1, medium = 2, low = 3 }
+        local oa = order[a.quality or "medium"] or 9
+        local ob = order[b.quality or "medium"] or 9
+        if oa ~= ob then return oa < ob end
+        return a.name < b.name
+    end)
+
     for _, voice in ipairs(voices) do
-        local size_mb = voice.size and string.format(" (%.0f MB)", voice.size / 1024 / 1024) or ""
+        local quality_label = ""
+        if voice.quality then
+            local icons = { high = "★★★", medium = "★★☆", low = "★☆☆" }
+            quality_label = string.format(" %s %s · %d kHz",
+                icons[voice.quality] or "", voice.quality,
+                (voice.sample_rate or 22050) / 1000)
+        end
+        local size_mb = voice.size and string.format(" · %.0f MB", voice.size / 1024 / 1024) or ""
         table.insert(menu, {
-            text = voice.name .. size_mb,
+            text = voice.name .. quality_label .. size_mb,
             checked_func = function()
                 return self:getSetting("piper_model", nil) == voice.path
                     or self.tts_engine.piper_model == voice.path
@@ -768,7 +844,12 @@ function Audiobook:buildPiperVoiceMenu()
             callback = function()
                 self.tts_engine:setPiperModel(voice.path)
                 self:setSetting("piper_model", voice.path)
-                self:setSetting("piper_model_label", voice.name)
+                -- Use quality-annotated label for the parent menu
+                local label = voice.name
+                if voice.quality then
+                    label = label .. " (" .. voice.quality .. ")"
+                end
+                self:setSetting("piper_model_label", label)
             end,
         })
     end
@@ -1485,6 +1566,13 @@ end
 -- reaches reader plugins — standalone UIManager widgets like PlaybackBar
 -- never receive it.  We must explicitly tell the bar to rebuild here.
 function Audiobook:onSetRotationMode()
+    local Device = require("device")
+    local Screen = Device.screen
+    local mode = Screen:getScreenMode()
+    local cur_w, cur_h = Screen:getWidth(), Screen:getHeight()
+    logger.warn("Audiobook: onSetRotationMode — mode=", mode,
+        "dims=", cur_w, "x", cur_h,
+        "rotation=", Screen.getRotationMode and Screen:getRotationMode() or "?")
     local was_playing = self.sync_controller:isPlaying()
     if was_playing then
         self.sync_controller:pause()
