@@ -16,15 +16,10 @@ local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
--- Get plugin directory for relative requires
-local function getPluginPath()
-    local callerSource = debug.getinfo(1, "S").source
-    if callerSource:find("^@") then
-        return callerSource:gsub("^@(.*/)[^/]*", "%1")
-    end
-    return "./"
-end
-local PLUGIN_PATH = getPluginPath()
+-- Shared utility modules (DRY: eliminates duplicated getPluginPath, commandExists)
+local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+local Utils = dofile(_utils_dir .. "utils.lua")
+local PLUGIN_PATH = _utils_dir
 
 local Audiobook = WidgetContainer:extend{
     name = "audiobook",
@@ -186,6 +181,19 @@ function Audiobook:addToMainMenu(menu_items)
                 end,
                 callback = function()
                     self:toggleSetting("highlight_sentences", true)
+                end,
+            },
+            {
+                text = _("Quick start with espeak (while Piper loads)"),
+                checked_func = function()
+                    return self:getSetting("espeak_cold_start", true)
+                end,
+                callback = function()
+                    self:toggleSetting("espeak_cold_start", true)
+                end,
+                enabled_func = function()
+                    return self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+                        and self.tts_engine.espeak_bin ~= nil
                 end,
             },
             {
@@ -724,14 +732,9 @@ function Audiobook:buildEngineSelectMenu()
 end
 
 --- Quick check if a command is on the system PATH (for menu building).
+-- Delegates to shared Utils module.
 function Audiobook:_commandOnPath(cmd)
-    local handle = io.popen("which " .. cmd .. " 2>/dev/null")
-    if handle then
-        local result = handle:read("*a")
-        handle:close()
-        return result and result ~= ""
-    end
-    return false
+    return Utils.commandExists(cmd)
 end
 
 --[[--

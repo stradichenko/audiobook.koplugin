@@ -11,15 +11,23 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local time = require("ui/time")
 
--- Get plugin directory for relative requires
-local function getPluginPath()
-    local callerSource = debug.getinfo(1, "S").source
-    if callerSource:find("^@") then
-        return callerSource:gsub("^@(.*/)[^/]*", "%1")
-    end
-    return "./"
-end
-local PLUGIN_PATH = getPluginPath()
+-- Shared utility modules (DRY: eliminates duplicated getPluginPath, ws)
+local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+local Utils = dofile(_utils_dir .. "utils.lua")
+local PLUGIN_PATH = _utils_dir
+
+-- ── Constants ────────────────────────────────────────────────────────
+-- Number of sentences to prefetch ahead for Piper TTS.
+-- Piper runs ~4× RTF on single-core ARM; with 2 servers batching 3
+-- sentences each, 20 sentences keeps the pipeline well-stocked so
+-- both servers always have work queued.
+local PIPER_LOOKAHEAD = 20
+
+-- Number of initial sentences to play via espeak-ng while Piper warms up.
+-- espeak synthesizes in ~300ms vs Piper's 30-75s first batch on ARM.
+-- 8 sentences ≈ 50-70s of audio, covering the typical first-batch wait.
+-- Only used during actual cold start, not after page turns.
+local ESPEAK_COLD_START_COUNT = 8
 
 local SyncController = {
     -- Playback states
@@ -44,6 +52,9 @@ function SyncController:new(o)
     o.reading_sentence_idx = 0
     o.total_sentences = 0
     o.current_sentence = nil
+    -- Set to true once Piper delivers its first audio; prevents espeak
+    -- cold-start from re-triggering on page turns.
+    o._piper_warmed_up = false
     -- Timing
     o.sentence_sync_start = nil
     o.pause_time = nil
@@ -85,6 +96,8 @@ function SyncController:start(text)
 
     self.total_sentences = #self.parsed_data.sentences
     self.reading_sentence_idx = 0
+    -- Don't reset _piper_warmed_up here: it persists across page turns
+    -- so espeak cold-start doesn't re-trigger when Piper is already warm.
     self.current_word_index = 0
     self.current_sentence_index = 0
     self.current_sentence = nil
@@ -148,6 +161,7 @@ function SyncController:readNextSentence()
     if used_prefetch then
         -- Audio is ready — apply timing and start playback immediately
         logger.warn("SyncController: Using prefetched audio for sentence", self.reading_sentence_idx)
+        self._piper_warmed_up = true
         controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
         controller:beginSentencePlayback(sentence)
         return
@@ -157,17 +171,40 @@ function SyncController:readNextSentence()
     -- launching a duplicate synthesis (which wastes ~11s and RAM).
     local piper_status = self.tts_engine:getPiperPrefetchStatus(sentence.text)
     if piper_status == "pending" or piper_status == "queued" then
+        -- ── espeak cold-start for early sentences ──────────────────
+        -- If we're in the first N sentences and espeak fallback is enabled,
+        -- don't wait for Piper — synthesize instantly with espeak.
+        local use_espeak_early = self.plugin
+            and self.plugin:getSetting("espeak_cold_start", true)
+            and self.tts_engine.espeak_bin
+            and self.reading_sentence_idx <= ESPEAK_COLD_START_COUNT
+            and not self._piper_warmed_up
+        if use_espeak_early then
+            logger.warn("SyncController: espeak cold-start fallback for sentence",
+                self.reading_sentence_idx, "(early, Piper status:", piper_status, ")")
+            local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
+            if fb_file then
+                controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
+                controller:beginSentencePlayback(sentence)
+                return
+            end
+            logger.warn("SyncController: espeak early fallback failed, waiting for Piper")
+        end
+
         logger.warn("SyncController: Waiting for Piper prefetch (status:", piper_status,
-            ") for sentence", self.reading_sentence_idx)
+            ") for sentence", self.reading_sentence_idx,
+            "|", self.tts_engine:getPiperQueueSnapshot())
         local poll_count = 0
-        local max_polls = 120  -- 60s timeout
+        local max_polls = 360  -- 90s timeout (batches can take 40-70s on ARM)
         local function waitForPiperPrefetch()
             if controller.state == controller.STATE.STOPPED then return end
             poll_count = poll_count + 1
             local ok = controller.tts_engine:usePrefetched(sentence.text)
             if ok then
                 logger.warn("SyncController: Piper prefetch arrived for sentence",
-                    controller.reading_sentence_idx, "after", poll_count * 0.5, "s")
+                    controller.reading_sentence_idx, "after", poll_count * 0.25, "s",
+                    "|", controller.tts_engine:getPiperQueueSnapshot())
+                controller._piper_warmed_up = true
                 controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
                 controller:beginSentencePlayback(sentence)
                 return
@@ -187,24 +224,27 @@ function SyncController:readNextSentence()
                 return
             end
             if poll_count < max_polls then
-                UIManager:scheduleIn(0.5, waitForPiperPrefetch)
+                UIManager:scheduleIn(0.25, waitForPiperPrefetch)
             else
                 logger.err("SyncController: Piper prefetch wait timed out, skipping sentence")
                 controller:readNextSentence()
             end
         end
-        UIManager:scheduleIn(0.5, waitForPiperPrefetch)
+        UIManager:scheduleIn(0.25, waitForPiperPrefetch)
         return
     end
 
-    -- No prefetch available — synthesize now (first sentence, or prefetch missed)
-    logger.warn("SyncController: Synthesizing sentence", self.reading_sentence_idx, "(", sentence.text:sub(1,40), ")")
-
-    -- For Piper: kick off prefetch for the next batch while the first
-    -- sentence is being synthesized (~11s), so by the time it finishes
-    -- the serial queue has a head start on upcoming sentences.
+    -- For Piper with no prefetch yet: route the CURRENT sentence through
+    -- the prefetch queue (instead of synthesize()) so the serial queue
+    -- processes it AND the lookahead sentences back-to-back.
+    -- synthesize() would set _piper_synthesizing=true which blocks the
+    -- entire prefetch queue during the initial ~11s synthesis — wasting
+    -- the time that could be spent prefetching sentence 2+.
     if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
-        local PIPER_LOOKAHEAD = 5
+        logger.warn("SyncController: Queueing sentence", self.reading_sentence_idx,
+            "via Piper prefetch queue (", sentence.text:sub(1,40), ")")
+        -- Queue current sentence + lookahead
+        self.tts_engine:piperPrefetchAsync(sentence.text)
         for offset = 1, PIPER_LOOKAHEAD do
             local ahead_idx = self.reading_sentence_idx + offset
             if self.parsed_data and ahead_idx <= self.total_sentences then
@@ -214,7 +254,75 @@ function SyncController:readNextSentence()
                 end
             end
         end
+        -- Kick the launcher AFTER all sentences are queued so the batcher
+        -- can group consecutive sentences per Piper call.
+        self.tts_engine:_launchNextPiperPrefetch()
+
+        -- ── espeak-ng cold-start fallback ──────────────────────────
+        -- Piper batches take 30-70s to synthesize on ARM.  If the user
+        -- enabled the fallback, play the first sentence immediately via
+        -- espeak-ng (~300ms) so there's no dead silence while Piper
+        -- warms up.  Subsequent sentences use Piper as normal.
+        local use_espeak_fallback = self.plugin
+            and self.plugin:getSetting("espeak_cold_start", true)
+            and self.tts_engine.espeak_bin
+            and not self._piper_warmed_up
+        if use_espeak_fallback then
+            logger.warn("SyncController: espeak cold-start fallback for sentence",
+                self.reading_sentence_idx)
+            local fb_file = self.tts_engine:espeakSynthesizeFallback(sentence.text)
+            if fb_file then
+                controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
+                controller:beginSentencePlayback(sentence)
+                return  -- Piper keeps synthesizing in background; readNextSentence will pick up Piper audio
+            end
+            -- If espeak fallback failed, fall through to Piper wait
+            logger.warn("SyncController: espeak fallback failed, waiting for Piper")
+        end
+
+        -- Show notification while waiting for Piper (no espeak fallback or it failed)
+        local InfoMessage = require("ui/widget/infomessage")
+        UIManager:show(InfoMessage:new{
+            text = _("Starting neural TTS, please wait…"),
+            timeout = 3,
+        })
+
+        -- Now wait for the current sentence to become ready
+        local poll_count = 0
+        local max_polls = 360  -- 90s timeout (batches can take 40-70s on ARM)
+        local function waitForPiperSynth()
+            if controller.state == controller.STATE.STOPPED then return end
+            poll_count = poll_count + 1
+            local ok = controller.tts_engine:usePrefetched(sentence.text)
+            if ok then
+                logger.warn("SyncController: Piper queue delivered sentence",
+                    controller.reading_sentence_idx, "after", poll_count * 0.25, "s",
+                    "|", controller.tts_engine:getPiperQueueSnapshot())
+                controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
+                controller:beginSentencePlayback(sentence)
+                return
+            end
+            local st = controller.tts_engine:getPiperPrefetchStatus(sentence.text)
+            if st == "failed" or (not st) then
+                logger.err("SyncController: Piper queue failed for sentence",
+                    controller.reading_sentence_idx, ", skipping")
+                controller:readNextSentence()
+                return
+            end
+            if poll_count < max_polls then
+                UIManager:scheduleIn(0.25, waitForPiperSynth)
+            else
+                logger.err("SyncController: Piper queue timed out for sentence",
+                    controller.reading_sentence_idx)
+                controller:readNextSentence()
+            end
+        end
+        UIManager:scheduleIn(0.25, waitForPiperSynth)
+        return
     end
+
+    -- No prefetch available — synthesize now (first sentence, or prefetch missed)
+    logger.warn("SyncController: Synthesizing sentence", self.reading_sentence_idx, "(", sentence.text:sub(1,40), ")")
 
     local success = self.tts_engine:synthesize(sentence.text, function(synth_success, timing_data)
         if not synth_success then
@@ -349,9 +457,19 @@ function SyncController:beginSentencePlayback(sentence)
                 cumulative_ms = cumulative_ms + pause_ms
             end
 
-            -- Reuse existing prefetch, or synthesize synchronously
+            -- Reuse existing prefetch, or synthesize synchronously.
+            -- peekPrefetch() does a sync-finalize check for Piper entries
+            -- that finished between UIManager poll intervals.
             local pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
             if not pf_file then
+                -- For Piper: don't try to synthesize inline — it's async and
+                -- would just queue without producing a result.  Only grab
+                -- entries that are already ready.
+                if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+                    logger.warn("SyncController: Concat: Piper sentence", idx, "not ready yet, stopping concat")
+                    break
+                end
+                -- For espeak-ng: synthesize synchronously (~200ms)
                 self.tts_engine:prefetch(sent.text)
                 pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
             end
@@ -382,7 +500,12 @@ function SyncController:beginSentencePlayback(sentence)
             table.insert(concat_wav_files, pf_file)
             prev_sent = sent
 
-            -- Protect file from _cleanPrefetch deletion during next iteration
+            -- Transfer ownership: if this came from the Piper queue, remove
+            -- the entry so _cleanPiperQueue doesn't double-delete the file.
+            -- The file is now owned by concat_wav_files.
+            self.tts_engine:consumePiperQueueEntry(sent.text)
+
+            -- Protect espeak-ng prefetch file from _cleanPrefetch deletion
             self.tts_engine._prefetch_in_use = true
 
             logger.warn("SyncController: Concat +sentence", idx,
@@ -438,11 +561,10 @@ function SyncController:beginSentencePlayback(sentence)
                     local fresh_parsed = controller.text_parser:parse(fresh_text)
                     if fresh_parsed and #fresh_parsed.sentences > 0 then
                         -- Find the last-played sentence in the new page parse
-                        local function ws(s) return s:gsub("%s+", " "):match("^%s*(.-)%s*$") end
-                        local last_text = ws(last_sent.text)
+                        local last_text = Utils.ws(last_sent.text)
                         local found_idx = nil
                         for i, s in ipairs(fresh_parsed.sentences) do
-                            if ws(s.text) == last_text then
+                            if Utils.ws(s.text) == last_text then
                                 found_idx = i
                                 break
                             end
@@ -517,6 +639,14 @@ function SyncController:beginSentencePlayback(sentence)
             self._concat_split_points = concat_split_points
             self._concat_boundary_idx = 0
             self._concat_wav_files = concat_wav_files
+            -- For Piper: schedule prefetch for sentences BEYOND the concat
+            -- batch so they'll be ready when this concat stream finishes.
+            if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+                local last_concat_idx = self.reading_sentence_idx + #concat_sentences
+                for offset = 1, PIPER_LOOKAHEAD do
+                    self:_prefetchNextSentence(last_concat_idx + offset)
+                end
+            end
             -- Schedule next-page prefetch in background so it's ready
             -- when we finish all sentences on this page.
             self:_prefetchNextPage()
@@ -526,10 +656,9 @@ function SyncController:beginSentencePlayback(sentence)
             self._concat_boundary_idx = nil
             self._concat_wav_files = nil
             -- Single sentence — prefetch upcoming ones.
-            -- For Piper (~2.5× real-time), queue 3-5 sentences so the
-            -- serial prefetch pipeline stays warm across playback.
+            -- For Piper (~4-5× real-time on ARM), queue 20 sentences so
+            -- both servers always have batches waiting.
             if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
-                local PIPER_LOOKAHEAD = 5
                 for offset = 1, PIPER_LOOKAHEAD do
                     self:_prefetchNextSentence(self.reading_sentence_idx + offset)
                 end
@@ -542,8 +671,12 @@ function SyncController:beginSentencePlayback(sentence)
         -- can see what is about to be spoken.  The highlight stays until the
         -- sync loop switches to the next sentence.
         if self.plugin and self.plugin:getSetting("highlight_sentences", true) then
+            local hl_sched_time = UIManager:getTime()
             UIManager:scheduleIn(0.05, function()
                 if controller.state == controller.STATE.STOPPED then return end
+                local hl_delta = time.to_ms(UIManager:getTime() - hl_sched_time)
+                logger.warn("SyncController: Highlighting sentence", sentence.index,
+                    "(scheduled+" .. hl_delta .. "ms)")
                 local ok, err = pcall(controller.highlightCurrentSentence, controller, sentence)
                 if not ok then
                     logger.warn("SyncController: Sentence highlight failed:", err)
@@ -798,14 +931,11 @@ function SyncController:_remapAfterRotation()
         return
     end
 
-    -- Helper to normalise whitespace for comparison
-    local function ws(s) return s:gsub("%s+", " "):match("^%s*(.-)%s*$") end
-
     -- Find the currently-playing sentence in the fresh parse
-    local cur_text = self.current_sentence and ws(self.current_sentence.text) or ""
+    local cur_text = self.current_sentence and Utils.ws(self.current_sentence.text) or ""
     local found_idx = nil
     for i, s in ipairs(fresh_parsed.sentences) do
-        if ws(s.text) == cur_text then
+        if Utils.ws(s.text) == cur_text then
             found_idx = i
             break
         end
@@ -835,7 +965,7 @@ function SyncController:_remapAfterRotation()
                     local scan_parsed = self.text_parser:parse(res.text)
                     if scan_parsed then
                         for i, s in ipairs(scan_parsed.sentences) do
-                            if ws(s.text) == cur_text then
+                            if Utils.ws(s.text) == cur_text then
                                 found_idx = i
                                 fresh_parsed = scan_parsed
                                 fresh_text = res.text
@@ -870,7 +1000,7 @@ function SyncController:_remapAfterRotation()
                             -- Re-find our sentence in the actual visible text
                             local nav_found = nil
                             for i, s in ipairs(nav_parsed.sentences) do
-                                if ws(s.text) == cur_text then
+                                if Utils.ws(s.text) == cur_text then
                                     nav_found = i
                                     break
                                 end
@@ -900,9 +1030,9 @@ function SyncController:_remapAfterRotation()
     -- values (start_time, end_time) must stay identical.
     local old_sentences = self.parsed_data and self.parsed_data.sentences or {}
     for _, old_s in ipairs(old_sentences) do
-        local old_t = ws(old_s.text)
+        local old_t = Utils.ws(old_s.text)
         for _, new_s in ipairs(fresh_parsed.sentences) do
-            if ws(new_s.text) == old_t then
+            if Utils.ws(new_s.text) == old_t then
                 -- Copy word timings
                 if old_s.words and new_s.words and #old_s.words == #new_s.words then
                     for wi, ow in ipairs(old_s.words) do
@@ -931,9 +1061,9 @@ function SyncController:_remapAfterRotation()
     if self._concat_sentences then
         -- Remap each concat sentence to its new-parse counterpart
         for ci, old_cs in ipairs(self._concat_sentences) do
-            local ct = ws(old_cs.text)
+            local ct = Utils.ws(old_cs.text)
             for _, new_s in ipairs(fresh_parsed.sentences) do
-                if ws(new_s.text) == ct then
+                if Utils.ws(new_s.text) == ct then
                     self._concat_sentences[ci] = new_s
                     break
                 end
@@ -946,7 +1076,7 @@ function SyncController:_remapAfterRotation()
     local first_text = self._first_play_sentence_text
     if first_text then
         for i, s in ipairs(fresh_parsed.sentences) do
-            if ws(s.text) == ws(first_text) then
+            if Utils.ws(s.text) == Utils.ws(first_text) then
                 self.reading_sentence_idx = i
                 break
             end
@@ -1056,14 +1186,23 @@ function SyncController:startSentenceSyncLoop(sentence)
         if not self._latency_locked then
             if self.tts_engine:isGstPlaying() then
                 -- GStreamer just transitioned to PLAYING — audio is flowing.
-                -- Offset for BT codec buffering + transmission to earbuds.
-                -- Warm BT (socket already active) has lower codec buffering
-                -- than a cold start where A2DP must fully negotiate.
+                -- For persistent pipeline: the BT socket is always warm
+                -- (silence keeps A2DP alive).  Use the engine's calculated
+                -- latency (pipe_buffer + 200ms ≈ 300ms).
+                -- For legacy: use _socket_clean to estimate cold/warm BT.
                 self.sentence_sync_start = UIManager:getTime()
-                local warm = self.tts_engine._socket_clean
-                self._locked_latency_ms = warm and 500 or 1500
+                if self.tts_engine._persistent_pipeline then
+                    -- Persistent pipeline: latency = feeder read delay +
+                    -- pipe buffer + BT codec (~200ms).  Use engine's value.
+                    self._locked_latency_ms = self.tts_engine.playback_latency_ms or 300
+                else
+                    local warm = self.tts_engine._socket_clean
+                    self._locked_latency_ms = warm and 500 or 1500
+                end
                 self._latency_locked = true
-                logger.warn("SyncController: Sync anchored to GST PLAYING state (warm=", warm, ", offset=", self._locked_latency_ms, "ms)")
+                logger.warn("SyncController: Sync anchored (persistent=",
+                    self.tts_engine._persistent_pipeline ~= nil,
+                    ", offset=", self._locked_latency_ms, "ms)")
             elseif self.tts_engine._audio_launched_at then
                 -- Fallback: if 5s passed since launch without PLAYING, lock
                 -- to the launch time with a static estimate.
@@ -1336,6 +1475,7 @@ function SyncController:stop()
     self.current_word_index = 0
     self.current_sentence_index = 0
     self.reading_sentence_idx = 0
+    self._piper_warmed_up = false
     self.total_sentences = 0
     self.current_sentence = nil
     self.sentence_sync_start = nil

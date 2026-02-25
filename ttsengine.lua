@@ -8,10 +8,28 @@ Handles text-to-speech synthesis with timing metadata.
 local Device = require("device")
 local InfoMessage = require("ui/widget/infomessage")
 local UIManager = require("ui/uimanager")
+local ffi = require("ffi")
 local ffiutil = require("ffi/util")
+
+-- Declare C functions needed for pipe buffer resize and Piper server FIFO I/O.
+-- Each declaration is wrapped separately so a duplicate from another module
+-- doesn't prevent the remaining declarations from being registered.
+-- CRITICAL: fcntl MUST be declared as variadic (...) — on ARM EABI, variadic
+-- args go on the stack while fixed args go in registers.  The old declaration
+-- int fcntl(int fd, int cmd, int arg) put the size in register r2, but the
+-- real libc fcntl read it from the stack → garbage → EINVAL.
+pcall(function() ffi.cdef[[ int open(const char *pathname, int flags); ]] end)
+pcall(function() ffi.cdef[[ int close(int fd); ]] end)
+pcall(function() ffi.cdef[[ int fcntl(int fd, int cmd, ...); ]] end)
+pcall(function() ffi.cdef[[ long write(int fd, const void *buf, unsigned long count); ]] end)
 local logger = require("logger")
 local time = require("ui/time")
 local _ = require("gettext")
+
+-- Shared utility modules (DRY: extracted from ttsengine, synccontroller, main)
+local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+local Utils = dofile(_utils_dir .. "utils.lua")
+local WavUtils = dofile(_utils_dir .. "wavutils.lua")
 
 local TTSEngine = {
     -- Supported TTS backends
@@ -92,6 +110,7 @@ function TTSEngine:detectBackend()
         f:close()
         found_espeak = true
         self.backend_cmd = bundled_bin
+        self.espeak_bin = bundled_bin  -- keep reference for fallback even when Piper is active
         self.espeak_lib_path = bundled_base .. "/lib"
         self.espeak_data_path = bundled_base .. "/share"
         self.espeak_linker = bundled_base .. "/lib/ld-linux-armhf.so.3"
@@ -147,17 +166,12 @@ end
 
 --[[--
 Check if a command exists in PATH.
+Delegates to shared Utils module.
 @param cmd string Command name
 @return boolean
 --]]
 function TTSEngine:commandExists(cmd)
-    local handle = io.popen("which " .. cmd .. " 2>/dev/null")
-    if handle then
-        local result = handle:read("*a")
-        handle:close()
-        return result and result ~= ""
-    end
-    return false
+    return Utils.commandExists(cmd)
 end
 
 --[[--
@@ -404,8 +418,6 @@ function TTSEngine:synthesizeCommand(text, callback)
             '(%s; echo $? > "%s") &',
             cmd, done_marker
         )
-        -- Flag: block prefetch queue from launching concurrently
-        self._piper_synthesizing = true
         logger.dbg("TTSEngine: Launching Piper async:", bg_cmd)
         os.execute(bg_cmd)
         -- Save state for the async completion handler
@@ -435,7 +447,6 @@ function TTSEngine:synthesizeCommand(text, callback)
                         engine.current_audio_file = audio_file
                         engine:generateTimingEstimates(text)
                         logger.dbg("TTSEngine: Piper async done, file size:", size)
-                        engine._piper_synthesizing = false
                         -- Chain: launch next queued prefetch now that the process slot is free
                         engine:_launchNextPiperPrefetch()
                         if callback then
@@ -445,7 +456,6 @@ function TTSEngine:synthesizeCommand(text, callback)
                     end
                 end
                 logger.err("TTSEngine: Piper async failed, exit_code:", exit_code)
-                engine._piper_synthesizing = false
                 engine:_launchNextPiperPrefetch()
                 if callback then
                     callback(false, nil)
@@ -460,7 +470,6 @@ function TTSEngine:synthesizeCommand(text, callback)
                 -- Clean up
                 if piper_text_file then os.remove(piper_text_file) end
                 os.remove(done_marker)
-                engine._piper_synthesizing = false
                 engine:_launchNextPiperPrefetch()
                 if callback then
                     callback(false, nil)
@@ -524,17 +533,12 @@ end
 
 --[[--
 Get file size.
+Delegates to WavUtils.
 @param path string File path
 @return number|nil File size in bytes
 --]]
 function TTSEngine:getFileSize(path)
-    local file = io.open(path, "rb")
-    if file then
-        local size = file:seek("end")
-        file:close()
-        return size
-    end
-    return nil
+    return WavUtils.getFileSize(path)
 end
 
 --[[--
@@ -607,33 +611,12 @@ end
 
 --[[--
 Count syllables in a word.
+Delegates to shared Utils module.
 @param word string The word
 @return number Syllable count
 --]]
 function TTSEngine:countSyllables(word)
-    if not word or word == "" then
-        return 1
-    end
-    
-    word = word:lower()
-    local count = 0
-    local prev_vowel = false
-    
-    for i = 1, #word do
-        local char = word:sub(i, i)
-        local is_vowel = char:match("[aeiouy]")
-        
-        if is_vowel and not prev_vowel then
-            count = count + 1
-        end
-        prev_vowel = is_vowel
-    end
-    
-    if word:sub(-1) == "e" and count > 1 then
-        count = count - 1
-    end
-    
-    return math.max(count, 1)
+    return Utils.countSyllables(word)
 end
 
 --[[--
@@ -667,76 +650,75 @@ end
 
 --[[--
 Append silence (zero samples) to the end of an existing WAV file.
-Reads the byte rate from the WAV header to match the file's format exactly,
-then appends zero bytes and updates the RIFF/data chunk sizes.
-This is used to bake inter-sentence pauses directly into speech WAV files,
-avoiding separate silence files in the GStreamer concat pipeline.
+Delegates to WavUtils.
 @param path string  WAV file path
 @param duration_ms number  Silence duration in milliseconds
 @return boolean  true on success
 --]]
 function TTSEngine:appendSilenceToWav(path, duration_ms)
-    if not path or not duration_ms or duration_ms <= 0 then return false end
+    return WavUtils.appendSilence(path, duration_ms)
+end
 
-    local f = io.open(path, "r+b")
-    if not f then return false end
-
-    -- Read byte rate from WAV header (offset 28, 4 bytes LE)
-    f:seek("set", 28)
-    local raw = f:read(4)
-    if not raw or #raw < 4 then f:close(); return false end
-    local b1, b2, b3, b4 = raw:byte(1, 4)
-    local byte_rate = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
-    if byte_rate <= 0 then f:close(); return false end
-
-    -- Read block align from WAV header (offset 32, 2 bytes LE)
-    f:seek("set", 32)
-    raw = f:read(2)
-    if not raw or #raw < 2 then f:close(); return false end
-    local ba1, ba2 = raw:byte(1, 2)
-    local block_align = ba1 + ba2 * 256
-    if block_align <= 0 then block_align = 2 end  -- fallback for 16-bit mono
-
-    -- Current file size
-    local file_size = f:seek("end")
-
-    -- Calculate silence bytes (aligned to block_align)
-    local silence_bytes = math.floor(byte_rate * (duration_ms / 1000))
-    silence_bytes = silence_bytes - (silence_bytes % block_align)
-    if silence_bytes <= 0 then f:close(); return false end
-
-    -- Append zero bytes at end of file
-    f:seek("end")
-    local chunk_size = 8192
-    local chunk = string.rep("\0", chunk_size)
-    local written = 0
-    while written < silence_bytes do
-        local to_write = math.min(chunk_size, silence_bytes - written)
-        if to_write < chunk_size then
-            f:write(chunk:sub(1, to_write))
-        else
-            f:write(chunk)
-        end
-        written = written + to_write
+--[[--
+Quick espeak-ng synthesis for cold-start fallback.
+Synthesizes text with the bundled espeak-ng binary (typically <300ms on ARM)
+and returns the WAV file path, or nil on failure.
+This works even when the active backend is Piper.
+@param text string Text to synthesize
+@return string|nil WAV file path on success
+--]]
+function TTSEngine:espeakSynthesizeFallback(text)
+    if not self.espeak_bin then return nil end
+    local temp_dir = "/tmp"
+    self.file_counter = (self.file_counter or 0) + 1
+    local audio_file = temp_dir .. "/audiobook_espeak_fb_" .. os.time() .. "_" .. self.file_counter .. ".wav"
+    local exec_prefix = ""
+    if self.espeak_linker then
+        exec_prefix = string.format(
+            "ESPEAK_DATA_PATH=%s %s --library-path %s ",
+            self.espeak_data_path, self.espeak_linker, self.espeak_lib_path
+        )
+    elseif self.espeak_lib_path then
+        exec_prefix = string.format(
+            "LD_LIBRARY_PATH=%s ESPEAK_DATA_PATH=%s ",
+            self.espeak_lib_path, self.espeak_data_path
+        )
     end
-
-    -- Update RIFF file size at offset 4
-    local new_file_size = file_size + silence_bytes
-    local function le32(n)
-        return string.char(n % 256, math.floor(n / 256) % 256,
-                           math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+    local speed = math.floor(175 * (self.rate or 1.0))
+    local cmd = string.format(
+        '%s%s -v en -s %d -a 100 -w "%s" "%s" 2>&1',
+        exec_prefix, self.espeak_bin, speed, audio_file, self:escapeText(text)
+    )
+    logger.warn("TTSEngine: espeak fallback synthesis for cold-start")
+    local handle = io.popen(cmd, "r")
+    if handle then
+        handle:read("*a")
+        handle:close()
     end
-    f:seek("set", 4)
-    f:write(le32(new_file_size - 8))
+    local f = io.open(audio_file, "r")
+    if f then
+        f:close()
+        -- Smooth boundary clicks at start/end
+        WavUtils.applyFade(audio_file, 15)
+        -- Generate timing estimates for the espeak audio
+        self:generateTimingEstimates(text)
+        self.current_audio_file = audio_file
+        return audio_file
+    end
+    return nil
+end
 
-    -- Update data chunk size at offset 40
-    f:seek("set", 40)
-    f:write(le32(new_file_size - 44))
-
-    f:close()
-    logger.dbg("TTSEngine: Appended", duration_ms, "ms silence to", path,
-        "(", silence_bytes, "bytes)")
-    return true
+--[[--
+Merge multiple WAV files into the current audio file.
+Delegates to WavUtils.
+@param concat_files table  Array of {file=path, duration_ms=number}
+@return boolean  true if data was appended
+--]]
+function TTSEngine:mergeWavFiles(concat_files)
+    if not self.current_audio_file or not concat_files or #concat_files == 0 then
+        return false
+    end
+    return WavUtils.mergeFiles(self.current_audio_file, concat_files)
 end
 
 --[[--
@@ -804,19 +786,26 @@ function TTSEngine:usePrefetched(text)
     end
     -- Check Piper async queue
     local entry = self._piper_queue[text]
-    if entry and entry.status == "ready" and entry.file then
-        if self.current_audio_file then
-            os.remove(self.current_audio_file)
+    if entry then
+        -- Try to finalize a pending entry synchronously (catches entries
+        -- that finished between UIManager poll intervals)
+        if entry.status == "pending" then
+            self:_tryFinalizePiperPrefetch(text)
         end
-        self.current_audio_file = entry.file
-        self.timing_data = entry.timing
-        -- Remove from queue (promoted to current)
-        self._piper_queue[text] = nil
-        for i, t in ipairs(self._piper_queue_order) do
-            if t == text then table.remove(self._piper_queue_order, i); break end
+        if entry.status == "ready" and entry.file then
+            if self.current_audio_file then
+                os.remove(self.current_audio_file)
+            end
+            self.current_audio_file = entry.file
+            self.timing_data = entry.timing
+            -- Remove from queue (promoted to current)
+            self._piper_queue[text] = nil
+            for i, t in ipairs(self._piper_queue_order) do
+                if t == text then table.remove(self._piper_queue_order, i); break end
+            end
+            logger.dbg("TTSEngine: Using Piper queued audio")
+            return true
         end
-        logger.dbg("TTSEngine: Using Piper queued audio")
-        return true
     end
     return false
 end
@@ -832,87 +821,60 @@ _cleanPrefetch() when the file is no longer needed.
 @return number      Duration in ms
 --]]
 function TTSEngine:peekPrefetch(text)
+    -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
         local dur = self:getWavDurationMs(self._prefetch_file)
         return self._prefetch_file, self._prefetch_timing, dur
+    end
+    -- Check Piper async queue for ready entries
+    local entry = self._piper_queue[text]
+    if entry then
+        -- Try to finalize a pending entry synchronously — the .done marker
+        -- may exist on disk but the UIManager poll hasn't fired yet.
+        if entry.status == "pending" then
+            self:_tryFinalizePiperPrefetch(text)
+        end
+        if entry.status == "ready" and entry.file then
+            local dur = self:getWavDurationMs(entry.file)
+            return entry.file, entry.timing, dur
+        end
     end
     return nil, nil, 0
 end
 
 --[[--
+Diagnostic: return a summary string of the Piper prefetch queue state.
+@return string  e.g. "queued=3 pending=2 ready=1 failed=0"
+--]]
+function TTSEngine:getPiperQueueSnapshot()
+    local counts = { queued = 0, pending = 0, ready = 0, failed = 0 }
+    for _, entry in pairs(self._piper_queue or {}) do
+        local st = entry.status or "unknown"
+        counts[st] = (counts[st] or 0) + 1
+    end
+    return string.format("queued=%d pending=%d ready=%d failed=%d total=%d",
+        counts.queued, counts.pending, counts.ready, counts.failed,
+        #(self._piper_queue_order or {}))
+end
+
+--[[--
 Get WAV duration from an arbitrary file path.
+Delegates to WavUtils.
 @param path string  WAV file path
 @return number  Duration in ms, 0 on error
 --]]
 function TTSEngine:getWavDurationMs(path)
-    if not path then return 0 end
-    local f = io.open(path, "rb")
-    if not f then return 0 end
-    local size = f:seek("end")
-    f:seek("set", 28)
-    local raw = f:read(4)
-    f:close()
-    if not raw or #raw < 4 then return 0 end
-    local b1, b2, b3, b4 = raw:byte(1, 4)
-    local byte_rate = b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
-    if byte_rate <= 0 then return 0 end
-    local data_bytes = size - 44
-    if data_bytes <= 0 then return 0 end
-    return math.floor((data_bytes / byte_rate) * 1000)
+    return WavUtils.getDurationMs(path)
 end
 
 --[[--
 Generate a WAV file containing silence of the given duration.
-Matches espeak-ng output format: 22050 Hz, mono, 16-bit PCM.
+Delegates to WavUtils.
 @param duration_ms number  Duration in milliseconds
 @return string|nil  Path to the generated WAV file
 --]]
 function TTSEngine:generateSilenceWav(duration_ms)
-    if not duration_ms or duration_ms <= 0 then return nil end
-    local temp_dir = "/tmp"
-    self.file_counter = (self.file_counter or 0) + 1
-    local path = temp_dir .. "/audiobook_silence_" .. os.time() .. "_" .. self.file_counter .. ".wav"
-
-    local sample_rate = 22050
-    local channels = 1
-    local bits_per_sample = 16
-    local num_samples = math.floor(sample_rate * (duration_ms / 1000))
-    local data_size = num_samples * channels * (bits_per_sample / 8)
-    local file_size = 36 + data_size
-
-    local function le32(n)
-        return string.char(n % 256, math.floor(n / 256) % 256,
-                           math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
-    end
-    local function le16(n)
-        return string.char(n % 256, math.floor(n / 256) % 256)
-    end
-
-    local byte_rate = sample_rate * channels * (bits_per_sample / 8)
-    local block_align = channels * (bits_per_sample / 8)
-
-    local header = "RIFF" .. le32(file_size) .. "WAVE"
-                 .. "fmt " .. le32(16)
-                 .. le16(1)
-                 .. le16(channels)
-                 .. le32(sample_rate)
-                 .. le32(byte_rate)
-                 .. le16(block_align)
-                 .. le16(bits_per_sample)
-                 .. "data" .. le32(data_size)
-
-    local f = io.open(path, "wb")
-    if not f then return nil end
-    f:write(header)
-    local chunk = string.rep("\0", math.min(data_size, 8192))
-    local written = 0
-    while written < data_size do
-        local to_write = math.min(#chunk, data_size - written)
-        f:write(chunk:sub(1, to_write))
-        written = written + to_write
-    end
-    f:close()
-    return path
+    return WavUtils.generateSilence(nil, duration_ms)
 end
 
 --[[--
@@ -931,6 +893,27 @@ function TTSEngine:_cleanPrefetch()
     -- Clean Piper async queue
     self:_cleanPiperQueue()
 end
+
+-- === Persistent BT Pipeline Constants ===
+-- Instead of launching a new gst-launch for each sentence (which crashes
+-- when BT A2DP disconnects during gaps), maintain a single persistent
+-- pipeline.  A feeder script writes silence (keeping BT alive) and
+-- switches to real audio on demand.  gst-launch never stops.
+local PIPE_BUFFER_DELAY_64KB = 1500 -- 64KB pipe buffer at 44100 B/s ≈ 1.45s
+local PIPE_BUFFER_DELAY_16KB = 370  -- 16KB pipe buffer at 44100 B/s ≈ 370ms
+local PIPELINE_CTRL_DIR = "/tmp/audiobook_ctrl"
+local PIPELINE_FIFO = "/tmp/audiobook_fifo"
+local PIPELINE_SCRIPT = "/tmp/audiobook_pipeline.sh"
+
+-- === Persistent Piper Server Constants ===
+-- Instead of spawning a new Piper process per sentence (5-14s model load
+-- each time!), keep 2 persistent Piper processes running with --json-input.
+-- The model loads ONCE per server (~5s), then each sentence only pays the
+-- inference cost (~4× RTF).  Sentences are distributed round-robin.
+-- 2 servers is the sweet spot — 3 causes CPU thrashing on the 4-core ARM
+-- (all batches slow down when 3 heavy processes fight for cores).
+local PIPER_SERVER_COUNT = 2
+local PIPER_SERVER_PREFIX = "/tmp/piper_server_"
 
 --[[--
 Play the synthesized audio.
@@ -1012,38 +995,160 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         end
     end
     
-    -- Build command WITHOUT trailing &; we'll add '& echo $!' for PID capture
-    local play_cmd
+    -- === PERSISTENT BT PIPELINE PATH ===
+    -- For Bluetooth: use a single persistent gst-launch that never stops.
+    -- A feeder script writes silence between sentences to keep BT A2DP alive,
+    -- and switches to real audio on demand via a control file.
     if self.audio_player_type == "gst-bt" then
-        -- GStreamer pipeline: convert to S16LE/48kHz/stereo for Kobo BT A2DP sink.
-        -- When concat_files is provided, use the concat element to chain multiple
-        -- WAV files into a single continuous BT stream (no A2DP re-negotiation gap).
+        -- Handle WAV merge for concatenated sentences
         if concat_files and #concat_files > 0 then
-            -- Multi-sentence concat pipeline
-            local sink = 'audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink'
-            local sources = string.format('filesrc location="%s" ! wavparse ! c. ', self.current_audio_file)
-            for _, cf in ipairs(concat_files) do
-                sources = sources .. string.format('filesrc location="%s" ! wavparse ! c. ', cf.file)
-            end
-            play_cmd = string.format('gst-launch-1.0 concat name=c ! %s %s', sink, sources)
-            -- Store combined duration for the sync controller
+            self:mergeWavFiles(concat_files)
             self._concat_durations = { self._current_audio_duration_ms }
             for _, cf in ipairs(concat_files) do
                 table.insert(self._concat_durations, cf.duration_ms)
             end
-            logger.warn("TTSEngine: Concat pipeline with", 1 + #concat_files, "files, durations=",
+            logger.warn("TTSEngine: Merged", 1 + #concat_files, "sentences, durations=",
                 table.concat(self._concat_durations, "+"))
         else
-            -- Single-sentence pipeline (fallback / non-concat)
-            play_cmd = string.format(
-                'gst-launch-1.0 filesrc location="%s" ! wavparse ! audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink',
-                self.current_audio_file
-            )
             self._concat_durations = nil
         end
+
+        -- Calculate expected audio duration
+        if self._concat_durations then
+            local total = 0
+            for _, d in ipairs(self._concat_durations) do total = total + d end
+            self._expected_play_duration_ms = total
+        else
+            self._expected_play_duration_ms = self._current_audio_duration_ms
+        end
+
+        -- Cancel any pending callbacks from previous play()
+        if self._completion_timer_fn then
+            UIManager:unschedule(self._completion_timer_fn)
+            self._completion_timer_fn = nil
+        end
+        if self._pending_launch_fn then
+            UIManager:unschedule(self._pending_launch_fn)
+            self._pending_launch_fn = nil
+        end
+
+        -- Ensure the persistent pipeline is running
+        if not self:_ensurePersistentPipeline() then
+            logger.err("TTSEngine: Failed to start persistent pipeline")
+            self.is_speaking = false
+            if on_fail then on_fail() end
+            return false
+        end
+
+        -- Bump generation to invalidate stale callbacks
+        self.play_generation = (self.play_generation or 0) + 1
+        local my_gen = self.play_generation
+
+        -- BT latency: pipe buffer + ring buffer (~200ms)
+        self.playback_latency_ms = (self._pipe_buffer_delay_ms or PIPE_BUFFER_DELAY_64KB) + 200
+
+        logger.warn("TTSEngine: play() pre-launch took", time.to_ms(UIManager:getTime() - t0), "ms")
+
+        -- Feed audio to the persistent pipeline
+        os.remove(PIPELINE_CTRL_DIR .. "/done")
+        local ctrl_f = io.open(PIPELINE_CTRL_DIR .. "/play", "w")
+        if ctrl_f then
+            ctrl_f:write(self.current_audio_file)
+            ctrl_f:close()
+        end
+
+        self._audio_launched_at = UIManager:getTime()
+        logger.warn("TTSEngine: play() fed to pipeline, dur=",
+            self._expected_play_duration_ms, "ms, gen=", my_gen,
+            "piper_q=", self:getPiperQueueSnapshot())
+
+        -- Poll for feeder 'done' file — logs when feeder finished writing
+        -- PCM to the FIFO.  This tells us the real latency from play() to
+        -- audio-data-in-pipeline.  Does NOT affect completion timing.
+        local feed_start = UIManager:getTime()
+        local feed_gen = my_gen
+        local feed_engine = self
+        local function pollFeederDone()
+            if (feed_engine.play_generation or 0) ~= feed_gen then return end
+            local df = io.open(PIPELINE_CTRL_DIR .. "/done", "r")
+            if df then
+                df:close()
+                local feed_ms = time.to_ms(UIManager:getTime() - feed_start)
+                logger.warn("TTSEngine: Feeder done in", feed_ms, "ms (gen=", feed_gen, ")")
+                return
+            end
+            UIManager:scheduleIn(0.05, pollFeederDone)
+        end
+        UIManager:scheduleIn(0.1, pollFeederDone)
+
+        -- Start timing loop for word highlighting
+        self:startTimingLoop()
+
+        -- Duration-based completion: schedule onPlaybackComplete after the
+        -- expected audio duration plus pipe buffer delay plus margin.
+        -- If pipe resize succeeded (4KB), delay is ~100ms.
+        -- If pipe resize failed (64KB), delay is ~1500ms.
+        local pipe_buf_ms = self._pipe_buffer_delay_ms or PIPE_BUFFER_DELAY_64KB
+        local engine = self
+        local completion_delay_s = (self._expected_play_duration_ms / 1000)
+            + (pipe_buf_ms / 1000) + 0.5
+        local function fireCompletion()
+            if (engine.play_generation or 0) ~= my_gen then return end
+            if not engine.is_speaking then return end
+            if engine.is_paused then
+                UIManager:scheduleIn(0.5, fireCompletion)
+                return
+            end
+            logger.warn("TTSEngine: Pipeline completion (duration-based,",
+                engine._expected_play_duration_ms, "ms + pipe_buf",
+                pipe_buf_ms, "ms + 500ms)")
+            engine:onPlaybackComplete()
+        end
+        engine._completion_timer_fn = fireCompletion
+        UIManager:scheduleIn(completion_delay_s, fireCompletion)
+
+        return true
+    end
+
+    -- === LEGACY PATH (non-Bluetooth audio) ===
+    -- Build command WITHOUT trailing &; we'll add '& echo $!' for PID capture
+    local play_cmd
+    if self.audio_player_type == "gst-bt" then
+        -- GStreamer pipeline: convert to S16LE/48kHz/stereo for Kobo BT A2DP sink.
+        -- When concat_files is provided, merge them into the main WAV file
+        -- (raw PCM append + header update) to avoid the GStreamer concat
+        -- element which crashes on Kobo BT (exits <1 s, corrupts socket).
+        if concat_files and #concat_files > 0 then
+            self:mergeWavFiles(concat_files)
+            -- Store per-sentence durations so the sync controller can
+            -- track split points for word highlighting across sentences.
+            self._concat_durations = { self._current_audio_duration_ms }
+            for _, cf in ipairs(concat_files) do
+                table.insert(self._concat_durations, cf.duration_ms)
+            end
+            logger.warn("TTSEngine: Merged", 1 + #concat_files, "sentences, durations=",
+                table.concat(self._concat_durations, "+"))
+        else
+            self._concat_durations = nil
+        end
+        -- Always use a single-file pipeline (merged or original)
+        play_cmd = string.format(
+            'gst-launch-1.0 filesrc location="%s" ! wavparse ! audioconvert ! audioresample ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink',
+            self.current_audio_file
+        )
     else
         play_cmd = string.format('%s "%s"', player, self.current_audio_file)
         self._concat_durations = nil
+    end
+
+    -- Store expected total audio duration so the process watcher can
+    -- detect premature exits (gst-launch crashing after BT idle gap).
+    if self._concat_durations then
+        local total = 0
+        for _, d in ipairs(self._concat_durations) do total = total + d end
+        self._expected_play_duration_ms = total
+    else
+        self._expected_play_duration_ms = self._current_audio_duration_ms
     end
     
     -- Cancel any previously scheduled launchAndStart from an earlier play()
@@ -1052,6 +1157,11 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         UIManager:unschedule(self._pending_launch_fn)
         self._pending_launch_fn = nil
     end
+
+    -- Stop BT keepalive (if running or scheduled).  If the keepalive was
+    -- holding the socket, _socket_clean is already false and the normal
+    -- kill+wait logic below will handle the socket release delay.
+    self:_stopBtKeepalive()
 
     -- Force-kill any lingering audio — SIGKILL + killall to release the
     -- @kobo:mtkbtmwrpc abstract socket held by stale gst-launch processes.
@@ -1236,6 +1346,8 @@ an abstract UNIX socket (@kobo:mtkbtmwrpc) that isn't released on graceful
 shutdown fast enough, causing "Address already in use" for the next launch.
 --]]
 function TTSEngine:_killAudioProcess()
+    -- Don't kill the persistent pipeline's gst-launch
+    if self._persistent_pipeline then return end
     local had_pid = self.audio_pid ~= nil
     if self.audio_pid then
         os.execute("kill -9 " .. self.audio_pid .. " 2>/dev/null")
@@ -1245,12 +1357,272 @@ function TTSEngine:_killAudioProcess()
     if self.audio_player_type == "gst-bt" then
         os.execute("killall -9 gst-launch-1.0 2>/dev/null")
     end
+    -- Also clear keepalive PID since killall caught it
+    self._bt_keepalive_pid = nil
     -- Record when we last killed a tracked process — used to skip redundant
     -- BT socket waits.  Only set when we had a real PID so that a no-op kill
     -- doesn't reset the timer and re-introduce the 0.3s wait.
     if had_pid then
         self._last_audio_kill_time = UIManager:getTime()
     end
+end
+
+--[[--%nStart a BT keepalive process that plays silence to hold the A2DP
+connection alive.  Without this, the BT audio sink disconnects after
+~1-2s of idle time, causing the next gst-launch to crash.
+Called from onPlaybackComplete via a short delay — if the next sentence
+is immediately ready, play() cancels this before it starts.
+--]]
+function TTSEngine:_startBtKeepalive()
+    if self.audio_player_type ~= "gst-bt" then return end
+    -- Don't start if there's already a keepalive running
+    if self._bt_keepalive_pid then return end
+    -- Create a long silence WAV once (120 seconds, covers any Piper wait)
+    if not self._keepalive_wav then
+        self._keepalive_wav = self:generateSilenceWav(120000)
+    end
+    if not self._keepalive_wav then return end
+    local cmd = string.format(
+        'gst-launch-1.0 filesrc location="%s" ! wavparse ! audioconvert ! audioresample'
+        .. ' ! "audio/x-raw,format=S16LE,rate=48000,channels=2" ! mtkbtmwrpcaudiosink'
+        .. ' >/dev/null 2>/dev/null & echo $!',
+        self._keepalive_wav
+    )
+    local h = io.popen(cmd)
+    local pid_str = h and h:read("*a") or ""
+    if h then h:close() end
+    self._bt_keepalive_pid = tonumber(pid_str:match("(%d+)"))
+    -- Socket is now held by keepalive — NOT clean
+    self._socket_clean = false
+    logger.warn("TTSEngine: BT keepalive started, PID=", self._bt_keepalive_pid)
+end
+
+--[[--%nStop the BT keepalive silence process.
+--]]
+function TTSEngine:_stopBtKeepalive()
+    -- Cancel any pending scheduled start
+    if self._keepalive_scheduled_fn then
+        UIManager:unschedule(self._keepalive_scheduled_fn)
+        self._keepalive_scheduled_fn = nil
+    end
+    if self._bt_keepalive_pid then
+        os.execute("kill -9 " .. self._bt_keepalive_pid .. " 2>/dev/null")
+        self._bt_keepalive_pid = nil
+        self._last_audio_kill_time = UIManager:getTime()
+        logger.warn("TTSEngine: BT keepalive stopped")
+    end
+end
+
+--[[--
+Write the persistent BT pipeline feeder script to /tmp.
+The script starts gst-launch reading from a named FIFO and feeds it
+raw PCM (silence when idle, real audio when playing).
+--]]
+function TTSEngine:_writePipelineScript()
+    local script = [=[
+#!/bin/sh
+CTRL="/tmp/audiobook_ctrl"
+FIFO="/tmp/audiobook_fifo"
+mkdir -p "$CTRL"
+rm -f "$CTRL/stop" "$CTRL/play" "$CTRL/done" "$CTRL/gst_pid"
+rm -f "$FIFO"
+mkfifo "$FIFO"
+# Silence chunk: ~50ms at 22050Hz 16-bit mono = 1102 samples × 2 bytes = 2204 bytes
+# MUST be even (multiple of block_align=2) to preserve PCM sample alignment!
+dd if=/dev/zero bs=2204 count=1 of="$CTRL/s.raw" 2>/dev/null
+# Start gst-launch reading raw PCM from FIFO.
+# sync=true (default) — the sink renders buffers at the timestamp rate.
+# Because the feeder writes silence CONTINUOUSLY (blocked by the pipe at
+# 1x when the buffer is full), the byte-offset timestamps from
+# rawaudioparse stay in sync with the GStreamer clock.  The BT A2DP
+# transport always has data — never suspends.
+# The Lua caller shrinks the pipe buffer to 16KB (~370ms) via
+# fcntl(F_SETPIPE_SZ) to reduce latency while keeping enough headroom
+# to absorb CPU stalls during Piper synthesis.
+gst-launch-1.0 filesrc location="$FIFO" \
+  ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=22050 num-channels=1 \
+  ! audioconvert ! audioresample \
+  ! "audio/x-raw,format=S16LE,rate=48000,channels=2" \
+  ! mtkbtmwrpcaudiosink >/dev/null 2>/dev/null &
+GST_PID=$!
+# Open FIFO write end — keeps it alive between individual writes.
+# This BLOCKS until gst-launch opens the read end (filesrc start).
+exec 3>"$FIFO"
+# Signal Lua AFTER the FIFO is fully set up (both ends open).
+# Lua uses the gst_pid file as a "ready" indicator before trying to
+# open(O_WRONLY|O_NONBLOCK) on the FIFO for pipe buffer resize.
+echo $GST_PID > "$CTRL/gst_pid"
+cleanup() { exec 3>&- 2>/dev/null; kill $GST_PID 2>/dev/null; rm -f "$FIFO" "$CTRL/s.raw" "$CTRL/gst_pid"; }
+trap cleanup EXIT TERM
+# Track total bytes written to detect/fix alignment
+TOTAL_BYTES=0
+# Feeder loop: continuous silence when idle, real audio when play file appears.
+# The pipe buffer is 64KB (~1.45s at 44100 B/s).  When the buffer is full,
+# 'cat s.raw >&3' blocks until the sink consumes data (at 1x rate),
+# so the feeder naturally writes at real-time rate.  This keeps the BT
+# A2DP transport fed continuously and timestamps perfectly in sync.
+# usleep 1000 (1ms) prevents CPU busy-spin during initial pipe fill.
+while kill -0 $GST_PID 2>/dev/null && [ ! -f "$CTRL/stop" ]; do
+  if [ -f "$CTRL/play" ]; then
+    FILE=$(cat "$CTRL/play")
+    rm -f "$CTRL/play" "$CTRL/done"
+    # If total bytes written so far is odd, write 1 zero byte to re-align
+    ODD=$((TOTAL_BYTES % 2))
+    if [ "$ODD" -ne 0 ]; then
+      printf '\0' >&3
+      TOTAL_BYTES=$((TOTAL_BYTES + 1))
+    fi
+    # Get audio data size (file size minus 44-byte WAV header)
+    FSIZE=$(wc -c < "$FILE")
+    DSIZE=$((FSIZE - 44))
+    # Skip 44-byte WAV header, output raw PCM
+    tail -c +45 "$FILE" >&3
+    TOTAL_BYTES=$((TOTAL_BYTES + DSIZE))
+    touch "$CTRL/done"
+  else
+    cat "$CTRL/s.raw" >&3
+    TOTAL_BYTES=$((TOTAL_BYTES + 2204))
+    usleep 1000
+  fi
+done
+]=]
+    local f = io.open(PIPELINE_SCRIPT, "w")
+    if not f then return false end
+    f:write(script)
+    f:close()
+    os.execute("chmod +x " .. PIPELINE_SCRIPT)
+    return true
+end
+
+--[[--
+Start the persistent BT audio pipeline.
+Creates the feeder script, launches it (piping silence/audio to gst-launch
+via a named FIFO), and waits for gst-launch to initialise.
+@return boolean true if pipeline started successfully
+--]]
+function TTSEngine:_startPersistentPipeline()
+    self:_stopPersistentPipeline()
+    if not self:_writePipelineScript() then
+        logger.err("TTSEngine: Cannot write pipeline script")
+        return false
+    end
+    -- Clean control files
+    os.execute("rm -f " .. PIPELINE_CTRL_DIR .. "/stop " .. PIPELINE_CTRL_DIR .. "/play " .. PIPELINE_CTRL_DIR .. "/done")
+    -- Launch pipeline in background
+    local h = io.popen(PIPELINE_SCRIPT .. " >/dev/null 2>/dev/null & echo $!")
+    local pid_str = h and h:read("*a") or ""
+    if h then h:close() end
+    self._pipeline_wrapper_pid = tonumber(pid_str:match("(%d+)"))
+    -- Wait for gst-launch PID file to appear (up to 3s)
+    local gst_pid = nil
+    for _ = 1, 60 do  -- 60 × 50ms = 3s
+        local pf = io.open(PIPELINE_CTRL_DIR .. "/gst_pid", "r")
+        if pf then
+            local pid = pf:read("*a")
+            pf:close()
+            gst_pid = tonumber((pid or ""):match("(%d+)"))
+            if gst_pid then break end
+        end
+        os.execute("usleep 50000")
+    end
+    self._pipeline_gst_pid = gst_pid
+    self.audio_pid = gst_pid  -- for pause/resume compatibility
+    self._socket_clean = false
+    self._persistent_pipeline = true
+
+    -- Shrink the FIFO pipe buffer from 64KB to 16KB.
+    -- 16KB (~370ms at 44100 B/s) balances low latency with enough
+    -- headroom to absorb CPU stalls when Piper is synthesising.
+    -- 4KB (~93ms) was too tight and caused audible micro-cuts.
+    self._pipe_buffer_delay_ms = PIPE_BUFFER_DELAY_64KB  -- default: assume 64KB
+    if gst_pid then
+        local O_WRONLY    = 1
+        local O_NONBLOCK  = 2048  -- 0x800
+        local F_SETPIPE_SZ = 1031
+        local fd = ffi.C.open(PIPELINE_FIFO, bit.bor(O_WRONLY, O_NONBLOCK))
+        if fd >= 0 then
+            -- Pass size as cdata int — required for variadic fcntl on ARM EABI.
+            local ret = ffi.C.fcntl(fd, F_SETPIPE_SZ, ffi.new("int", 16384))
+            if ret >= 0 then
+                self._pipe_buffer_delay_ms = PIPE_BUFFER_DELAY_16KB
+                logger.warn("TTSEngine: Pipe buffer shrunk to 16KB, ret=", ret)
+            else
+                logger.warn("TTSEngine: fcntl F_SETPIPE_SZ failed, ret=", ret,
+                    "errno=", ffi.errno(), ", trying shell fallback")
+                ffi.C.close(fd)
+                -- Shell fallback: python3 or direct /proc write
+                local rc = os.execute(string.format(
+                    'python3 -c "import fcntl,os; fd=os.open(\'%s\',os.O_WRONLY|os.O_NONBLOCK); fcntl.fcntl(fd,1031,16384); os.close(fd)" 2>/dev/null',
+                    PIPELINE_FIFO))
+                if rc == 0 then
+                    self._pipe_buffer_delay_ms = PIPE_BUFFER_DELAY_16KB
+                    logger.warn("TTSEngine: Pipe buffer shrunk to 16KB via python3")
+                else
+                    logger.warn("TTSEngine: All pipe resize methods failed, using 64KB delay")
+                end
+                fd = -1  -- already closed
+            end
+            if fd >= 0 then ffi.C.close(fd) end
+        else
+            logger.warn("TTSEngine: Could not open FIFO for pipe resize, errno=",
+                ffi.errno(), ", using 64KB delay")
+        end
+    end
+
+    logger.warn("TTSEngine: Persistent pipeline started, wrapper=",
+        self._pipeline_wrapper_pid, "gst=", self._pipeline_gst_pid)
+    return gst_pid ~= nil
+end
+
+--[[--
+Stop the persistent BT audio pipeline.
+Kills the feeder script and gst-launch, cleans up the FIFO.
+--]]
+function TTSEngine:_stopPersistentPipeline()
+    if not self._persistent_pipeline then return end
+    -- Signal feeder to stop
+    local sf = io.open(PIPELINE_CTRL_DIR .. "/stop", "w")
+    if sf then sf:write("1"); sf:close() end
+    -- Kill processes
+    if self._pipeline_gst_pid then
+        os.execute("kill -9 " .. self._pipeline_gst_pid .. " 2>/dev/null")
+    end
+    if self._pipeline_wrapper_pid then
+        os.execute("kill -9 " .. self._pipeline_wrapper_pid .. " 2>/dev/null")
+    end
+    os.execute("killall -9 gst-launch-1.0 2>/dev/null")
+    -- Clean up
+    os.execute("rm -f " .. PIPELINE_FIFO .. " " .. PIPELINE_CTRL_DIR .. "/gst_pid")
+    self._pipeline_gst_pid = nil
+    self._pipeline_wrapper_pid = nil
+    self._persistent_pipeline = false
+    self.audio_pid = nil
+    self._socket_clean = false
+    logger.warn("TTSEngine: Persistent pipeline stopped")
+end
+
+--[[--
+Check if the persistent BT pipeline is alive.
+@return boolean
+--]]
+function TTSEngine:_isPipelineAlive()
+    if not self._persistent_pipeline or not self._pipeline_gst_pid then
+        return false
+    end
+    local ret = os.execute("kill -0 " .. self._pipeline_gst_pid .. " 2>/dev/null")
+    return ret == 0
+end
+
+--[[--
+Ensure the persistent BT pipeline is running, (re)starting if needed.
+@return boolean true if pipeline is alive
+--]]
+function TTSEngine:_ensurePersistentPipeline()
+    if self:_isPipelineAlive() then
+        return true
+    end
+    logger.warn("TTSEngine: Pipeline not alive, (re)starting...")
+    return self:_startPersistentPipeline()
 end
 
 --[[--
@@ -1277,7 +1649,7 @@ for rotation, taps, and other input events.
 
 @param bt_retry_allowed boolean Whether BT early-death retry is allowed
 --]]
-function TTSEngine:_startProcessWatcher(bt_retry_allowed)
+function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail)
     local my_gen = self.play_generation or 0
     local launch_time = UIManager:getTime()
     -- Real BT connection failures exit in <200ms (no A2DP sink).
@@ -1318,6 +1690,13 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed)
                         -- Restart watcher WITHOUT retry (second chance only)
                         engine:_startProcessWatcher(false)
                     end)
+                elseif skip_on_fail then
+                    -- Retry of a premature-exit also failed fast — skip
+                    -- sentence and continue playback instead of showing error.
+                    logger.warn("TTSEngine: gst-launch retry failed fast ("
+                        .. elapsed_ms .. "ms), skipping sentence")
+                    engine._socket_clean = false
+                    engine:onPlaybackComplete()
                 else
                     -- Retry also failed — BT not connected
                     logger.warn("TTSEngine: gst-launch died on retry — BT audio not connected")
@@ -1333,6 +1712,39 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed)
                     if engine.on_fail_callback then
                         engine.on_fail_callback()
                     end
+                end
+            elseif engine.audio_player_type == "gst-bt" and engine._expected_play_duration_ms
+                    and engine._expected_play_duration_ms > 2000
+                    and elapsed_ms < engine._expected_play_duration_ms * 0.4 then
+                -- Premature exit: gst-launch crashed (BT sink went idle
+                -- during Piper synthesis wait, A2DP re-negotiation failed).
+                -- The socket is NOT clean — kill and retry with a delay.
+                if bt_retry_allowed then
+                    logger.warn("TTSEngine: gst-launch premature exit ("
+                        .. elapsed_ms .. "ms vs expected "
+                        .. engine._expected_play_duration_ms .. "ms), killing BT & retrying…")
+                    engine._socket_clean = false
+                    engine:_killAudioProcess()
+                    -- 2s wait for BT A2DP re-establishment
+                    UIManager:scheduleIn(2.0, function()
+                        if (engine.play_generation or 0) ~= my_gen then return end
+                        if not engine.is_speaking then return end
+                        local handle = io.popen(engine._last_pid_cmd)
+                        local pid_str = handle and handle:read("*a") or ""
+                        if handle then handle:close() end
+                        engine.audio_pid = tonumber(pid_str:match("(%d+)"))
+                        launch_time = UIManager:getTime()
+                        logger.warn("TTSEngine: BT premature-exit retry PID:", engine.audio_pid)
+                        -- On failure, skip sentence (don't show BT error)
+                        engine:_startProcessWatcher(false, true)
+                    end)
+                else
+                    -- Retry also crashed — skip this sentence so playback
+                    -- can continue (next play will get a fresh socket).
+                    logger.warn("TTSEngine: gst-launch retry also crashed ("
+                        .. elapsed_ms .. "ms), skipping sentence")
+                    engine._socket_clean = false
+                    engine:onPlaybackComplete()
                 end
             else
                 -- Normal completion (process streamed successfully then exited)
@@ -1361,10 +1773,15 @@ function TTSEngine:onPlaybackComplete()
     -- The process watcher confirmed the process exited naturally, so the BT
     -- abstract socket is already released.  No need to killall — that would
     -- just waste ~200ms spawning a shell on the ARM CPU.
-    self.audio_pid = nil
-    self._socket_clean = true
+    if self._persistent_pipeline then
+        -- Pipeline keeps running (playing silence) — audio_pid stays set
+        -- and socket stays held by the pipeline.  No keepalive needed.
+    else
+        self.audio_pid = nil
+        self._socket_clean = true
+    end
     self:cleanup()
-    
+
     if self.on_complete_callback then
         self.on_complete_callback()
     end
@@ -1377,8 +1794,15 @@ function TTSEngine:pause()
     if self.is_speaking and not self.is_paused then
         self.is_paused = true
         self.pause_time = UIManager:getTime()
-        -- Freeze the audio player process (SIGSTOP) so it can resume in place
-        if self.audio_pid then
+        -- Freeze the audio pipeline/process (SIGSTOP) so it can resume in place
+        if self._persistent_pipeline then
+            if self._pipeline_gst_pid then
+                os.execute("kill -STOP " .. self._pipeline_gst_pid .. " 2>/dev/null")
+            end
+            if self._pipeline_wrapper_pid then
+                os.execute("kill -STOP " .. self._pipeline_wrapper_pid .. " 2>/dev/null")
+            end
+        elseif self.audio_pid then
             os.execute("kill -STOP " .. self.audio_pid .. " 2>/dev/null")
         end
         logger.dbg("TTSEngine: Paused")
@@ -1394,8 +1818,15 @@ function TTSEngine:resume()
         -- Adjust start time to account for the pause duration
         local pause_duration = UIManager:getTime() - self.pause_time
         self.playback_start_time = self.playback_start_time + pause_duration
-        -- Unfreeze the audio player process (SIGCONT) — resumes exactly where it stopped
-        if self.audio_pid then
+        -- Unfreeze the audio pipeline/process (SIGCONT)
+        if self._persistent_pipeline then
+            if self._pipeline_gst_pid then
+                os.execute("kill -CONT " .. self._pipeline_gst_pid .. " 2>/dev/null")
+            end
+            if self._pipeline_wrapper_pid then
+                os.execute("kill -CONT " .. self._pipeline_wrapper_pid .. " 2>/dev/null")
+            end
+        elseif self.audio_pid then
             os.execute("kill -CONT " .. self.audio_pid .. " 2>/dev/null")
         end
         -- Restart the timing loop (it exited when is_paused was true)
@@ -1420,6 +1851,19 @@ function TTSEngine:stop()
         UIManager:unschedule(self._pending_launch_fn)
         self._pending_launch_fn = nil
     end
+
+    -- Cancel completion timer
+    if self._completion_timer_fn then
+        UIManager:unschedule(self._completion_timer_fn)
+        self._completion_timer_fn = nil
+    end
+
+    -- Stop persistent pipeline or legacy keepalive
+    if self._persistent_pipeline then
+        self:_stopPersistentPipeline()
+    else
+        self:_stopBtKeepalive()
+    end
     
     -- Only clear _socket_clean if there was a live audio process to kill.
     -- If the process already exited naturally (onPlaybackComplete set
@@ -1434,7 +1878,6 @@ function TTSEngine:stop()
     -- Kill any background Piper synthesis processes immediately
     if self.backend == self.BACKENDS.PIPER then
         self:_killPiperProcesses()
-        self._piper_synthesizing = false
     end
     
     -- Clear concat/prefetch-in-use flag so fullCleanup can delete files
@@ -1452,6 +1895,8 @@ output.  Returns true once the pipeline is actually outputting audio.
 @return boolean
 --]]
 function TTSEngine:isGstPlaying()
+    -- Persistent pipeline is always in PLAYING state
+    if self._persistent_pipeline then return true end
     if not self._gst_status_file then return false end
     local f = io.open(self._gst_status_file, "r")
     if not f then return false end
@@ -1474,12 +1919,19 @@ function TTSEngine:forceKillAll()
         UIManager:unschedule(self._pending_launch_fn)
         self._pending_launch_fn = nil
     end
+    -- Stop persistent pipeline or legacy keepalive
+    if self._persistent_pipeline then
+        self:_stopPersistentPipeline()
+    else
+        self:_stopBtKeepalive()
+    end
     if self.audio_pid then
         os.execute("kill -TERM " .. self.audio_pid .. " 2>/dev/null")
         self.audio_pid = nil
     end
     os.execute("killall -TERM gst-launch-1.0 2>/dev/null")
-    -- Kill any background Piper synthesis processes
+    -- Full Piper shutdown: stop persistent servers AND kill per-process instances
+    self:_stopPiperServers()
     self:_killPiperProcesses()
     self:fullCleanup()
 end
@@ -1653,19 +2105,14 @@ function TTSEngine:listPiperVoices()
     return voices
 end
 
--- ── Piper command builder & async prefetch queue ─────────────────────
+-- ── Persistent Piper Server ──────────────────────────────────────────
 
 --[[--
-Build the shell command for Piper TTS synthesis.
-Extracts the command construction so both synthesizeCommand() and
-piperPrefetchAsync() can reuse it.
-@param text string  Text to synthesize
-@param audio_file string  Output WAV file path
-@return string cmd  Shell command
-@return string text_file  Path to the temporary text input file
+Build the base Piper command (without input/output flags).
+Used for persistent server launch and fallback per-sentence synthesis.
+@return string  Full command prefix including ld-linux, model, speaker, etc.
 --]]
-function TTSEngine:_buildPiperCommand(text, audio_file)
-    local temp_dir = "/tmp"
+function TTSEngine:_buildPiperBaseCommand()
     local piper_bin = self.piper_cmd or self.backend_cmd or "piper"
     local model_flag = ""
     local model_path = self:_resolvePiperModel()
@@ -1681,9 +2128,6 @@ function TTSEngine:_buildPiperCommand(text, audio_file)
     if math.abs(length_scale - 1.0) > 0.01 then
         length_flag = string.format(' --length_scale %.2f', length_scale)
     end
-    -- Piper ships its own libs (onnxruntime, espeak-ng phonemizer data).
-    -- On Kobo, Piper needs the bundled glibc/libstdc++ (from espeak-ng/lib).
-    -- We invoke Piper through the bundled ld-linux-armhf.so.3 dynamic linker.
     local exec_prefix = ""
     if self.piper_model_dir then
         local piper_lib = self.piper_model_dir .. "/lib"
@@ -1700,10 +2144,7 @@ function TTSEngine:_buildPiperCommand(text, audio_file)
         if ld_f then
             ld_f:close()
             local lib_path = piper_lib .. ":" .. espeak_lib
-            exec_prefix = string.format(
-                '"%s" --library-path "%s" ',
-                ld_linux, lib_path
-            )
+            exec_prefix = string.format('"%s" --library-path "%s" ', ld_linux, lib_path)
             local espeak_data_dir = self.piper_model_dir .. "/espeak-ng-data"
             local ed_f = io.open(espeak_data_dir .. "/phontab", "r")
             if ed_f then
@@ -1717,19 +2158,272 @@ function TTSEngine:_buildPiperCommand(text, audio_file)
             )
         end
     end
+    return string.format('nice -n 19 %s%s%s%s%s',
+        exec_prefix, piper_bin, model_flag, speaker_flag, length_flag)
+end
+
+--[[--
+Write and launch the persistent Piper server scripts.
+Each server is a shell script that runs Piper with --json-input.
+The model loads ONCE, then sentences are fed via FIFO as JSON lines.
+Piper prints each output_file path to stdout after writing it;
+a pipe loop creates .done markers so the polling code works unchanged.
+--]]
+function TTSEngine:_startPiperServers()
+    if self._piper_servers_running or self._piper_servers_starting then return end
+
+    -- Prevent infinite retry loops: max 2 startup attempts per session.
+    -- After that, fall back to per-process mode permanently.
+    self._piper_server_start_attempts = (self._piper_server_start_attempts or 0) + 1
+    if self._piper_server_start_attempts > 2 then
+        logger.warn("TTSEngine: Piper server start attempts exhausted, using per-process mode")
+        return
+    end
+
+    self._piper_servers_starting = true
+    self._piper_servers = {}
+    self._piper_server_rr = 0
+
+    -- Kill ALL existing piper processes before launching new servers.
+    -- Without this, timed-out servers keep running (loading the model),
+    -- and new server launches compete for CPU/RAM, causing cascading
+    -- timeouts (seen as 5× 15s restarts = 75s before servers work).
+    os.execute("killall -9 piper 2>/dev/null")
+    -- Brief delay for process cleanup
+    os.execute("usleep 200000")
+
+    local base_cmd = self:_buildPiperBaseCommand()
+
+    for i = 1, PIPER_SERVER_COUNT do
+        local fifo = PIPER_SERVER_PREFIX .. i
+        local script_path = fifo .. ".sh"
+        local pid_file = fifo .. ".pid"
+        local log_file = fifo .. ".log"
+
+        -- Clean previous state
+        os.execute(string.format('rm -f "%s" "%s" "%s" "%s"', fifo, pid_file, script_path, log_file))
+
+        -- Write server script
+        local script = string.format([=[#!/bin/sh
+FIFO="%s"
+LOG="%s"
+rm -f "$FIFO" "${FIFO}.pid"
+mkfifo "$FIFO"
+
+# Open FIFO read-write on fd 3.  Opening a FIFO with <> (read-write)
+# never blocks — it satisfies both the read and write side immediately.
+# This fd serves as a keep-alive writer: Piper reads from fd 0 (which
+# is also the FIFO), while fd 3 keeps the write side open so Piper
+# doesn't get EOF between Lua's writes.
+exec 3<>"$FIFO"
+
+# Start Piper reading from fd 3 (the FIFO).
+# Piper prints each output_file path to stdout after writing the WAV.
+# The while-read loop creates .done markers so Lua's polling code finds them.
+%s --json-input --sentence_silence 0 <&3 2>>"$LOG" | while IFS= read -r wav_path; do
+  wav_path=$(echo "$wav_path" | tr -d '\r\n')
+  if [ -n "$wav_path" ]; then
+    echo "0" > "${wav_path}.done"
+  fi
+done &
+PIPE_PID=$!
+
+# Write PID file (signals FIFO is ready for Lua writers)
+echo "$PIPE_PID" > "${FIFO}.pid"
+
+# Wait for pipeline to exit
+wait $PIPE_PID 2>/dev/null
+exec 3>&-
+rm -f "$FIFO" "${FIFO}.pid"
+]=], fifo, log_file, base_cmd)
+
+        local sf = io.open(script_path, "w")
+        if sf then
+            sf:write(script)
+            sf:close()
+            os.execute('chmod +x "' .. script_path .. '"')
+        end
+
+        -- Launch server in background
+        os.execute(string.format('/bin/sh "%s" &', script_path))
+        logger.warn("TTSEngine: Piper server", i, "launching...")
+    end
+
+    -- Poll for all servers to be ready (non-blocking via UIManager)
+    local engine = self
+    local start_time = UIManager:getTime()
+    local function checkServersReady()
+        local all_ready = true
+        for i = 1, PIPER_SERVER_COUNT do
+            if not engine._piper_servers[i] then
+                local pid_file = PIPER_SERVER_PREFIX .. i .. ".pid"
+                local pf = io.open(pid_file, "r")
+                if pf then
+                    local pid = pf:read("*a"):gsub("%s+", "")
+                    pf:close()
+                    engine._piper_servers[i] = {
+                        fifo = PIPER_SERVER_PREFIX .. i,
+                        pid = tonumber(pid),
+                    }
+                    logger.warn("TTSEngine: Piper server", i, "ready, PID:", pid)
+                else
+                    all_ready = false
+                end
+            end
+        end
+        if all_ready then
+            engine._piper_servers_running = true
+            engine._piper_servers_starting = false
+            logger.warn("TTSEngine: All", PIPER_SERVER_COUNT,
+                "persistent Piper servers ready in",
+                time.to_ms(UIManager:getTime() - start_time), "ms")
+            -- Kick the prefetch launcher now that servers are available
+            engine:_launchNextPiperPrefetch()
+        elseif time.to_ms(UIManager:getTime() - start_time) > 60000 then
+            -- Timeout after 60s — model loading on ARM can take 15-30s on cold cache.
+            -- Fall back to per-process mode for this session.
+            engine._piper_servers_starting = false
+            logger.err("TTSEngine: Piper server startup timed out after 60s, using per-process fallback")
+            engine:_launchNextPiperPrefetch()
+        else
+            UIManager:scheduleIn(0.3, checkServersReady)
+        end
+    end
+    UIManager:scheduleIn(0.3, checkServersReady)
+end
+
+--[[--
+Stop persistent Piper servers and clean up.
+--]]
+function TTSEngine:_stopPiperServers()
+    if not self._piper_servers_running and not self._piper_servers_starting then return end
+    for i = 1, PIPER_SERVER_COUNT do
+        local server = self._piper_servers and self._piper_servers[i]
+        if server and server.pid then
+            -- Kill the pipeline process group
+            os.execute(string.format("kill %d 2>/dev/null", server.pid))
+        end
+        -- Clean up files
+        local fifo = PIPER_SERVER_PREFIX .. i
+        os.execute(string.format('rm -f "%s" "%s.pid" "%s.sh" "%s.log"', fifo, fifo, fifo, fifo))
+    end
+    -- Kill any remaining piper processes
+    os.execute("killall -9 piper 2>/dev/null")
+    self._piper_servers = {}
+    self._piper_servers_running = false
+    self._piper_servers_starting = false
+    self._piper_slots_busy = 0
+
+    -- Rescue orphaned "pending" entries: servers were killed mid-batch,
+    -- so those entries would stay "pending" forever.  Reset them to
+    -- "queued" with restored done_markers so they get re-dispatched.
+    local rescued = 0
+    if self._piper_queue then
+        for text, entry in pairs(self._piper_queue) do
+            if entry.status == "pending" then
+                entry.status = "queued"
+                entry.done_marker = entry.file and (entry.file .. ".done") or nil
+                rescued = rescued + 1
+            end
+        end
+    end
+    logger.warn("TTSEngine: Piper servers stopped, rescued", rescued, "pending entries")
+end
+
+--[[--
+Write a JSON line to a persistent Piper server's FIFO.
+Uses FFI open(O_WRONLY|O_NONBLOCK) + write() to avoid blocking Lua.
+@param server_id number  Server index (1-based)
+@param json_line string  JSON line to write (must end with \n)
+@return boolean  true if write succeeded
+--]]
+function TTSEngine:_writeToPiperFifo(server_id, json_line)
+    local server = self._piper_servers[server_id]
+    if not server then return false end
+
+    local O_WRONLY    = 1
+    local O_NONBLOCK  = 2048
+    local fd = ffi.C.open(server.fifo, bit.bor(O_WRONLY, O_NONBLOCK))
+    if fd < 0 then
+        local err = ffi.errno()
+        logger.err("TTSEngine: Piper server", server_id,
+            "FIFO open failed, errno:", err)
+        return false
+    end
+
+    local len = #json_line
+    local written = tonumber(ffi.C.write(fd, json_line, len))
+    ffi.C.close(fd)
+
+    if written ~= len then
+        logger.err("TTSEngine: Piper server", server_id,
+            "FIFO write incomplete:", written, "/", len)
+        return false
+    end
+    return true
+end
+
+--[[--
+Build a JSON line for Piper's --json-input mode.
+Uses shared _cleanPiperText for text normalisation.
+@param text string  Sentence text
+@param output_file string  WAV output path
+@return string  JSON line ending with \n
+--]]
+function TTSEngine:_buildPiperJsonLine(text, output_file)
+    local clean = self:_cleanPiperText(text)
+    -- Escape for JSON string
+    clean = clean:gsub("\\", "\\\\")    -- backslash first
+    clean = clean:gsub('"', '\\"')      -- double quote
+    clean = clean:gsub("\t", "\\t")     -- tab
+    return string.format('{"text":"%s","output_file":"%s"}\n', clean, output_file)
+end
+
+--[[--
+Pick the next Piper server (round-robin).
+@return number  Server ID (1-based)
+--]]
+function TTSEngine:_pickPiperServer()
+    self._piper_server_rr = (self._piper_server_rr or 0) % PIPER_SERVER_COUNT + 1
+    return self._piper_server_rr
+end
+
+-- ── Piper command builder & async prefetch queue ─────────────────────
+
+--- Clean text for Piper synthesis (shared helper).
+-- Replaces ellipsis variants, normalises whitespace.
+-- @param text string  Raw sentence text
+-- @return string  Cleaned text
+function TTSEngine:_cleanPiperText(text)
+    local clean = text:gsub("\n", " "):gsub("\r", "")
+    clean = clean:gsub("\xe2\x80\xa6", ", ")     -- Unicode ellipsis U+2026
+    clean = clean:gsub("%.[%.%s]+%.", ", ")        -- 3+ dots with optional spaces
+    clean = clean:gsub("%.%.+", ", ")               -- 2+ consecutive dots
+    return clean
+end
+
+--[[--
+Build the shell command for Piper TTS synthesis.
+Delegates to _buildPiperBaseCommand for the prefix, then adds I/O flags.
+@param text string  Text to synthesize
+@param audio_file string  Output WAV file path
+@return string cmd  Shell command
+@return string text_file  Path to the temporary text input file
+--]]
+function TTSEngine:_buildPiperCommand(text, audio_file)
+    local base = self:_buildPiperBaseCommand()
+
     -- Write text to a temp file to avoid shell escaping issues
     self.file_counter = (self.file_counter or 0) + 1
-    local text_file = temp_dir .. "/audiobook_piper_in_" .. os.time() .. "_" .. self.file_counter .. ".txt"
+    local text_file = "/tmp/audiobook_piper_in_" .. os.time() .. "_" .. self.file_counter .. ".txt"
     local tf = io.open(text_file, "w")
     if tf then
-        local clean = text:gsub("\n", " "):gsub("\r", "")
-        tf:write(clean .. "\n")
+        tf:write(self:_cleanPiperText(text) .. "\n")
         tf:close()
     end
-    local cmd = string.format(
-        '%s%s%s%s%s --output_file "%s" < "%s" 2>&1',
-        exec_prefix, piper_bin, model_flag, speaker_flag, length_flag, audio_file, text_file
-    )
+
+    local cmd = string.format('%s --output_file "%s" < "%s" 2>&1',
+        base, audio_file, text_file)
     return cmd, text_file
 end
 
@@ -1763,64 +2457,292 @@ function TTSEngine:piperPrefetchAsync(text)
     logger.dbg("TTSEngine: Piper prefetch queued:", text:sub(1, 40),
         "(queue size:", #self._piper_queue_order, ")")
 
-    -- Kick the serial launcher — it will start this entry if nothing
-    -- else is currently running.
-    self:_launchNextPiperPrefetch()
+    -- Kick the launcher if servers are already running so refill entries
+    -- (queued one-at-a-time via _prefetchNextSentence) get dispatched.
+    -- During initial startup, piperPrefetchBatch / the first-sentence path
+    -- in synccontroller calls _launchNextPiperPrefetch() once after bulk-
+    -- queueing, and _startPiperServers kicks again when servers are ready.
+    if self._piper_servers_running then
+        self:_launchNextPiperPrefetch()
+    end
 end
 
 --[[--
-Launch the next queued Piper prefetch entry, but only if no other
-entry is currently "pending" (= actively synthesising).
-Called after piperPrefetchAsync() adds an entry, and again when a
-running synthesis finishes.
+Launch the next queued Piper prefetch entry via persistent server.
+
+Uses persistent Piper processes (--json-input) to avoid the crippling
+5-14s model reload per sentence.  Sentences are sent as JSON lines to
+server FIFOs.  The server's stdout pipe creates .done markers, so the
+existing polling/finalization code works unchanged.
+
+Falls back to per-process launch if servers aren't available.
 --]]
 function TTSEngine:_launchNextPiperPrefetch()
-    -- Don't launch if a main synthesis is in progress
-    if self._piper_synthesizing then
-        return
-    end
-    -- Check if something is already running
-    for _, entry in pairs(self._piper_queue) do
-        if entry.status == "pending" then
-            return  -- one process at a time
-        end
+    -- Start persistent servers if not yet running
+    if not self._piper_servers_running then
+        self:_startPiperServers()
+        -- Servers start asynchronously; _startPiperServers will call us
+        -- again when ready.  Don't fall through to per-process launch
+        -- unless server startup itself has failed.
+        if self._piper_servers_starting then return end
     end
 
-    -- Find the first "queued" entry in insertion order
-    local text_to_launch = nil
+    -- Concurrency limit = number of servers (one batch per server at a time)
+    local max_concurrent = self._piper_servers_running and PIPER_SERVER_COUNT or 2
+
+    -- Check server slot availability.
+    -- _piper_slots_busy counts active server SLOTS (not pending entries).
+    -- A 3-sentence batch occupies ONE slot until its .done marker appears.
+    self._piper_slots_busy = self._piper_slots_busy or 0
+    if self._piper_slots_busy >= max_concurrent then
+        return  -- all server slots busy
+    end
+
+    -- Find consecutive "queued" entries for batching.
+    -- Batching 5 sentences into 1 Piper call amortises the ~5s per-call
+    -- overhead on ARM, cutting synthesis time significantly.
+    local BATCH_SIZE = 3
+    local batch_texts = {}
+    local batch_entries = {}
     for _, text in ipairs(self._piper_queue_order) do
-        local entry = self._piper_queue[text]
-        if entry and entry.status == "queued" then
-            text_to_launch = text
-            break
+        local e = self._piper_queue[text]
+        if e and e.status == "queued" then
+            table.insert(batch_texts, text)
+            table.insert(batch_entries, e)
+            if #batch_texts >= BATCH_SIZE then break end
         end
     end
-    if not text_to_launch then return end  -- nothing to do
+    if #batch_texts == 0 then return end  -- nothing to do
 
-    local entry = self._piper_queue[text_to_launch]
+    -- Mark all batch entries as pending
+    for _, e in ipairs(batch_entries) do
+        e.status = "pending"
+    end
+
+    -- The primary entry determines the combined WAV output path and done marker
+    local primary_text = batch_texts[1]
+    local primary_entry = batch_entries[1]
+    local combined_audio_file = primary_entry.file
+    local combined_done_marker = primary_entry.done_marker
+
+    -- ── Persistent server path (preferred) ──
+    if self._piper_servers_running then
+        local server_id = self:_pickPiperServer()
+
+        -- Build combined text: join all batch sentences with " " separator.
+        -- Piper handles natural sentence boundaries, so the combined output
+        -- has proper prosody and no awkward cuts.
+        local combined_text = table.concat(batch_texts, " ")
+        local json_line = self:_buildPiperJsonLine(combined_text, combined_audio_file)
+
+        local ok = self:_writeToPiperFifo(server_id, json_line)
+
+        -- If the chosen server's FIFO is gone, try the other server(s)
+        -- before killing everything and falling back to per-process.
+        if not ok then
+            logger.warn("TTSEngine: Server", server_id, "FIFO dead, trying alternate")
+            for alt = 1, PIPER_SERVER_COUNT do
+                if alt ~= server_id then
+                    ok = self:_writeToPiperFifo(alt, json_line)
+                    if ok then
+                        server_id = alt
+                        logger.warn("TTSEngine: Alternate server", alt, "accepted batch")
+                        break
+                    end
+                end
+            end
+        end
+
+        if not ok then
+            logger.err("TTSEngine: All server FIFOs failed, falling back to per-process")
+            -- Reset batch entries to queued so they can be retried
+            for _, e in ipairs(batch_entries) do e.status = "queued" end
+            self._piper_servers_running = false
+            self:_stopPiperServers()
+        else
+            logger.warn("TTSEngine: Piper BATCH prefetch → server", server_id,
+                ":", #batch_texts, "sentences (",
+                combined_text:sub(1, 60), ")")
+
+            -- Prevent _tryFinalizePiperPrefetch from racing with our poll.
+            -- The batch pollDone closure captures `combined_done_marker` and
+            -- handles splitting; individual entries must not be finalized
+            -- by the synchronous shortcut in peekPrefetch / usePrefetched.
+            for _, e in ipairs(batch_entries) do
+                e.done_marker = nil
+            end
+
+            -- Track server slot occupancy (decremented in pollDone)
+            self._piper_slots_busy = (self._piper_slots_busy or 0) + 1
+
+            -- Poll for .done marker, then split the combined WAV
+            local engine = self
+            local poll_count = 0
+            local max_polls = 900  -- 180s timeout for batch (900 × 0.2s)
+            local function pollDone()
+                -- Check if primary entry was removed (cancelled)
+                if not engine._piper_queue[primary_text] then
+                    os.remove(combined_audio_file)
+                    os.remove(combined_done_marker)
+                    engine._piper_slots_busy = math.max(0, (engine._piper_slots_busy or 0) - 1)
+                    engine:_launchNextPiperPrefetch()
+                    return
+                end
+                poll_count = poll_count + 1
+                local mf = io.open(combined_done_marker, "r")
+                if mf then
+                    mf:close()
+                    os.remove(combined_done_marker)
+                    local total_size = engine:getFileSize(combined_audio_file)
+                    if not total_size or total_size <= 0 then
+                        for _, t in ipairs(batch_texts) do
+                            local e = engine._piper_queue[t]
+                            if e then e.status = "failed" end
+                        end
+                        logger.err("TTSEngine: Batch prefetch: done but empty WAV")
+                        engine._piper_slots_busy = math.max(0, (engine._piper_slots_busy or 0) - 1)
+                        engine:_launchNextPiperPrefetch()
+                        return
+                    end
+
+                    local synth_ms = poll_count * 200
+                    logger.warn("TTSEngine: Piper BATCH READY in", synth_ms, "ms:",
+                        #batch_texts, "sentences, size:", total_size)
+
+                    if #batch_texts == 1 then
+                        -- Single sentence, no splitting needed
+                        WavUtils.applyFade(combined_audio_file, 15)
+                        engine:generateTimingEstimates(primary_text)
+                        primary_entry.timing = engine.timing_data
+                        primary_entry.status = "ready"
+                    else
+                        -- Estimate per-sentence duration proportions from
+                        -- syllable counts, then split the combined WAV.
+                        local durations = {}
+                        local total_syllables = 0
+                        for _, t in ipairs(batch_texts) do
+                            local count = 0
+                            for word in t:gmatch("%S+") do
+                                count = count + engine:countSyllables(word:gsub("[%p]", ""))
+                            end
+                            count = math.max(count, 1)
+                            table.insert(durations, count)
+                            total_syllables = total_syllables + count
+                        end
+
+                        -- Get actual total audio duration from WAV header
+                        local total_dur_ms = WavUtils.getDurationMs(combined_audio_file)
+                        local est_durations_ms = {}
+                        for _, syl in ipairs(durations) do
+                            table.insert(est_durations_ms,
+                                math.floor(total_dur_ms * syl / total_syllables))
+                        end
+
+                        -- Prepare output paths (all must differ from source)
+                        local output_paths = {}
+                        local first_seg_tmp = combined_audio_file .. ".seg1"
+                        for i, t in ipairs(batch_texts) do
+                            if i == 1 then
+                                table.insert(output_paths, first_seg_tmp)
+                            else
+                                table.insert(output_paths, batch_entries[i].file)
+                            end
+                        end
+
+                        -- Split the combined WAV
+                        local split_ok = WavUtils.splitFile(
+                            combined_audio_file, est_durations_ms, output_paths)
+
+                        -- Move first segment to its final path
+                        if split_ok then
+                            os.remove(combined_audio_file)
+                            os.rename(first_seg_tmp, combined_audio_file)
+                        else
+                            os.remove(first_seg_tmp)
+                        end
+
+                        if split_ok then
+                            for i, t in ipairs(batch_texts) do
+                                local e = engine._piper_queue[t]
+                                if e then
+                                    -- Smooth boundary clicks with a short fade
+                                    WavUtils.applyFade(e.file, 15)
+                                    engine:generateTimingEstimates(t)
+                                    e.timing = engine.timing_data
+                                    e.status = "ready"
+                                end
+                            end
+                            logger.warn("TTSEngine: Batch split OK,",
+                                #batch_texts, "sentences ready, durations=",
+                                table.concat(est_durations_ms, "+"))
+                        else
+                            -- Split failed — mark first as ready (it has the
+                            -- combined audio), others as failed
+                            engine:generateTimingEstimates(primary_text)
+                            primary_entry.timing = engine.timing_data
+                            primary_entry.status = "ready"
+                            for i = 2, #batch_texts do
+                                local e = engine._piper_queue[batch_texts[i]]
+                                if e then e.status = "failed" end
+                            end
+                            logger.err("TTSEngine: Batch split failed, only first sentence ready")
+                        end
+                    end
+
+                    engine._piper_slots_busy = math.max(0, (engine._piper_slots_busy or 0) - 1)
+                    engine:_launchNextPiperPrefetch()
+                    return
+                end
+                if poll_count < max_polls then
+                    UIManager:scheduleIn(0.2, pollDone)
+                else
+                    for _, t in ipairs(batch_texts) do
+                        local e = engine._piper_queue[t]
+                        if e then e.status = "failed" end
+                    end
+                    logger.err("TTSEngine: Piper batch prefetch timed out")
+                    os.remove(combined_done_marker)
+                    engine._piper_slots_busy = math.max(0, (engine._piper_slots_busy or 0) - 1)
+                    engine:_launchNextPiperPrefetch()
+                end
+            end
+            UIManager:scheduleIn(0.2, pollDone)
+
+            -- Fill remaining server slots with more batches
+            self:_launchNextPiperPrefetch()
+            return
+        end
+    end
+
+    -- ── Per-process fallback (servers not available) ──
+    -- Fall back to single-sentence mode
+    local text_to_launch = batch_texts[1]
+    local entry = batch_entries[1]
+    -- Reset others back to queued
+    for i = 2, #batch_entries do
+        batch_entries[i].status = "queued"
+    end
     local audio_file = entry.file
     local done_marker = entry.done_marker
 
     local cmd, text_file = self:_buildPiperCommand(text_to_launch, audio_file)
     entry.text_file = text_file
-    entry.status = "pending"
 
     local bg_cmd = string.format('(%s; echo $? > "%s") &', cmd, done_marker)
-    logger.dbg("TTSEngine: Piper prefetch launching:", text_to_launch:sub(1, 40))
+    logger.dbg("TTSEngine: Piper prefetch (per-process):", text_to_launch:sub(1, 40))
     os.execute(bg_cmd)
+    self._piper_slots_busy = (self._piper_slots_busy or 0) + 1
 
-    -- Poll for completion, then chain to the next queued entry
     local engine = self
     local poll_count = 0
-    local max_polls = 120  -- 60s timeout
+    local max_polls = 300  -- 60s timeout at 0.2s interval
     local function pollDone()
         local e = engine._piper_queue[text_to_launch]
         if not e then
-            -- Cleaned while pending — tidy temp files
             os.remove(audio_file)
             os.remove(done_marker)
             if text_file then os.remove(text_file) end
-            -- Chain: maybe more entries were queued in the meantime
+            engine._piper_slots_busy = math.max(0, (engine._piper_slots_busy or 0) - 1)
             engine:_launchNextPiperPrefetch()
             return
         end
@@ -1841,7 +2763,7 @@ function TTSEngine:_launchNextPiperPrefetch()
                     e.status = "ready"
                     logger.dbg("TTSEngine: Piper prefetch ready:",
                         text_to_launch:sub(1, 40), "size:", size)
-                    -- ── Chain: launch next queued entry ──
+                    engine._piper_slots_busy = math.max(0, (engine._piper_slots_busy or 0) - 1)
                     engine:_launchNextPiperPrefetch()
                     return
                 end
@@ -1849,20 +2771,22 @@ function TTSEngine:_launchNextPiperPrefetch()
             e.status = "failed"
             logger.err("TTSEngine: Piper prefetch failed:",
                 text_to_launch:sub(1, 40), "exit:", exit_code)
+            engine._piper_slots_busy = math.max(0, (engine._piper_slots_busy or 0) - 1)
             engine:_launchNextPiperPrefetch()
             return
         end
         if poll_count < max_polls then
-            UIManager:scheduleIn(0.5, pollDone)
+            UIManager:scheduleIn(0.2, pollDone)
         else
             e.status = "failed"
             logger.err("TTSEngine: Piper prefetch timed out:", text_to_launch:sub(1, 40))
             if text_file then os.remove(text_file) end
             os.remove(done_marker)
+            engine._piper_slots_busy = math.max(0, (engine._piper_slots_busy or 0) - 1)
             engine:_launchNextPiperPrefetch()
         end
     end
-    UIManager:scheduleIn(0.5, pollDone)
+    UIManager:scheduleIn(0.2, pollDone)
 end
 
 --[[--
@@ -1876,6 +2800,56 @@ function TTSEngine:piperPrefetchBatch(texts)
             self:piperPrefetchAsync(text)
         end
     end
+    -- Kick the launcher AFTER all sentences are queued so the batcher
+    -- can group 3 consecutive sentences per Piper call.
+    self:_launchNextPiperPrefetch()
+end
+
+--[[--
+Synchronously check a pending Piper prefetch entry's .done marker file.
+If the marker exists (the background piper process finished), finalize
+the entry to "ready" immediately — without waiting for the next
+UIManager:scheduleIn poll.  This closes the race window between the
+background process writing the marker and the poll callback firing.
+
+Called from peekPrefetch() and usePrefetched() so the concat loop and
+readNextSentence can discover entries that just finished.
+
+@param text string  Queue key (sentence text)
+--]]
+function TTSEngine:_tryFinalizePiperPrefetch(text)
+    local entry = self._piper_queue[text]
+    if not entry or entry.status ~= "pending" then return end
+    if not entry.done_marker then return end
+
+    local mf = io.open(entry.done_marker, "r")
+    if not mf then return end  -- not done yet
+
+    local exit_code = mf:read("*a"):gsub("%s+", "")
+    mf:close()
+    os.remove(entry.done_marker)
+    if entry.text_file then os.remove(entry.text_file) end
+
+    local af = io.open(entry.file, "r")
+    if af then
+        af:close()
+        local size = self:getFileSize(entry.file)
+        if size and size > 0 then
+            self:generateTimingEstimates(text)
+            entry.timing = self.timing_data
+            entry.status = "ready"
+            logger.dbg("TTSEngine: Piper prefetch sync-finalized:", text:sub(1, 40), "size:", size)
+            -- Free the server slot and launch next queued batch
+            self._piper_slots_busy = math.max(0, (self._piper_slots_busy or 0) - 1)
+            self:_launchNextPiperPrefetch()
+            return
+        end
+    end
+
+    entry.status = "failed"
+    logger.err("TTSEngine: Piper prefetch sync-finalize FAILED:", text:sub(1, 40), "exit:", exit_code)
+    self._piper_slots_busy = math.max(0, (self._piper_slots_busy or 0) - 1)
+    self:_launchNextPiperPrefetch()
 end
 
 --[[--
@@ -1886,6 +2860,28 @@ Check if a Piper prefetch entry is ready for the given text.
 function TTSEngine:isPiperPrefetchReady(text)
     local entry = self._piper_queue[text]
     return entry and entry.status == "ready"
+end
+
+--[[--
+Remove a Piper queue entry without deleting its files.
+Used to transfer ownership of the WAV file to the concat pipeline.
+@param text string
+@return string|nil file  Audio file path (or nil if not found)
+@return table|nil timing  Timing data
+--]]
+function TTSEngine:consumePiperQueueEntry(text)
+    local entry = self._piper_queue[text]
+    if entry then
+        self._piper_queue[text] = nil
+        for i, t in ipairs(self._piper_queue_order) do
+            if t == text then
+                table.remove(self._piper_queue_order, i)
+                break
+            end
+        end
+        return entry.file, entry.timing
+    end
+    return nil, nil
 end
 
 --[[--
@@ -1902,9 +2898,10 @@ end
 --[[--
 Clean up the Piper async prefetch queue.
 Removes all WAV files and cancels pending entries.
+Does NOT stop persistent servers (they're reused across pages).
 --]]
 function TTSEngine:_cleanPiperQueue()
-    -- Kill any running piper processes FIRST, before removing their files
+    -- Kill any per-process piper instances (NOT persistent servers)
     self:_killPiperProcesses()
     for text, entry in pairs(self._piper_queue) do
         if entry.file then
@@ -1919,16 +2916,31 @@ function TTSEngine:_cleanPiperQueue()
     end
     self._piper_queue = {}
     self._piper_queue_order = {}
+    self._piper_slots_busy = 0
 end
 
 --[[--
-Kill all running piper TTS processes.
-Called when playback is stopped/cancelled to prevent orphaned piper
-processes from consuming CPU and memory in the background.
+Kill per-process piper TTS instances.  Persistent servers are left alive
+(stopped separately via _stopPiperServers).
 --]]
 function TTSEngine:_killPiperProcesses()
-    os.execute("killall -9 piper 2>/dev/null")
-    logger.dbg("TTSEngine: Killed all piper processes")
+    -- Only kill orphaned per-process piper instances, not persistent servers
+    if self._piper_servers_running then
+        -- Servers are running — don't killall, just clean the queue
+        logger.dbg("TTSEngine: Piper servers active, skipping killall")
+    else
+        os.execute("killall -9 piper 2>/dev/null")
+        logger.dbg("TTSEngine: Killed all piper processes")
+    end
+end
+
+--[[--
+Full Piper shutdown: stop servers AND clean queue.
+Called when the plugin is closed or TTS is stopped entirely.
+--]]
+function TTSEngine:shutdownPiper()
+    self:_cleanPiperQueue()
+    self:_stopPiperServers()
 end
 
 return TTSEngine

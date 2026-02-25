@@ -7,6 +7,10 @@ Splits text into words and sentences with position tracking.
 
 local logger = require("logger")
 
+-- Shared utility modules (DRY: countSyllables)
+local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+local Utils = dofile(_utils_dir .. "utils.lua")
+
 local TextParser = {
     -- Sentence ending punctuation
     SENTENCE_ENDINGS = "[%.%?!]",
@@ -291,36 +295,12 @@ end
 
 --[[--
 Count syllables in a word (simple heuristic).
+Delegates to shared Utils module.
 @param word string The word to analyze
 @return number Estimated syllable count
 --]]
 function TextParser:countSyllables(word)
-    if not word or word == "" then
-        return 1
-    end
-    
-    word = word:lower()
-    local count = 0
-    local prev_vowel = false
-    local vowels = "aeiouy"
-    
-    for i = 1, #word do
-        local char = word:sub(i, i)
-        local is_vowel = vowels:find(char, 1, true) ~= nil
-        
-        if is_vowel and not prev_vowel then
-            count = count + 1
-        end
-        prev_vowel = is_vowel
-    end
-    
-    -- Handle silent e
-    if word:sub(-1) == "e" and count > 1 then
-        count = count - 1
-    end
-    
-    -- Minimum 1 syllable
-    return math.max(count, 1)
+    return Utils.countSyllables(word)
 end
 
 --[[--

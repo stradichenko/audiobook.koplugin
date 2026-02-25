@@ -14,6 +14,10 @@ local UIManager = require("ui/uimanager")
 local logger = require("logger")
 local _ = require("gettext")
 
+-- Shared utility modules (DRY: ws helper)
+local _utils_dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+local Utils = dofile(_utils_dir .. "utils.lua")
+
 local Screen = Device.screen
 
 local HighlightManager = {
@@ -98,8 +102,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc)
         return
     end
 
-    local function ws(s) return s:gsub("%s+", " "):match("^%s*(.-)%s*$") end
-    local sent_text = ws(sentence.text)
+    local sent_text = Utils.ws(sentence.text)
     if sent_text == "" then return end
 
     -- Get per-line screen boxes
@@ -121,7 +124,7 @@ function HighlightManager:_highlightSentenceRolling(sentence, parsed_data, doc)
             {x = box.x, y = box.y + math.floor(box.h / 2)},
             {x = box.x + box.w - 1, y = box.y + math.floor(box.h / 2)},
             true)
-        local lt = (r and r.text) and ws(r.text) or ""
+        local lt = (r and r.text) and Utils.ws(r.text) or ""
         line_texts[i] = lt
         if i > 1 and lt ~= "" then
             built_text = built_text .. " "
