@@ -18,10 +18,10 @@ local PLUGIN_PATH = _utils_dir
 
 -- ── Constants ────────────────────────────────────────────────────────
 -- Number of sentences to prefetch ahead for Piper TTS.
--- Piper runs ~4× RTF on single-core ARM; with 2 servers batching 3
--- sentences each, 9 sentences (3 batches) keeps both servers busy
--- without flooding the queue and delaying next-page prefetch.
-local PIPER_LOOKAHEAD = 9
+-- With BATCH_SIZE=1 and 2 servers × 4 pipeline depth = 8 slots,
+-- we need at least 8 sentences queued to keep all slots fed.
+-- 20 gives comfortable headroom so sentences are ready when needed.
+local PIPER_LOOKAHEAD = 20
 
 -- Number of initial sentences to play via espeak-ng while Piper warms up.
 -- espeak synthesizes in ~300ms vs Piper's 30-75s first batch on ARM.
@@ -475,13 +475,14 @@ function SyncController:beginSentencePlayback(sentence)
                 end
             end
             if pause_ms > 0 then
+                local g_type = (prev_sent.end_type == "paragraph") and "paragraph" or "sentence"
                 if prev_sent == sentence then
-                    self.tts_engine:appendSilenceToWav(self.tts_engine.current_audio_file, pause_ms)
+                    self.tts_engine:appendGapToWav(self.tts_engine.current_audio_file, pause_ms, g_type)
                     first_padded = true
                 elseif #concat_files > 0 then
                     local prev_cf = concat_files[#concat_files]
                     if prev_cf and prev_cf.file then
-                        self.tts_engine:appendSilenceToWav(prev_cf.file, pause_ms)
+                        self.tts_engine:appendGapToWav(prev_cf.file, pause_ms, g_type)
                         prev_cf.duration_ms = prev_cf.duration_ms + pause_ms
                     end
                 end
@@ -511,7 +512,7 @@ function SyncController:beginSentencePlayback(sentence)
             prev_sent = sent
 
             -- Transfer ownership: if this came from the Piper queue, remove
-            -- the entry so _cleanPiperQueue doesn't double-delete the file.
+            -- the entry so cleanQueue doesn't double-delete the file.
             -- The file is now owned by concat_wav_files.
             self.tts_engine:consumePiperQueueEntry(sent.text)
 
@@ -536,15 +537,16 @@ function SyncController:beginSentencePlayback(sentence)
             end
         end
         if trailing_gap_ms > 0 then
+            local tg_type = (prev_sent and prev_sent.end_type == "paragraph") and "paragraph" or "sentence"
             if #concat_files > 0 then
                 local last_cf = concat_files[#concat_files]
                 if last_cf and last_cf.file then
-                    self.tts_engine:appendSilenceToWav(last_cf.file, trailing_gap_ms)
+                    self.tts_engine:appendGapToWav(last_cf.file, trailing_gap_ms, tg_type)
                     last_cf.duration_ms = last_cf.duration_ms + trailing_gap_ms
                 end
             else
                 -- Single sentence: pad the main audio file
-                self.tts_engine:appendSilenceToWav(self.tts_engine.current_audio_file, trailing_gap_ms)
+                self.tts_engine:appendGapToWav(self.tts_engine.current_audio_file, trailing_gap_ms, tg_type)
                 if not first_padded then
                     first_padded = true
                 end

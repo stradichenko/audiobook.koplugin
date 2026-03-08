@@ -1,7 +1,7 @@
 --[[--
 WAV File Utilities
 Provides functions for reading, writing, and manipulating WAV files.
-Used by ttsengine and piperserver modules for audio file operations.
+Used by ttsengine and piperqueue modules for audio file operations.
 
 All functions assume standard PCM WAV format with a 44-byte header.
 Piper and espeak-ng both produce this canonical layout.
@@ -572,6 +572,78 @@ function WavUtils.splitFile(source_path, segment_durations, output_paths)
     f:close()
     logger.warn("WavUtils: Split", source_path, "into", #output_paths, "segments")
     return all_ok
+end
+
+--[[--
+Append a low-frequency sine-wave tone to the end of an existing WAV file.
+Used in "gap test mode" to make gap locations audible.
+Updates RIFF/data chunk sizes after appending.
+
+@param path string        WAV file path
+@param duration_ms number Duration of the tone in milliseconds
+@param freq_hz number     Tone frequency in Hz (default 220 = A3)
+@param amplitude number   Peak amplitude 0-32767 (default 2000 ≈ −24 dB)
+@return boolean           true on success
+--]]
+function WavUtils.appendTone(path, duration_ms, freq_hz, amplitude)
+    if not path or not duration_ms or duration_ms <= 0 then return false end
+    freq_hz = freq_hz or 220
+    amplitude = amplitude or 2000
+
+    local f = io.open(path, "r+b")
+    if not f then return false end
+
+    local sample_rate = WavUtils.readSampleRate(f)
+    if sample_rate <= 0 then f:close(); return false end
+    local block_align = WavUtils.readBlockAlign(f)
+
+    local num_samples = math.floor(sample_rate * (duration_ms / 1000))
+    -- Align to block_align
+    local tone_bytes = num_samples * block_align
+    tone_bytes = tone_bytes - (tone_bytes % block_align)
+    num_samples = math.floor(tone_bytes / block_align)
+    if num_samples <= 0 then f:close(); return false end
+
+    -- Generate sine wave samples as 16-bit signed LE
+    -- Apply a short fade-in/fade-out (5ms) to avoid clicks
+    local fade_samples = math.min(math.floor(sample_rate * 0.005), math.floor(num_samples / 4))
+    local two_pi = 2 * math.pi
+    local chunks = {}
+    local chunk_samples = {}
+    local chunk_limit = 4096  -- samples per chunk
+
+    f:seek("end")
+    for i = 0, num_samples - 1 do
+        local t = i / sample_rate
+        local sample = math.floor(amplitude * math.sin(two_pi * freq_hz * t))
+
+        -- Fade envelope
+        if i < fade_samples then
+            sample = math.floor(sample * (i / fade_samples))
+        elseif i >= num_samples - fade_samples then
+            sample = math.floor(sample * ((num_samples - 1 - i) / fade_samples))
+        end
+
+        -- Clamp
+        sample = math.max(-32768, math.min(32767, sample))
+        -- Convert signed to unsigned for LE encoding
+        if sample < 0 then sample = sample + 65536 end
+        chunk_samples[#chunk_samples + 1] = WavUtils.le16(sample)
+
+        if #chunk_samples >= chunk_limit then
+            f:write(table.concat(chunk_samples))
+            chunk_samples = {}
+        end
+    end
+    if #chunk_samples > 0 then
+        f:write(table.concat(chunk_samples))
+    end
+
+    WavUtils.updateHeaders(f)
+    f:close()
+
+    logger.dbg("WavUtils: Appended", duration_ms, "ms tone @", freq_hz, "Hz to", path)
+    return true
 end
 
 return WavUtils
