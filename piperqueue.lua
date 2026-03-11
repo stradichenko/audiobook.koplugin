@@ -26,10 +26,11 @@ local SERVER_COUNT  = 2                       -- persistent Piper servers
 local SERVER_PREFIX = "/tmp/piper_server_"
 local BATCH_SIZE    = 1                       -- sentences per server call
 -- Maximum requests queued per server via FIFO pipelining.
--- The FIFO buffers JSON lines so multiple requests are processed
--- sequentially without waiting for each to finish.  This keeps
--- both servers continuously busy even while poll callbacks fire.
-local MAX_PIPELINE_DEPTH = 4
+-- Depth=2 ensures zero idle time between sentences on each server
+-- (the next request is already waiting in the FIFO when the current
+-- one finishes).  Higher depth just increases queue latency without
+-- improving throughput since Piper processes requests sequentially.
+local MAX_PIPELINE_DEPTH = 2
 
 -- ── PiperQueue class ─────────────────────────────────────────────────
 

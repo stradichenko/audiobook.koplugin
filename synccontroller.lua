@@ -29,6 +29,18 @@ local PIPER_LOOKAHEAD = 20
 -- Only used during actual cold start, not after page turns.
 local ESPEAK_COLD_START_COUNT = 8
 
+-- ── Accumulate-then-play buffering ───────────────────────────────────
+-- Piper on ARM synthesizes at ~0.3-0.5× real-time (each 5 s sentence
+-- takes 15-30 s).  Playing each sentence as soon as it's ready creates
+-- a choppy "5 s audio → 10 s silence → 3 s audio" pattern.
+--
+-- Instead, when we must wait for a sentence anyway, we keep waiting
+-- until several CONSECUTIVE sentences are ready, then concat them into
+-- one smooth burst (e.g. 20 s of uninterrupted audio).  The user hears
+-- longer but fewer pauses, with smooth playback in between.
+local MIN_READY_AHEAD = 3         -- wait for 3+ more sentences after target
+local BUFFER_FILL_TIMEOUT_S = 20  -- max seconds to wait after target is ready
+
 local SyncController = {
     -- Playback states
     STATE = {
@@ -202,21 +214,81 @@ function SyncController:readNextSentence()
             ") for sentence", self.reading_sentence_idx,
             "|", self.tts_engine:getPiperQueueSnapshot())
         local poll_count = 0
-        local max_polls = 360  -- 90s timeout (batches can take 40-70s on ARM)
+        local max_polls = 600  -- 150 s hard timeout (buffer wait can add time)
+        local target_ready_at = nil  -- timestamp when target first became ready
+
+        -- Count how many consecutive sentences AFTER the target are ready.
+        local function countReadyAhead()
+            local count = 0
+            for offset = 1, MIN_READY_AHEAD + 2 do
+                local ai = controller.reading_sentence_idx + offset
+                if not controller.parsed_data or ai > controller.total_sentences then break end
+                local s = controller.parsed_data.sentences[ai]
+                if not s or not s.text or s.text == "" then break end
+                local st = controller.tts_engine:getPiperPrefetchStatus(s.text)
+                if st ~= "ready" then break end
+                count = count + 1
+            end
+            return count
+        end
+
         local function waitForPiperPrefetch()
             if controller.state == controller.STATE.STOPPED then return end
             poll_count = poll_count + 1
-            local ok = controller.tts_engine:usePrefetched(sentence.text)
-            if ok then
-                logger.warn("SyncController: Piper prefetch arrived for sentence",
-                    controller.reading_sentence_idx, "after", poll_count * 0.25, "s",
-                    "|", controller.tts_engine:getPiperQueueSnapshot())
-                controller._piper_warmed_up = true
-                controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
-                controller:beginSentencePlayback(sentence)
+
+            -- Use non-consuming peek so we can delay playback for buffering
+            local pf_file = controller.tts_engine:peekPrefetch(sentence.text)
+            if pf_file then
+                -- Target sentence is ready.
+                if not target_ready_at then
+                    target_ready_at = UIManager:getTime()
+                end
+
+                -- Accumulate buffer: wait for more consecutive sentences
+                local ready_ahead = countReadyAhead()
+                local remaining  = controller.total_sentences - controller.reading_sentence_idx
+                local min_needed = math.min(MIN_READY_AHEAD, remaining)
+                local enough     = ready_ahead >= min_needed
+                local elapsed_s  = time.to_s(UIManager:getTime() - target_ready_at)
+                local timed_out  = elapsed_s >= BUFFER_FILL_TIMEOUT_S
+
+                if enough or timed_out then
+                    -- Consume the prefetch and start playback
+                    local ok = controller.tts_engine:usePrefetched(sentence.text)
+                    if ok then
+                        logger.warn("SyncController: Piper prefetch arrived for sentence",
+                            controller.reading_sentence_idx, "after",
+                            poll_count * 0.25, "s  buffer:",
+                            ready_ahead, "ahead",
+                            string.format("(%.1fs since ready, %s)",
+                                elapsed_s, enough and "enough" or "timeout"),
+                            "|", controller.tts_engine:getPiperQueueSnapshot())
+                        controller._piper_warmed_up = true
+                        controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
+                        controller:beginSentencePlayback(sentence)
+                        return
+                    end
+                end
+
+                -- Keep waiting for more buffer to accumulate
+                if poll_count < max_polls then
+                    UIManager:scheduleIn(0.25, waitForPiperPrefetch)
+                else
+                    -- Hard timeout: play whatever we have
+                    local ok = controller.tts_engine:usePrefetched(sentence.text)
+                    if ok then
+                        controller._piper_warmed_up = true
+                        controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
+                        controller:beginSentencePlayback(sentence)
+                    else
+                        logger.err("SyncController: Piper prefetch hard timeout, skipping")
+                        controller:readNextSentence()
+                    end
+                end
                 return
             end
-            -- Check if it failed
+
+            -- Target not ready yet — check for failure
             local st = controller.tts_engine:getPiperPrefetchStatus(sentence.text)
             if st == "failed" or (not st) then
                 logger.warn("SyncController: Piper prefetch failed/gone, falling back to synthesize")

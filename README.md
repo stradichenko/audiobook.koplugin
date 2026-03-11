@@ -1,428 +1,432 @@
-# Audiobook Read-Along Plugin for KOReader
+<h1 align="center">
+  Audiobook Read-Along Plugin for KOReader
+</h1>
 
-A Text-to-Speech plugin with synchronized word highlighting for KOReader e-readers.
+<h3 align="center">
 
-## Features
+![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)
+![Platform](https://img.shields.io/badge/platform-Kobo%20%7C%20Kindle%20%7C%20Android%20%7C%20Linux-blue)
+![TTS](https://img.shields.io/badge/TTS-Piper%20%7C%20espeak--ng-green)
 
-- **Word Highlight Sync**: Each word is highlighted as it's spoken, moving through the text
-- **Sentence Highlighting**: Optional sentence-level highlighting
-- **Playback Control Bar**: Bottom control bar with:
-  - ⏮ Rewind (previous paragraph/sentence)
-  - ⏸/▶ Play/Pause toggle
-  - ⏭ Forward (next paragraph/sentence)
-  - ✕ Close/Stop reading
-  - Progress bar showing reading position
-  - Current word display
-- **Multiple TTS Engines**: Support for **Piper** (neural, natural-sounding), espeak-ng, pico2wave, flite, festival, and Android TTS
-- **Adjustable Speech Rate**: 0.5x to 2.0x speed control
-- **Multiple Highlight Styles**: Background, underline, box, or invert
-- **Auto-Advance**: Automatically moves to the next page when reading completes
+</h3>
+
+<h4 align="center">
+  Consider supporting:<br><br>
+  <a href="https://www.patreon.com/8153512/join">
+    <img src="https://img.shields.io/badge/Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white" alt="Patreon">
+  </a>
+  <a href="https://github.com/sponsors/stradichenko">
+    <img src="https://img.shields.io/badge/sponsor-30363D?style=for-the-badge&logo=GitHub-Sponsors&logoColor=#EA4AAA" alt="GitHub Sponsors">
+  </a>
+</h4>
+
+<h4 align="center">
+
+[![Share on X](https://img.shields.io/badge/-Share%20on%20X-gray?style=flat&logo=x)](https://x.com/intent/tweet?text=Audiobook%20Read-Along%20for%20KOReader!%20TTS%20with%20word%20highlighting%20on%20e-readers.&url=https://github.com/stradichenko/audiobook.koplugin&hashtags=KOReader,TTS,eink)
+
+</h4>
+
+A text-to-speech plugin for [KOReader](https://github.com/koreader/koreader)
+with synchronized word highlighting. Each word is highlighted as it is spoken,
+and the plugin handles page turns automatically so you can listen hands-free.
+
+## About
+
+The plugin sits between KOReader's document renderer and a TTS engine running
+on the device. It parses visible page text into words and sentences, synthesizes
+audio, and drives a highlight overlay in lockstep with playback. A small control
+bar at the bottom of the screen provides transport controls (rewind, play/pause,
+forward, close) and a progress indicator.
+
+Supported TTS backends:
+
+| Engine | Quality | Speed | Size |
+| -------- | --------- | ------- | ------ |
+| espeak-ng | Formant / robotic | Very fast | ~4 MB |
+| Piper (low) | Neural / natural | Fast | ~40 MB |
+| Piper (medium) | Neural / natural | Moderate | ~85 MB |
+| pico2wave | Diphone | Fast | ~5 MB |
+| flite | Unit selection | Fast | ~15 MB |
+| festival | Unit selection | Moderate | ~30 MB |
+| Android TTS | Varies | Varies | System |
 
 ## Installation
 
-1. Copy the entire `audiobook.koplugin` folder to your KOReader plugins directory:
-   - **Linux**: `~/.config/koreader/plugins/`
-   - **Kindle**: `koreader/plugins/`
-   - **Kobo**: `.adds/koreader/plugins/`
-   - **Android**: `/sdcard/koreader/plugins/`
-   - **PocketBook**: `applications/koreader/plugins/`
+Copy the `audiobook.koplugin` folder into the KOReader plugins directory for
+your device:
 
-2. **Restart KOReader completely** (close and reopen)
+| Platform | Path |
+| ---------- | ------ |
+| Linux | `~/.config/koreader/plugins/` |
+| Kindle | `koreader/plugins/` |
+| Kobo | `.adds/koreader/plugins/` |
+| Android | `/sdcard/koreader/plugins/` |
+| PocketBook | `applications/koreader/plugins/` |
 
-3. Open any book/document
+After copying, restart KOReader completely (close and reopen, do not just
+minimize).
 
 ## Requirements
 
+### Kobo
 
-### Kobo (with USB-C headphones or Bluetooth)
+Kobo devices do not ship with a TTS engine. You need to install espeak-ng once
+before the plugin will work. The steps below do not require coding experience.
 
-**IMPORTANT:** Kobo devices do not come with a TTS (text-to-speech) engine. You need to install **espeak-ng** once before this plugin will work. No coding experience is needed — just follow the steps below carefully.
+#### Install the plugin via USB
 
----
+1. Connect your Kobo to your computer with the USB cable.
+2. The device appears as a USB drive. Navigate to `.adds/koreader/plugins/`.
+   On Windows you may need to enable hidden files in File Explorer. On macOS
+   press `Cmd + Shift + .` in Finder. On Linux
+   press `Ctrl + H` in your file manager.
+3. Copy the entire `audiobook.koplugin` folder into `plugins/`.
+4. Eject the device safely and unplug it.
 
-#### Step 1: Install the Plugin via USB
+#### Connect to the Kobo shell
 
-This is the easiest part. You don't need Wi-Fi or SSH for this.
+You need a shell to install espeak-ng. Pick one of two methods.
 
-1. **Connect your Kobo to your computer** using the USB cable.
-2. Your Kobo will appear as a USB drive on your computer.
-3. Navigate to the hidden `.adds/koreader/plugins/` folder.
-   - **On Windows:** You may need to enable "Show hidden files" in File Explorer (View → Show → Hidden items).
-   - **On Mac:** Press `Cmd + Shift + .` in Finder to show hidden folders.
-   - **On Linux:** Press `Ctrl + H` in your file manager.
-4. Copy the entire `audiobook.koplugin` folder into that `plugins/` folder.
-5. Eject the Kobo safely and unplug it.
+**Terminal emulator (no computer needed).** In KOReader, open the menu bar,
+then go to More tools > Terminal emulator. A text input will appear where you
+can type the commands shown below.
 
----
+**SSH from your computer.** KOReader includes a built-in SSH server; developer
+mode is not required.
 
-#### Step 2: Connect to Your Kobo (to install espeak-ng)
-
-You have **two options** — pick whichever is easier for you:
-
-##### Option A: Use KOReader's Built-in Terminal (easiest — no computer needed)
-
-KOReader has a terminal emulator that lets you type commands directly on your Kobo.
-
-1. Open KOReader on your Kobo.
-2. Tap the top of the screen to open the menu bar.
-3. Go to **☰ (hamburger menu) → More tools → Terminal emulator**.
-4. A text input will appear where you can type commands.
-5. Continue to **Step 3** below and type the commands there.
-
-##### Option B: Connect via SSH from Your Computer
-
-KOReader has a **built-in SSH server** — you do NOT need `devmodeon` or developer mode.
-
-1. On your Kobo, open **KOReader**.
-2. Make sure **Wi-Fi is on** and connected to your home network.
-3. Tap the top of the screen → **☰ (hamburger menu) → Network → SSH server**.
-4. Check **"Login without password (DANGEROUS)"** (you can disable this later).
-5. Check **"SSH server"** to start it.
-6. A popup will show your Kobo's **IP address** (e.g., `192.168.1.14`).
-
-Now, on your computer:
-
-- **Windows:** Download and open [PuTTY](https://www.putty.org/). Enter the IP address, set port to **2222**, and click Open.
-- **Mac/Linux:** Open a terminal and type:
+1. Open KOReader. Make sure Wi-Fi is connected to your local network.
+2. Open the menu bar, then go to Network > SSH server.
+3. Enable "Login without password" (you can disable it later) and start the
+   server. A popup will display the device IP address.
+4. On your computer, connect with port 2222 (not 22):
 
 ```bash
-ssh root@192.168.1.14 -p 2222
+ssh root@<kobo-ip> -p 2222
 ```
 
-> ⚠️ **The port is 2222, not 22!** This is the most common mistake.
+The password is `root`.
 
-The password is **root**. If asked about authenticity, type `yes` and press Enter.
-
----
-
-#### Step 3: Check What's Already Installed
-
-Once you're connected (via Terminal emulator or SSH), type these commands one at a time:
+#### Check existing tools
 
 ```bash
 which espeak-ng
-```
-
-```bash
 which aplay
 ```
 
-- If either command shows a path (like `/usr/bin/espeak-ng`), that tool is already installed.
-- If it says `not found` or shows nothing, you need to install it.
+If a command prints a path, that tool is already present.
 
----
+#### Install espeak-ng
 
-#### Step 4: Install espeak-ng
-
-**Try the package manager first:**
+Try the package manager first:
 
 ```bash
 opkg update
 opkg install espeak-ng
 ```
 
-If `opkg` is not found, try:
-
-```bash
-pkm install espeak-ng
-```
-
-If neither works, you'll need to download espeak-ng manually:
-
-1. On your computer, visit: https://github.com/nickel-packages/packages
-2. Download the espeak-ng `.ipk` file for your Kobo's architecture (usually ARM).
-3. Connect your Kobo via USB and copy the `.ipk` file to the root of your Kobo's storage.
-4. Then via SSH or Terminal emulator:
+If `opkg` is not available, try `pkm install espeak-ng`. If neither works,
+download the `.ipk` from
+[nickel-packages](https://github.com/nickel-packages/packages), copy it to the
+Kobo via USB, and install manually:
 
 ```bash
 opkg install /mnt/onboard/espeak-ng*.ipk
 ```
 
----
+#### Verify
 
-#### Step 5: Test That It Works
-
-Plug in your headphones, then type:
+Plug in headphones, then run:
 
 ```bash
 espeak-ng "hello" -w /tmp/test.wav
 aplay /tmp/test.wav
 ```
 
-- If you hear "hello" through your headphones — **you're all set!** 🎉
-- If you hear nothing, see Troubleshooting below.
+You should hear the word "hello" through your headphones.
 
----
-
-#### Troubleshooting
+#### Quick troubleshooting
 
 | Problem | Solution |
-|---------|----------|
-| `espeak-ng: command not found` | espeak-ng is not installed. Repeat Step 4. |
-| `aplay: command not found` | Try: `opkg install alsa-utils` |
-| No sound through headphones | Make sure headphones are plugged in **before** running the command. Try `aplay -l` to list audio devices. |
-| `ssh: Connection refused` on port 22 | Use port **2222** instead: `ssh root@IP -p 2222` |
-| SSH server not showing in menu | Make sure you are in **KOReader** (not Kobo's default reader). Go to ☰ → Network → SSH server. |
-| Can't find `.adds` folder via USB | Enable "show hidden files" on your computer. The folder starts with a dot. |
+| --------- | ---------- |
+| `espeak-ng: command not found` | Repeat the install step above. |
+| `aplay: command not found` | `opkg install alsa-utils` |
+| No sound through headphones | Plug headphones in before running the command. Run `aplay -l` to list audio devices. |
+| `ssh: Connection refused` on port 22 | Use port 2222: `ssh root@<ip> -p 2222` |
+| SSH server missing from menu | Make sure you are in KOReader, not the stock Kobo reader. Go to Network > SSH server. |
+| `.adds` folder not visible via USB | Enable hidden files on your computer. The folder name starts with a dot. |
 
-**Need more help?**
+Further help:
 
-- [KOReader SSH Wiki](https://github.com/koreader/koreader/wiki/SSH)
-- [KOReader Community Forum](https://www.mobileread.com/forums/forumdisplay.php?f=276)
+- [KOReader SSH wiki](https://github.com/koreader/koreader/wiki/SSH)
+- [KOReader community forum](https://www.mobileread.com/forums/forumdisplay.php?f=276)
 
----
+#### Optional: install Piper TTS (neural voice)
 
-#### Optional: Install Piper TTS (Neural Voice)
+Piper is a neural TTS engine that sounds considerably more natural than
+espeak-ng. It runs locally on the Kobo ARM processor with no internet
+connection required during playback. Total size is roughly 40 MB (24 MB engine
+plus 15 MB for the low-quality voice model).
 
-Piper TTS is a **neural text-to-speech engine** that sounds far more natural than espeak-ng. It runs locally on the Kobo's ARM processor — no internet required during playback.
-
-**Requirements:** ~85 MB total (24 MB engine + 15–60 MB voice model)
-
-##### Method 1: Bundle with the packaging script (recommended)
-
-On your build machine, run:
+**Method 1: packaging script (recommended)**
 
 ```bash
 bash package-for-kobo.sh --with-piper
 ```
 
-This downloads the Piper armv7l binary and the `en_US-lessac-medium` voice model, and bundles them into the plugin directory automatically.
-
-To use a different voice or quality level:
+This downloads the Piper armv7l binary and the `en_US-danny-low` voice
+model and bundles them into the plugin directory. You can choose a different
+voice:
 
 ```bash
-# Smaller (~15 MB model, faster synthesis, slightly lower quality)
-bash package-for-kobo.sh --piper-voice en_US-lessac-low
+# alternative voice
+bash package-for-kobo.sh --piper-voice en_US-ryan-low
 
-# Higher quality (~60 MB model, slower synthesis)
+# higher quality, larger model (~60 MB, slower synthesis)
 bash package-for-kobo.sh --piper-voice en_US-lessac-medium
 ```
 
-Voice samples: [rhasspy.github.io/piper-samples](https://rhasspy.github.io/piper-samples/)
+Voice samples are available at
+[rhasspy.github.io/piper-samples](https://rhasspy.github.io/piper-samples/).
 
-##### Method 2: Manual install
+**Method 2: manual install**
 
-1. Download the armv7l binary from [github.com/rhasspy/piper/releases](https://github.com/rhasspy/piper/releases/tag/2023.11.14-2):
-   - `piper_linux_armv7l.tar.gz` (~24 MB)
+1. Download the armv7l binary from
+   [github.com/rhasspy/piper/releases](https://github.com/rhasspy/piper/releases/tag/2023.11.14-2)
+   (`piper_linux_armv7l.tar.gz`, ~24 MB).
+2. Download a voice model (both the `.onnx` and `.onnx.json` files) from
+   [HuggingFace](https://huggingface.co/rhasspy/piper-voices).
+3. Extract and copy to the Kobo:
 
-2. Download a voice model from [HuggingFace](https://huggingface.co/rhasspy/piper-voices):
-   - You need both the `.onnx` file and the `.onnx.json` config file
+```
+.adds/koreader/plugins/audiobook.koplugin/
+  piper/
+    piper
+    lib/
+    espeak-ng-data/
+    en_US-danny-low.onnx
+    en_US-danny-low.onnx.json
+```
 
-3. Extract and copy to your Kobo:
-   ```
-   .adds/koreader/plugins/audiobook.koplugin/
-   └── piper/
-       ├── piper              (the binary)
-       ├── lib/               (shared libraries from the tarball)
-       ├── espeak-ng-data/    (phonemizer data from the tarball)
-       ├── en_US-lessac-medium.onnx
-       └── en_US-lessac-medium.onnx.json
-   ```
+4. In KOReader, go to Tools > Audiobook Read-Along > Voice settings > TTS
+   engine and select Piper (neural).
 
-4. In KOReader, go to **Tools → Audiobook Read-Along → Voice settings → TTS engine** and select **Piper (neural)**.
+Both engines can coexist. Switch between them at any time from the same menu.
 
-##### Switching between engines
+### Linux / Desktop
 
-You can have **both espeak-ng and Piper installed** simultaneously and switch between them from:
+Install at least one TTS engine:
 
-**Tools → Audiobook Read-Along → Voice settings → TTS engine**
+```bash
+sudo apt install espeak-ng        # recommended
+sudo apt install libttspico-utils # pico2wave
+sudo apt install flite
+sudo apt install festival
+```
 
-| Engine | Sound quality | Speed | Size |
-|--------|-------------|-------|------|
-| espeak-ng | Robotic/formant | Very fast | ~4 MB |
-| Piper (low) | Natural/neural | Fast | ~40 MB |
-| Piper (medium) | Natural/neural | Moderate | ~85 MB |
+An audio player is also required. `aplay` (ALSA) is usually present by default.
+Alternatives:
 
----
-
-### Linux/Desktop
-One of the following TTS engines must be installed:
-- **espeak-ng** (recommended): `sudo apt install espeak-ng`
-- **pico2wave**: `sudo apt install libttspico-utils`
-- **flite**: `sudo apt install flite`
-- **festival**: `sudo apt install festival`
-
-An audio player is also required:
-- **aplay** (ALSA): Usually pre-installed
-- **paplay** (PulseAudio): `sudo apt install pulseaudio-utils`
-- **mpv**: `sudo apt install mpv`
+```bash
+sudo apt install pulseaudio-utils # paplay
+sudo apt install mpv
+```
 
 ### Android
-Uses the built-in Android TTS system. Make sure a TTS engine is installed in your Android settings.
+
+The plugin uses the built-in Android TTS system. Make sure a TTS engine is
+configured in your device settings.
 
 ## Usage
 
-### Method 1: Long-press a Word (Recommended)
-1. Open a document in KOReader
-2. **Long-press on any word** to open the dictionary popup
-3. Tap **"🔊 Read aloud from here"** button (appears below Wikipedia/Search/Close)
-4. Reading starts from that sentence with synchronized word highlighting
-5. **Playback control bar** appears at the bottom of the screen
+### Long-press a word (recommended)
 
-### Playback Controls
-When reading is active, a control bar appears at the bottom:
-- **⏮ Rewind**: Jump to previous sentence/paragraph (hold for 3x)
-- **⏸ Pause / ▶ Play**: Toggle playback
-- **⏭ Forward**: Jump to next sentence/paragraph (hold for 3x)
-- **✕ Close**: Stop reading and close the control bar
+1. Open a document in KOReader.
+2. Long-press any word to open the dictionary popup.
+3. Tap "Read aloud from here" (below the Wikipedia / Search / Close row).
+4. Reading begins from that sentence with synchronized word highlighting. The
+   playback control bar appears at the bottom of the screen.
 
-### Method 2: From Tools Menu
-1. Open a document in KOReader
-2. Tap the top of the screen to show the menu bar
-3. Go to **☰ (hamburger menu) → Tools → Audiobook Read-Along**
-4. Select **"Start reading from current page"**
+### From the tools menu
 
-### Keyboard/Gesture Shortcuts
-You can configure shortcuts in **Settings → Gesture Manager** or **Settings → Keyboard shortcuts**:
-- **Toggle Read-Along**: Play/pause reading
-- **Stop Read-Along**: Stop completely
+1. Open a document and tap the top of the screen to show the menu bar.
+2. Go to Tools > Audiobook Read-Along.
+3. Select "Start reading from current page".
+
+### Playback controls
+
+The control bar at the bottom provides four buttons:
+
+| Button | Action |
+| -------- | -------- |
+| Rewind | Jump to the previous sentence or paragraph. Hold for 3x skip. |
+| Play / Pause | Toggle playback. |
+| Forward | Jump to the next sentence or paragraph. Hold for 3x skip. |
+| Close | Stop reading and dismiss the bar. |
+
+### Keyboard and gesture shortcuts
+
+Shortcuts can be configured under Settings > Gesture Manager or Settings >
+Keyboard shortcuts:
+
+- Toggle Read-Along: play or pause reading
+- Stop Read-Along: stop completely
 
 ### Settings
 
-#### TTS Engine
-Choose which TTS engine to use for speech synthesis.
+**TTS engine.** Choose which backend to use for speech synthesis.
 
-#### Speech Rate
-Adjust how fast the text is read:
-- 0.5x - Half speed
-- 1.0x - Normal speed
-- 2.0x - Double speed
+**Speech rate.** Adjust playback speed from 0.5x (half speed) to 2.0x (double
+speed). The default is 1.0x.
 
-#### Highlight Style
-- **Background**: Fills word background with color
-- **Underline**: Draws line under the word
-- **Box**: Draws border around the word
-- **Invert**: Inverts the word colors (best for e-ink)
+**Highlight style.** Four options are available: background fill, underline,
+box, and invert. Invert tends to work best on e-ink displays.
 
-#### Auto-Advance Pages
-When enabled, automatically turns to the next page and continues reading.
+**Auto-advance pages.** When enabled the plugin turns to the next page
+automatically and continues reading.
 
-#### Highlight Words/Sentences
-Toggle word-level and sentence-level highlighting independently.
+**Highlight words / sentences.** Word-level and sentence-level highlighting can
+be toggled independently.
 
 ## Architecture
 
 ```
 audiobook.koplugin/
-├── _meta.lua            # Plugin metadata
-├── main.lua             # Main plugin entry point  
-├── textparser.lua       # Text parsing and tokenization
-├── ttsengine.lua        # TTS synthesis and playback
-├── highlightmanager.lua # Visual highlighting (moving word highlight)
-├── playbackbar.lua      # Bottom playback control bar widget
-├── synccontroller.lua   # Coordination, timing, and playback state
-├── espeak-ng/           # Bundled espeak-ng (formant TTS)
-│   ├── bin/espeak-ng
-│   ├── lib/             # Cross-compiled glibc + shared libs
-│   └── share/           # Phoneme data + English dictionary
-├── piper/               # Bundled Piper (neural TTS, optional)
-│   ├── piper            # ARM binary
-│   ├── lib/             # onnxruntime + shared libs
-│   ├── espeak-ng-data/  # Phonemizer data (used by Piper internally)
-│   └── *.onnx           # Voice model file(s)
-└── README.md            # This file
+  _meta.lua            # plugin metadata
+  main.lua             # entry point, menu integration, settings
+  textparser.lua       # text tokenization and position tracking
+  ttsengine.lua        # TTS synthesis and audio playback
+  highlightmanager.lua # on-screen word and sentence highlighting
+  playbackbar.lua      # bottom transport control bar widget
+  synccontroller.lua   # coordination between audio and highlights
+  espeak-ng/           # bundled espeak-ng (formant TTS)
+    bin/espeak-ng
+    lib/               # cross-compiled glibc and shared libraries
+    share/             # phoneme data and English dictionary
+  piper/               # bundled Piper (neural TTS, optional)
+    piper              # ARM binary
+    lib/               # onnxruntime and shared libraries
+    espeak-ng-data/    # phonemizer data used internally by Piper
+    *.onnx             # voice model files
 ```
-
-### Module Descriptions
-
-- **main.lua**: Plugin initialization, menu integration, dictionary button hook, settings
-- **textparser.lua**: Splits text into words and sentences, tracks positions
-- **ttsengine.lua**: Handles TTS synthesis, timing generation, audio playback
-- **highlightmanager.lua**: Manages visual highlighting on screen
-- **synccontroller.lua**: Coordinates timing between audio and highlights
 
 ## How It Works
 
-1. **Text Parsing**: When read-along starts, the current page text is parsed into words and sentences with character position tracking.
+1. **Text parsing.** When read-along starts, the visible page text is split
+   into words and sentences. Character positions are recorded so highlights can
+   be mapped back to screen coordinates.
 
-2. **TTS Synthesis**: The text is sent to the TTS engine which generates audio and timing metadata (or estimates timing based on syllable count).
+2. **Synthesis.** The text is sent to the selected TTS engine, which produces a
+   WAV file and, where supported, word-level timing metadata.
 
-3. **Synchronization**: During playback, the sync controller tracks elapsed time and matches it to word timing data.
+3. **Synchronization.** During playback the sync controller tracks elapsed time
+   and matches it against the timing data to determine which word is currently
+   being spoken.
 
-4. **Highlighting**: The highlight manager uses text positions to draw highlights at the corresponding screen locations.
+4. **Highlighting.** The highlight manager draws a visual overlay at the screen
+   position of the active word (and optionally the active sentence).
 
-5. **Auto-Advance**: When the page is complete, the plugin can automatically advance and continue.
+5. **Auto-advance.** When the end of a page is reached the plugin can
+   automatically turn the page and continue.
 
-## Timing Estimation
+### Timing estimation
 
-When TTS engines don't provide word timing metadata, the plugin estimates timing:
-- Syllables are counted using vowel patterns
-- Each syllable is estimated at ~200ms base duration
-- Adjusted by speech rate multiplier
-- 50ms gap added between words
+When a TTS engine does not provide word-level timing, the plugin estimates it:
+
+- Syllables are counted by vowel patterns.
+- Each syllable is assigned a base duration of roughly 200 ms.
+- The duration is scaled by the current speech rate multiplier.
+- A 50 ms gap is inserted between words.
 
 ## Troubleshooting
 
-### Plugin not showing in menu
-1. **Check folder name**: Must be exactly `audiobook.koplugin` (with `.koplugin` extension)
-2. **Check location**: Must be in the correct `plugins/` folder for your device
-3. **Restart properly**: Close KOReader completely (not just minimize), then reopen
-4. **Check permissions**: All files should be readable
-5. **Open a document**: The plugin only appears when a document is open (`is_doc_only = true`)
+### Plugin does not appear in the menu
 
-To verify installation, check if the folder exists:
+1. The folder must be named exactly `audiobook.koplugin`.
+2. It must be inside the correct `plugins/` directory for your device.
+3. KOReader must be restarted completely (close and reopen, not just minimize).
+4. All files must be readable.
+5. A document must be open; the plugin only appears when a document is loaded
+   (`is_doc_only = true`).
+
+To verify the installation:
+
 ```bash
-# Linux example
 ls ~/.config/koreader/plugins/audiobook.koplugin/
-# Should show: main.lua, _meta.lua, textparser.lua, etc.
+# expected: main.lua, _meta.lua, textparser.lua, etc.
 ```
 
 ### Nothing happens after "Starting read-along..."
-This usually means TTS synthesis failed:
-1. **Check for error messages** - The plugin should show what's missing
-2. **Verify TTS is installed**:
-   ```bash
-   which espeak-ng   # Should show a path
-   espeak-ng "hello" -w /tmp/test.wav  # Should create file
-   ls -la /tmp/test.wav  # Should show file size > 0
-   ```
-3. **Verify audio player**:
-   ```bash
-   which aplay   # Should show a path
-   aplay /tmp/test.wav  # Should play audio
-   ```
 
-### "No TTS engine found" error
-You need to install espeak-ng on your device. See Requirements section above.
+This usually means synthesis failed. Check for error messages, then verify that
+the TTS engine and audio player are working:
 
-### "No audio player found" error
-The plugin needs `aplay`, `paplay`, or `mpv` to play audio files.
-- On Kobo: `aplay` is usually available
-- Make sure headphones are connected before starting
+```bash
+which espeak-ng
+espeak-ng "hello" -w /tmp/test.wav
+ls -la /tmp/test.wav
 
-### No "Read aloud" button in dictionary popup
-- Make sure you're long-pressing a word (not selecting text)
-- The button appears below Wikipedia/Search/Close
-- Restart KOReader after installing the plugin
+which aplay
+aplay /tmp/test.wav
+```
+
+### "No TTS engine found"
+
+Install espeak-ng on the device. See the Requirements section.
+
+### "No audio player found"
+
+The plugin needs `aplay`, `paplay`, or `mpv`. On Kobo, `aplay` is usually
+available. Make sure headphones are connected before starting playback.
+
+### "Read aloud" button missing from the dictionary popup
+
+Long-press a word (do not drag-select text). The button appears below the
+Wikipedia / Search / Close row. Restart KOReader if you just installed the
+plugin.
 
 ### No audio with USB-C headphones
-- Some USB-C audio adapters need special configuration
-- Try playing audio with `aplay /tmp/test.wav` via SSH first
-- Check ALSA device list: `aplay -l`
 
-### Playback control bar doesn't appear
-- The bar should appear at the bottom when reading starts
-- If synthesis fails, the bar won't show
-- Check KOReader logs for errors
+Some USB-C audio adapters require extra configuration. Try `aplay /tmp/test.wav`
+over SSH first, and check the device list with `aplay -l`.
+
+### Control bar does not appear
+
+If synthesis fails the bar will not be shown. Check the KOReader logs for error
+messages.
 
 ### Highlights not visible
-- E-ink screens may need a full refresh
-- Try different highlight styles (Invert works best on e-ink)
-- Check that "Highlight words" is enabled in settings
 
-### Timing seems off
-- Estimated timing may not match exact speech
-- Try adjusting speech rate
-- Some TTS engines provide better timing than others
+E-ink screens may need a full refresh to display changes. Try a different
+highlight style (invert usually works best). Confirm that "Highlight words" is
+enabled in the plugin settings.
+
+### Timing feels off
+
+Estimated timing may not match the exact speech cadence. Adjusting the speech
+rate can help. Some TTS engines provide more accurate timing than others.
 
 ## Contributing
 
-Contributions are welcome! Areas for improvement:
-- Real word timing from TTS engines (SSML/callbacks)
+Contributions are welcome. Areas that could use improvement:
+
+- Real word timing from TTS engines via SSML or callbacks
 - Better position mapping for different document types
-- More TTS engine support
+- Additional TTS engine backends
 - Accessibility improvements
 
 ## License
 
-This plugin is part of the KOReader project and is licensed under the AGPL-3.0 license.
+Copyright 2025 gespitia
+
+This project is licensed under the GNU Affero General Public License v3.0.
+See [LICENSE](LICENSE) for the full text.
+
+Bundled components carry their own licenses:
+
+| Component | License |
+| --------- | ------- |
+| [KOReader](https://github.com/koreader/koreader) | AGPL-3.0 |
+| [espeak-ng](https://github.com/espeak-ng/espeak-ng) | GPL-3.0+ |
+| [Piper](https://github.com/rhasspy/piper) | MIT |
+| [Piper voice models](https://huggingface.co/rhasspy/piper-voices) | MIT |
+| glibc (bundled shared libraries) | LGPL-2.1 |
