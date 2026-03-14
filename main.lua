@@ -28,6 +28,12 @@ local Audiobook = WidgetContainer:extend{
 }
 
 function Audiobook:init()
+    -- ── Orphan cleanup from previous crash/SIGKILL ──
+    -- If KOReader was killed (OOM, watchdog, etc.), no Lua cleanup ran.
+    -- Kill any orphan processes from the previous session to free the
+    -- BT audio socket and reclaim CPU/memory.
+    self:_killOrphanProcessesFromPreviousSession()
+
     -- Load submodules from plugin directory
     local TextParser = dofile(PLUGIN_PATH .. "textparser.lua")
     local TTSEngine = dofile(PLUGIN_PATH .. "ttsengine.lua")
@@ -422,6 +428,79 @@ function Audiobook:startReadAlongFromWord(word, context)
     
     -- Start reading from the found position
     self:startReadAlong(page_text, start_pos)
+end
+
+--[[--
+Kill orphan processes from a previous KOReader session that was SIGKILL'd.
+Checks for PID files and known process names left behind when cleanup
+didn't run (OOM kill, watchdog, hard reboot).
+Called once at plugin init — idempotent and safe when no orphans exist.
+--]]
+function Audiobook:_killOrphanProcessesFromPreviousSession()
+    local dominated = false
+
+    -- 1. Kill orphan gst-launch-1.0 (frees the exclusive BT A2DP socket)
+    --    Check if any gst-launch is running before paying the killall cost.
+    local h = io.popen("pgrep -c gst-launch 2>/dev/null")
+    if h then
+        local count = tonumber(h:read("*a"))
+        h:close()
+        if count and count > 0 then
+            os.execute("killall -9 gst-launch-1.0 2>/dev/null")
+            dominated = true
+            logger.warn("Audiobook: Startup cleanup — killed orphan gst-launch-1.0")
+        end
+    end
+
+    -- 2. Kill orphan piper processes
+    h = io.popen("pgrep -c piper 2>/dev/null")
+    if h then
+        local count = tonumber(h:read("*a"))
+        h:close()
+        if count and count > 0 then
+            os.execute("killall -9 piper 2>/dev/null")
+            dominated = true
+            logger.warn("Audiobook: Startup cleanup — killed orphan piper")
+        end
+    end
+
+    -- 3. Kill orphan feeder/server shell scripts by PID file
+    local pid_files = {
+        "/tmp/audiobook_ctrl/gst_pid",    -- persistent pipeline gst PID
+        "/tmp/piper_server_1.pid",         -- piper server 1 reader PID
+        "/tmp/piper_server_1.piper_pid",   -- piper server 1 piper PID
+        "/tmp/piper_server_2.pid",         -- piper server 2 reader PID
+        "/tmp/piper_server_2.piper_pid",   -- piper server 2 piper PID
+    }
+    for _, pf_path in ipairs(pid_files) do
+        local pf = io.open(pf_path, "r")
+        if pf then
+            local pid = pf:read("*a"):gsub("%s+", "")
+            pf:close()
+            if pid ~= "" then
+                os.execute(string.format("kill -9 %s 2>/dev/null", pid))
+                dominated = true
+                logger.warn("Audiobook: Startup cleanup — killed PID", pid, "from", pf_path)
+            end
+            os.remove(pf_path)
+        end
+    end
+
+    -- 4. Kill the feeder wrapper shell by finding /bin/sh audiobook_pipeline
+    --    This catches the wrapper that io.popen("script & echo $!") spawned.
+    os.execute("pkill -9 -f 'audiobook_pipeline\\.sh' 2>/dev/null")
+
+    -- 5. Kill orphan server wrapper shells
+    os.execute("pkill -9 -f 'piper_server_.*\\.sh' 2>/dev/null")
+
+    -- 6. Clean up stale temp files
+    os.execute("rm -f /tmp/audiobook_fifo /tmp/audiobook_pipeline.sh /tmp/audiobook_ctrl/gst_pid /tmp/audiobook_ctrl/stop /tmp/audiobook_ctrl/play /tmp/audiobook_ctrl/done 2>/dev/null")
+    os.execute("rm -f /tmp/piper_server_*.pid /tmp/piper_server_*.piper_pid /tmp/piper_server_*.sh /tmp/piper_server_*.log 2>/dev/null")
+
+    if dominated then
+        -- Give kernel time to release sockets after SIGKILL
+        os.execute("usleep 300000")
+    end
 end
 
 function Audiobook:stopReadAlong()

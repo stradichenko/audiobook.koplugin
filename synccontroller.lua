@@ -439,14 +439,31 @@ function SyncController:applySentenceTiming(sentence, timing_data)
             end
         end
     else
-        -- Fallback: estimate timing from syllable count
+        -- Fallback: estimate timing when no TTS timing data is available.
+        -- For Piper (neural TTS), use character-length proportional timing
+        -- which better reflects uniform-rate neural synthesis than syllable
+        -- counting.  Values are scaled to match real WAV duration later,
+        -- so only the proportions between words matter.
         local current_time = 0
+        local is_piper = self.tts_engine
+            and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
         for _, word in ipairs(sentence.words) do
-            local duration = self.text_parser:estimateWordDuration(word)
+            local duration
+            if is_piper then
+                local chars = #(word.clean_text or word.text:gsub("[%%p]", ""))
+                duration = math.floor(chars * 80)
+                if word.text:match("[,;:]$") then
+                    duration = duration + 150
+                elseif word.text:match("[%.%%?!]$") then
+                    duration = duration + 200
+                end
+            else
+                duration = self.text_parser:estimateWordDuration(word)
+            end
             word.start_time = current_time
             word.end_time = current_time + duration
             word.duration = duration
-            current_time = current_time + duration + 50
+            current_time = current_time + duration + (is_piper and 30 or 50)
         end
     end
 end
@@ -798,8 +815,16 @@ function SyncController:beginSentencePlayback(sentence)
         -- can see what is about to be spoken.  The highlight stays until the
         -- sync loop switches to the next sentence.
         if self.plugin and self.plugin:getSetting("highlight_sentences", true) then
+            -- Delay sentence highlight to roughly match when audio reaches
+            -- the speaker.  For persistent BT pipeline the audio travels
+            -- through a pipe buffer + BT codec; showing the highlight at
+            -- that time keeps it synchronized with what the user hears.
+            local hl_delay = 0.05
+            if self.tts_engine._persistent_pipeline then
+                hl_delay = math.max(0.05, (self.tts_engine.playback_latency_ms or 300) / 1000)
+            end
             local hl_sched_time = UIManager:getTime()
-            UIManager:scheduleIn(0.05, function()
+            UIManager:scheduleIn(hl_delay, function()
                 if controller.state == controller.STATE.STOPPED then return end
                 local hl_delta = time.to_ms(UIManager:getTime() - hl_sched_time)
                 logger.warn("SyncController: Highlighting sentence", sentence.index,

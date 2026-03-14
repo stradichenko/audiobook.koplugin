@@ -568,6 +568,7 @@ function TTSEngine:generateTimingEstimates(text)
     self.timing_data = {}
     local current_time = 0
     local pos = 1
+    local is_piper = self.backend == self.BACKENDS.PIPER
     
     while pos <= #text do
         -- Skip whitespace
@@ -589,8 +590,25 @@ function TTSEngine:generateTimingEstimates(text)
         local clean_word = word:gsub("[%p]", "")
         
         if clean_word ~= "" then
-            local syllables = self:countSyllables(clean_word)
-            local duration = math.floor((syllables * 200) / self.rate)
+            local duration
+            if is_piper then
+                -- Neural TTS: character-length proportional estimation.
+                -- Piper synthesizes at a fairly uniform rate per character,
+                -- so character count gives better proportional distribution
+                -- than syllable count.  These raw values are later scaled to
+                -- match the real WAV duration — only the ratios matter.
+                duration = math.floor(#clean_word * 80)
+                -- Punctuation after a word causes Piper to insert a natural
+                -- pause — model that for better within-sentence proportions.
+                if word:match("[,;:]$") then
+                    duration = duration + 150
+                elseif word:match("[%.%?!]$") then
+                    duration = duration + 200
+                end
+            else
+                local syllables = self:countSyllables(clean_word)
+                duration = math.floor((syllables * 200) / self.rate)
+            end
             
             table.insert(self.timing_data, {
                 word = word,
@@ -600,7 +618,7 @@ function TTSEngine:generateTimingEstimates(text)
                 end_time = current_time + duration,
             })
             
-            current_time = current_time + duration + 50 -- 50ms gap
+            current_time = current_time + duration + (is_piper and 30 or 50)
         end
     end
     
@@ -1490,7 +1508,29 @@ via a named FIFO), and waits for gst-launch to initialise.
 @return boolean true if pipeline started successfully
 --]]
 function TTSEngine:_startPersistentPipeline()
-    self:_stopPersistentPipeline()
+    self:_stopPersistentPipeline("restart")
+
+    -- Verify the mtkbtmwrpc socket is actually free before starting.
+    -- An orphan gst-launch from a crashed/previous session can hold it.
+    -- The killall in _stopPersistentPipeline should have freed it, but
+    -- the kernel needs a moment to tear down the abstract socket.
+    for attempt = 1, 5 do
+        local pf = io.open("/proc/net/unix", "r")
+        if pf then
+            local content = pf:read("*a")
+            pf:close()
+            if not content:find("@kobo:mtkbtmwrpc") then
+                break  -- socket is free
+            end
+            logger.warn("TTSEngine: mtkbtmwrpc socket still held, attempt",
+                attempt, "— waiting 200ms")
+            os.execute("killall -9 gst-launch-1.0 2>/dev/null")
+            os.execute("usleep 200000")
+        else
+            break  -- can't check, proceed anyway
+        end
+    end
+
     if not self:_writePipelineScript() then
         logger.err("TTSEngine: Cannot write pipeline script")
         return false
@@ -1568,20 +1608,57 @@ end
 --[[--
 Stop the persistent BT audio pipeline.
 Kills the feeder script and gst-launch, cleans up the FIFO.
+@param reason string  Caller identification for diagnostic logging
 --]]
-function TTSEngine:_stopPersistentPipeline()
-    if not self._persistent_pipeline then return end
-    -- Signal feeder to stop
+function TTSEngine:_stopPersistentPipeline(reason)
+    reason = reason or "unknown"
+    -- Log the caller so we can diagnose unexpected pipeline kills.
+    -- debug.traceback is cheap (only fires on pipeline stop, not per-sentence).
+    logger.warn("TTSEngine: _stopPersistentPipeline called, reason=", reason,
+        "pipeline=", self._persistent_pipeline,
+        "gst_pid=", self._pipeline_gst_pid,
+        "is_speaking=", self.is_speaking,
+        "gen=", self.play_generation,
+        "\n  traceback: ", debug.traceback("", 2))
+    -- Signal feeder to stop (harmless if no feeder is running)
     local sf = io.open(PIPELINE_CTRL_DIR .. "/stop", "w")
     if sf then sf:write("1"); sf:close() end
-    -- Kill processes
+    -- Kill tracked processes
     if self._pipeline_gst_pid then
         os.execute("kill -9 " .. self._pipeline_gst_pid .. " 2>/dev/null")
     end
     if self._pipeline_wrapper_pid then
         os.execute("kill -9 " .. self._pipeline_wrapper_pid .. " 2>/dev/null")
     end
+    -- Also read gst PID from file in case Lua state was lost (crash/restart).
+    -- This catches orphans whose PIDs we no longer track in memory.
+    local gst_pf = io.open(PIPELINE_CTRL_DIR .. "/gst_pid", "r")
+    if gst_pf then
+        local file_pid = gst_pf:read("*a"):gsub("%s+", "")
+        gst_pf:close()
+        if file_pid ~= "" and tonumber(file_pid) ~= self._pipeline_gst_pid then
+            os.execute(string.format("kill -9 %s 2>/dev/null", file_pid))
+            logger.warn("TTSEngine: Killed orphan gst from PID file:", file_pid)
+        end
+    end
+    -- Kill orphan feeder wrapper shells that Lua state doesn't track.
+    -- These are /bin/sh processes not caught by killall gst-launch-1.0.
+    os.execute("pkill -9 -f 'audiobook_pipeline\\.sh' 2>/dev/null")
+    -- ALWAYS kill orphan gst-launch processes.  On Kobo, the
+    -- mtkbtmwrpcaudiosink binds an exclusive abstract socket
+    -- (@kobo:mtkbtmwrpc).  If ANY gst-launch holds it — even an
+    -- orphan from a previous KOReader session or an SSH test — the
+    -- new pipeline fails with "Address already in use".
     os.execute("killall -9 gst-launch-1.0 2>/dev/null")
+    -- Kill the feeder wrapper shell too — if Lua lost track of its PID
+    -- (crash / restart), it becomes orphaned under init (PID 1).
+    os.execute("pkill -9 -f 'audiobook_pipeline\\.sh' 2>/dev/null")
+    -- Brief wait for the kernel to release the abstract socket
+    -- after SIGKILL.  Without this, the bind() in the new pipeline
+    -- can race against socket teardown.
+    if self._persistent_pipeline then
+        os.execute("usleep 200000")
+    end
     -- Clean up
     os.execute("rm -f " .. PIPELINE_FIFO .. " " .. PIPELINE_CTRL_DIR .. "/gst_pid")
     self._pipeline_gst_pid = nil
@@ -1589,7 +1666,7 @@ function TTSEngine:_stopPersistentPipeline()
     self._persistent_pipeline = false
     self.audio_pid = nil
     self._socket_clean = false
-    logger.warn("TTSEngine: Persistent pipeline stopped")
+    logger.warn("TTSEngine: Persistent pipeline stopped, reason=", reason)
 end
 
 --[[--
@@ -1833,6 +1910,9 @@ function TTSEngine:stop()
     -- Always bump generation and clear state, even if not speaking.
     -- This ensures stale scheduled callbacks (launchAndStart, checkProcess,
     -- updateTiming) exit immediately regardless of what state we were in.
+    logger.warn("TTSEngine: stop() called, is_speaking=", self.is_speaking,
+        "gen=", self.play_generation, "persistent=", self._persistent_pipeline,
+        "\n  traceback: ", debug.traceback("", 2))
     self.is_speaking = false
     self.is_paused = false
     self.play_generation = (self.play_generation or 0) + 1
@@ -1851,7 +1931,7 @@ function TTSEngine:stop()
 
     -- Stop persistent pipeline or legacy keepalive
     if self._persistent_pipeline then
-        self:_stopPersistentPipeline()
+        self:_stopPersistentPipeline("engine_stop")
     else
         self:_stopBtKeepalive()
     end
@@ -1912,15 +1992,18 @@ function TTSEngine:forceKillAll()
     end
     -- Stop persistent pipeline or legacy keepalive
     if self._persistent_pipeline then
-        self:_stopPersistentPipeline()
+        self:_stopPersistentPipeline("force_kill_all")
     else
         self:_stopBtKeepalive()
     end
     if self.audio_pid then
-        os.execute("kill -TERM " .. self.audio_pid .. " 2>/dev/null")
+        os.execute("kill -9 " .. self.audio_pid .. " 2>/dev/null")
         self.audio_pid = nil
     end
-    os.execute("killall -TERM gst-launch-1.0 2>/dev/null")
+    -- SIGKILL to guarantee hung gst-launch processes die (e.g. stuck in
+    -- BT audio driver).  _stopPersistentPipeline already used SIGKILL for
+    -- the pipeline; this catches any legacy-path or newly spawned strays.
+    os.execute("killall -9 gst-launch-1.0 2>/dev/null")
     -- Full Piper shutdown: stop persistent servers AND kill per-process instances
     self._piper:shutdown()
     self:fullCleanup()
@@ -1938,7 +2021,14 @@ function TTSEngine:cleanup()
         end
         self.current_audio_file = nil
     end
-    self.audio_pid = nil
+    -- Only clear audio_pid for the legacy (non-persistent) path.
+    -- For the persistent pipeline, audio_pid points to the gst-launch
+    -- process which keeps running between sentences.  Clearing it here
+    -- breaks pause/resume and causes _isAudioProcessRunning to return
+    -- false spuriously.
+    if not self._persistent_pipeline then
+        self.audio_pid = nil
+    end
 end
 
 --[[--

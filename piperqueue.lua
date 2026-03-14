@@ -22,15 +22,32 @@ local WavUtils = dofile(_utils_dir .. "wavutils.lua")
 
 -- ── Constants ────────────────────────────────────────────────────────
 
-local SERVER_COUNT  = 2                       -- persistent Piper servers
+-- Auto-detect CPU cores.  On single-core ARM (e.g. Kobo Clara Cortex-A8)
+-- running >1 Piper server causes severe CPU contention — benchmarks show
+-- a 4× throughput drop vs a single server.  Only use multiple servers on
+-- hardware with ≥2 physical cores.
+local function _detect_cpu_cores()
+    local f = io.open("/sys/devices/system/cpu/possible", "r")
+    if f then
+        -- Format: "0-N" → N+1 cores, or "0" → 1 core
+        local s = f:read("*l") or "0"
+        f:close()
+        local hi = s:match("%-(%d+)")
+        if hi then return tonumber(hi) + 1 end
+        return 1
+    end
+    return 1  -- conservative fallback
+end
+
+local _cpu_cores    = _detect_cpu_cores()
+local SERVER_COUNT  = math.min(_cpu_cores, 2)  -- 1 server per core, max 2
 local SERVER_PREFIX = "/tmp/piper_server_"
-local BATCH_SIZE    = 1                       -- sentences per server call
+local BATCH_SIZE    = _cpu_cores == 1 and 3 or 1  -- batch more on single-core
 -- Maximum requests queued per server via FIFO pipelining.
--- Depth=2 ensures zero idle time between sentences on each server
--- (the next request is already waiting in the FIFO when the current
--- one finishes).  Higher depth just increases queue latency without
--- improving throughput since Piper processes requests sequentially.
-local MAX_PIPELINE_DEPTH = 2
+-- On single-core, depth>1 adds FIFO overhead with no benefit (CPU can't
+-- overlap work).  On multi-core, depth=2 keeps the server fed while we
+-- process the previous result.
+local MAX_PIPELINE_DEPTH = _cpu_cores == 1 and 1 or 2
 
 -- ── PiperQueue class ─────────────────────────────────────────────────
 
@@ -160,7 +177,7 @@ function PiperQueue:setModel(model)
     if old_model and old_model ~= model then
         logger.warn("PiperQueue: Model changed, stopping servers + pipeline")
         self:stopServers()
-        engine:_stopPersistentPipeline()
+        engine:_stopPersistentPipeline("model_change")
         self:cleanQueue()
     end
 end
@@ -381,12 +398,41 @@ function PiperQueue:startServers()
         return
     end
 
+    logger.warn("PiperQueue: CPU cores:", _cpu_cores,
+                "→ SERVER_COUNT:", SERVER_COUNT,
+                "BATCH_SIZE:", BATCH_SIZE)
+
     self._servers_starting = true
     self._servers = {}
     self._server_rr = 0
 
     -- Kill ALL existing piper processes before launching
     os.execute("killall -9 piper 2>/dev/null")
+    -- Also kill orphan server shell wrappers from a previous crash.
+    -- These are /bin/sh processes not caught by killall piper.
+    for i = 1, SERVER_COUNT do
+        local fifo = SERVER_PREFIX .. i
+        local pid_file = fifo .. ".pid"
+        local piper_pid_file = fifo .. ".piper_pid"
+        local pf = io.open(pid_file, "r")
+        if pf then
+            local pid = pf:read("*a"):gsub("%s+", "")
+            pf:close()
+            if pid ~= "" then
+                os.execute(string.format("kill -9 %s 2>/dev/null", pid))
+            end
+        end
+        local ppf = io.open(piper_pid_file, "r")
+        if ppf then
+            local pid = ppf:read("*a"):gsub("%s+", "")
+            ppf:close()
+            if pid ~= "" then
+                os.execute(string.format("kill -9 %s 2>/dev/null", pid))
+            end
+        end
+        os.execute(string.format('rm -f "%s" "%s.pid" "%s.piper_pid" "%s.sh" "%s.log"',
+            fifo, fifo, fifo, fifo, fifo))
+    end
     os.execute("usleep 200000")
 
     local base_cmd = self:buildBaseCommand()
@@ -403,10 +449,21 @@ function PiperQueue:startServers()
         local script = string.format([=[#!/bin/sh
 FIFO="%s"
 LOG="%s"
-rm -f "$FIFO" "${FIFO}.pid"
+rm -f "$FIFO" "${FIFO}.pid" "${FIFO}.piper_pid"
 mkfifo "$FIFO"
 exec 3<>"$FIFO"
-%s --json-input --sentence_silence 0 <&3 2>>"$LOG" | while IFS= read -r wav_path; do
+# Launch piper piped to the done-marker writer, as a single background
+# pipeline.  $! gives the PID of the rightmost (while-read) subshell.
+# We also record piper's PID via a wrapper that writes it before exec.
+PIPER_INNER_PID_FILE="${FIFO}.piper_pid"
+{
+  # This subshell's PID ($BASHPID / $$) is the piper process after exec.
+  # But /bin/sh doesn't have $BASHPID; use a bg trick instead.
+  %s --json-input --sentence_silence 0 <&3 2>>"$LOG" &
+  INNER_PID=$!
+  echo "$INNER_PID" > "$PIPER_INNER_PID_FILE"
+  wait $INNER_PID
+} | while IFS= read -r wav_path; do
   wav_path=$(echo "$wav_path" | tr -d '\r\n')
   if [ -n "$wav_path" ]; then
     echo "0" > "${wav_path}.done"
@@ -414,9 +471,20 @@ exec 3<>"$FIFO"
 done &
 PIPE_PID=$!
 echo "$PIPE_PID" > "${FIFO}.pid"
+cleanup() {
+  # Kill piper directly (not just the pipe reader)
+  if [ -f "$PIPER_INNER_PID_FILE" ]; then
+    INNER=$(cat "$PIPER_INNER_PID_FILE" 2>/dev/null)
+    kill $INNER 2>/dev/null
+  fi
+  kill $PIPE_PID 2>/dev/null
+  exec 3>&- 2>/dev/null
+  rm -f "$FIFO" "${FIFO}.pid" "${FIFO}.piper_pid"
+}
+trap cleanup EXIT TERM
 wait $PIPE_PID 2>/dev/null
 exec 3>&-
-rm -f "$FIFO" "${FIFO}.pid"
+rm -f "$FIFO" "${FIFO}.pid" "${FIFO}.piper_pid"
 ]=], fifo, log_file, base_cmd)
 
         local sf = io.open(script_path, "w")
@@ -441,11 +509,20 @@ rm -f "$FIFO" "${FIFO}.pid"
                 if pf then
                     local pid = pf:read("*a"):gsub("%s+", "")
                     pf:close()
+                    -- Also read piper's own PID for direct kill capability
+                    local piper_pid = nil
+                    local ppf = io.open(SERVER_PREFIX .. i .. ".piper_pid", "r")
+                    if ppf then
+                        local raw = ppf:read("*a"):gsub("%s+", "")
+                        piper_pid = tonumber(raw)
+                        ppf:close()
+                    end
                     pq._servers[i] = {
                         fifo = SERVER_PREFIX .. i,
                         pid = tonumber(pid),
+                        piper_pid = piper_pid,
                     }
-                    logger.warn("PiperQueue: Server", i, "ready, PID:", pid)
+                    logger.warn("PiperQueue: Server", i, "ready, PID:", pid, "piper_pid:", piper_pid)
                 else
                     all_ready = false
                 end
@@ -473,17 +550,34 @@ end
 Stop persistent Piper servers.
 --]]
 function PiperQueue:stopServers()
-    if not self._servers_running and not self._servers_starting then return end
+    -- No early return: even if we think servers aren't running, there may
+    -- be orphan processes from a previous crash.  Always kill by PID file
+    -- and killall to be safe.
     for i = 1, SERVER_COUNT do
         local server = self._servers and self._servers[i]
         if server and server.pid then
             os.execute(string.format("kill %d 2>/dev/null", server.pid))
         end
+        -- Also kill the piper process directly via its PID file
+        if server and server.piper_pid then
+            os.execute(string.format("kill %d 2>/dev/null", server.piper_pid))
+        end
         local fifo = SERVER_PREFIX .. i
-        os.execute(string.format('rm -f "%s" "%s.pid" "%s.sh" "%s.log"',
-            fifo, fifo, fifo, fifo))
+        -- Read piper_pid from file in case server table is stale
+        local ppf = io.open(fifo .. ".piper_pid", "r")
+        if ppf then
+            local ppid = ppf:read("*a"):gsub("%s+", "")
+            ppf:close()
+            if ppid ~= "" then
+                os.execute(string.format("kill -9 %s 2>/dev/null", ppid))
+            end
+        end
+        os.execute(string.format('rm -f "%s" "%s.pid" "%s.piper_pid" "%s.sh" "%s.log"',
+            fifo, fifo, fifo, fifo, fifo))
     end
     os.execute("killall -9 piper 2>/dev/null")
+    -- Kill wrapper shells that may be orphaned (reparented to init)
+    os.execute("pkill -9 -f 'piper_server_.*\\.sh' 2>/dev/null")
     self._servers = {}
     self._servers_running = false
     self._servers_starting = false
@@ -955,14 +1049,24 @@ end
 -- ── Cleanup ──────────────────────────────────────────────────────────
 
 --[[--
-Kill per-process piper instances (not persistent servers).
+Kill orphan piper processes.
+When servers are running, only kills per-process piper instances
+(those not managed by persistent servers) by targeting the specific
+nice-wrapped piper command pattern.  When servers are NOT running,
+kills all piper processes unconditionally.
 --]]
 function PiperQueue:killOrphanProcesses()
     if self._servers_running then
+        -- Servers are managed — don't kill them.
+        -- Per-process fallback piper instances are unlikely when servers
+        -- are active, but if any exist they'll die naturally when their
+        -- output pipe is consumed.  No action needed.
         logger.dbg("PiperQueue: Servers active, skipping killall")
     else
         os.execute("killall -9 piper 2>/dev/null")
-        logger.dbg("PiperQueue: Killed all piper processes")
+        -- Also kill server wrapper shells that might be orphaned
+        os.execute("pkill -9 -f 'piper_server_.*\\.sh' 2>/dev/null")
+        logger.dbg("PiperQueue: Killed all piper processes + wrapper shells")
     end
 end
 
