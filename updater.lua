@@ -275,6 +275,16 @@ function Updater._performUpdate(plugin, release)
     end
 
     logger.warn("Updater: successfully installed v" .. release.version)
+    
+    -- Ensure latest release version is written in _meta.lua
+    local meta_lua = _dir .. "_meta.lua"
+    local f = io.open(meta_lua, "r")
+    local content = f:read("*a")
+    f:close()
+    content = content:gsub('version%s*=%s*".-"', 'version = "' .. release.version .. '"')
+    f = io.open(meta_lua, "w")
+    f:write(content)
+    f:close()
 
     UIManager:show(ConfirmBox:new{
         text = T(_("Updated to v%1.\n\nRestart KOReader to apply the update."), release.version),
