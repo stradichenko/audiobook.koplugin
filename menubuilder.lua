@@ -439,7 +439,11 @@ function MenuBuilder.buildPitchMenu(plugin)
 end
 
 function MenuBuilder.buildVolumeMenu(plugin)
-    local volumes = {0.25, 0.50, 0.75, 1.0}
+    -- Perceptually spaced (roughly 3dB per step): linear amplitude percentage
+    -- maps badly onto loudness, so the choices cluster at the quiet end where
+    -- a given percentage change is most audible.
+    -- Keep in sync with VOLUME_STEPS in synccontroller.lua (the bar's V-/V+).
+    local volumes = {0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.50, 0.70, 1.0}
     local menu = {}
     for _i, v in ipairs(volumes) do
         table.insert(menu, {
@@ -450,6 +454,9 @@ function MenuBuilder.buildVolumeMenu(plugin)
             callback = function()
                 plugin:setSetting("speech_volume", v)
                 plugin.tts_engine:setVolume(v)
+                -- Invalidate the prefetched next sentence (synthesized at the
+                -- old volume) so the change is heard on the next sentence.
+                pcall(plugin.tts_engine._cleanPrefetch, plugin.tts_engine)
             end,
         })
     end

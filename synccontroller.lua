@@ -1255,6 +1255,75 @@ end
 --[[--
 Show the playback control bar.
 --]]
+-- Perceptually spaced volume steps (roughly 3dB apart at the quiet end).
+-- Keep in sync with the volume table in MenuBuilder.buildVolumeMenu.
+local VOLUME_STEPS = {0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.18, 0.25, 0.35, 0.50, 0.70, 1.0}
+
+-- Speech-rate steps for the bar's S-/S+ buttons.  Finer around 1.0, where
+-- small changes are most noticeable.
+local SPEED_STEPS = {0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0}
+
+--[[--
+Find the index of the entry in `steps` closest to `value`.
+Settings may hold a value that is not exactly on a step (set by an older
+version, or by the menu), so snap to the nearest one before stepping.
+--]]
+local function nearestStepIndex(steps, value)
+    local idx, best = 1, math.huge
+    for i, v in ipairs(steps) do
+        local d = math.abs(v - value)
+        if d < best then best, idx = d, i end
+    end
+    return idx
+end
+
+--[[--
+Step the speech volume up (+1) or down (-1) through VOLUME_STEPS.
+Persists the setting, updates the engine, and flashes the new value in the
+bar's text row for immediate feedback.
+@param direction number +1 to raise, -1 to lower
+--]]
+function SyncController:stepVolume(direction)
+    local cur = (self.plugin and self.plugin:getSetting("speech_volume", 1.0)) or 1.0
+    local idx = nearestStepIndex(VOLUME_STEPS, cur) + direction
+    idx = math.max(1, math.min(#VOLUME_STEPS, idx))
+    local vol = VOLUME_STEPS[idx]
+    if self.plugin then self.plugin:setSetting("speech_volume", vol) end
+    if self.tts_engine then
+        self.tts_engine:setVolume(vol)
+        -- Drop the already-synthesized next sentence: it was rendered at the
+        -- OLD volume (prefetch runs while the current sentence plays), so
+        -- without this the change is only heard two or more sentences later.
+        -- Costs one synth of latency, once.
+        pcall(self.tts_engine._cleanPrefetch, self.tts_engine)
+    end
+    logger.dbg("SyncController: volume ->", vol)
+    if self.playback_bar and self.playback_bar.updateCurrentWord then
+        self.playback_bar:updateCurrentWord(T(_("Volume %1%"), math.floor(vol * 100 + 0.5)))
+    end
+end
+
+--[[--
+Step the speech rate up (+1) or down (-1) through SPEED_STEPS.
+Same shape as stepVolume.
+@param direction number +1 to speed up, -1 to slow down
+--]]
+function SyncController:stepSpeed(direction)
+    local cur = (self.plugin and self.plugin:getSetting("speech_rate", 1.0)) or 1.0
+    local idx = nearestStepIndex(SPEED_STEPS, cur) + direction
+    idx = math.max(1, math.min(#SPEED_STEPS, idx))
+    local rate = SPEED_STEPS[idx]
+    if self.plugin then self.plugin:setSetting("speech_rate", rate) end
+    if self.tts_engine then
+        self.tts_engine:setRate(rate)
+        pcall(self.tts_engine._cleanPrefetch, self.tts_engine)
+    end
+    logger.dbg("SyncController: speed ->", rate)
+    if self.playback_bar and self.playback_bar.updateCurrentWord then
+        self.playback_bar:updateCurrentWord(T(_("Speed %1x"), string.format("%.2f", rate)))
+    end
+end
+
 --[[--
 Reserve the playback bar's height in the document's bottom margin so the bar
 never covers book text: the page reflows to end just above the bar.
@@ -1339,6 +1408,18 @@ function SyncController:showPlaybackBar()
         end,
         on_realign = function()
             self:realignToReadingPage()
+        end,
+        on_volume_down = function()
+            self:stepVolume(-1)
+        end,
+        on_volume_up = function()
+            self:stepVolume(1)
+        end,
+        on_speed_down = function()
+            self:stepSpeed(-1)
+        end,
+        on_speed_up = function()
+            self:stepSpeed(1)
         end,
     }
 

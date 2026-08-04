@@ -46,6 +46,10 @@ local PlaybackBar = InputContainer:extend{
     on_forward = nil,
     on_close = nil,
     on_realign = nil,
+    on_volume_down = nil,
+    on_volume_up = nil,
+    on_speed_down = nil,
+    on_speed_up = nil,
     -- Scrubber mode for audio file playback
     scrubber_mode = false,
     on_seek = nil,
@@ -64,12 +68,26 @@ function PlaybackBar:init()
     self:setupUI()
 end
 
+-- Buttons in the row: rewind, play/pause, forward, S-, S+, V-, V+, realign, close.
+local BUTTON_COUNT = 9
+
 function PlaybackBar:setupUI()
-    local button_width = Screen:scaleBySize(60)
     local button_height = Screen:scaleBySize(40)
     local button_font_size = 20
-    local spacing = Size.padding.large
-    
+
+    -- Size the buttons to the screen instead of hardcoding a width: the row
+    -- now holds 9 buttons (S-/S+ and V-/V+ were added), which overflows a
+    -- narrow screen at the old fixed 60px.  Fit them to the space actually
+    -- available and cap at the original width on roomy screens.
+    local row_spacing = Size.padding.default
+    local row_inset = Size.padding.large * 2
+    local avail = self.width - row_inset - row_spacing * (BUTTON_COUNT - 1)
+    local button_width = math.floor(avail / BUTTON_COUNT)
+    local max_button_width = Screen:scaleBySize(60)
+    if button_width > max_button_width then button_width = max_button_width end
+    local min_button_width = Screen:scaleBySize(28)
+    if button_width < min_button_width then button_width = min_button_width end
+
     -- Rewind button (previous paragraph)
     self.rewind_button = Button:new{
         text = "⏮",
@@ -132,6 +150,60 @@ function PlaybackBar:setupUI()
         show_parent = self,
     }
 
+    -- Speed down / up buttons (step the speech rate).
+    -- Plain ASCII-ish labels on purpose: KOReader's bundled fonts have no
+    -- reliable glyphs for the tempo/speaker symbols one would reach for first.
+    self.speed_down_button = Button:new{
+        text = "S−",
+        width = button_width,
+        max_width = button_width,
+        height = button_height,
+        text_font_size = button_font_size,
+        callback = function()
+            if self.on_speed_down then self.on_speed_down() end
+        end,
+        bordersize = Size.border.button,
+        show_parent = self,
+    }
+    self.speed_up_button = Button:new{
+        text = "S+",
+        width = button_width,
+        max_width = button_width,
+        height = button_height,
+        text_font_size = button_font_size,
+        callback = function()
+            if self.on_speed_up then self.on_speed_up() end
+        end,
+        bordersize = Size.border.button,
+        show_parent = self,
+    }
+
+    -- Volume down / up buttons (step the speech volume)
+    self.vol_down_button = Button:new{
+        text = "V−",
+        width = button_width,
+        max_width = button_width,
+        height = button_height,
+        text_font_size = button_font_size,
+        callback = function()
+            if self.on_volume_down then self.on_volume_down() end
+        end,
+        bordersize = Size.border.button,
+        show_parent = self,
+    }
+    self.vol_up_button = Button:new{
+        text = "V+",
+        width = button_width,
+        max_width = button_width,
+        height = button_height,
+        text_font_size = button_font_size,
+        callback = function()
+            if self.on_volume_up then self.on_volume_up() end
+        end,
+        bordersize = Size.border.button,
+        show_parent = self,
+    }
+
     -- Close button
     self.close_button = Button:new{
         text = "✕",
@@ -154,7 +226,7 @@ function PlaybackBar:setupUI()
     self.word_display = TextWidget:new{
         text = display_text,
         face = Font:getFace("cfont", 16),
-        max_width = self.width - button_width * 5 - spacing * 7,
+        max_width = self.width - row_inset,
         truncate_left = true,
     }
     
@@ -180,17 +252,26 @@ function PlaybackBar:setupUI()
     self._scrubber_dragging = false
     self._scrubber_drag_pct = nil
     
-    -- Button row
+    -- Button row.  Gaps are Size.padding.default rather than .large: with 9
+    -- buttons the wider spacing pushed the row past the edge of a 6" screen.
     local button_row = HorizontalGroup:new{
         align = "center",
-        self.realign_button,
-        HorizontalSpan:new{ width = spacing * 2 },
         self.rewind_button,
-        HorizontalSpan:new{ width = spacing },
+        HorizontalSpan:new{ width = row_spacing },
         self.play_pause_button,
-        HorizontalSpan:new{ width = spacing },
+        HorizontalSpan:new{ width = row_spacing },
         self.forward_button,
-        HorizontalSpan:new{ width = spacing * 2 },
+        HorizontalSpan:new{ width = row_spacing },
+        self.speed_down_button,
+        HorizontalSpan:new{ width = row_spacing },
+        self.speed_up_button,
+        HorizontalSpan:new{ width = row_spacing },
+        self.vol_down_button,
+        HorizontalSpan:new{ width = row_spacing },
+        self.vol_up_button,
+        HorizontalSpan:new{ width = row_spacing },
+        self.realign_button,
+        HorizontalSpan:new{ width = row_spacing },
         self.close_button,
     }
     
