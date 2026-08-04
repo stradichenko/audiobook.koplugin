@@ -54,6 +54,11 @@ local PlaybackBar = InputContainer:extend{
     scrubber_mode = false,
     on_seek = nil,
     current_time_str = "",
+    -- Show the progress row during TTS read-along.  Defaults to true (the
+    -- long-standing behaviour); the user can turn it off to make the bar one
+    -- row shorter, which on a rolling document is one more line of book text.
+    -- Ignored in scrubber mode, where the bar is an interactive seek control.
+    show_progress = true,
 }
 
 function PlaybackBar:init()
@@ -277,6 +282,14 @@ function PlaybackBar:setupUI()
     
     -- Main layout — generous spacing so progress bar and buttons
     -- are clearly separated from each other and the bottom edge.
+    --
+    -- The progress row is included in scrubber mode (where it is an
+    -- interactive seek control) and, during TTS read-along, only when the
+    -- user leaves show_progress on.  In read-along the sentence highlight
+    -- already shows position, so dropping the row buys back a line of book
+    -- text.  The widget itself always exists — the scrubber code and
+    -- updateProgress() reference it — it is simply not in the visible tree.
+    self._progress_shown = self.scrubber_mode or self.show_progress ~= false
     local content = VerticalGroup:new{
         align = "center",
         VerticalSpan:new{ width = Size.padding.small },
@@ -284,18 +297,20 @@ function PlaybackBar:setupUI()
             dimen = Geom:new{ w = self.width, h = self.word_display:getSize().h },
             self.word_display,
         },
-        VerticalSpan:new{ width = Size.padding.default },
-        CenterContainer:new{
+    }
+    if self._progress_shown then
+        table.insert(content, VerticalSpan:new{ width = Size.padding.default })
+        table.insert(content, CenterContainer:new{
             dimen = Geom:new{ w = self.width, h = self.progress_bar:getSize().h },
             self.progress_bar,
-        },
-        VerticalSpan:new{ width = Size.padding.large },
-        CenterContainer:new{
-            dimen = Geom:new{ w = self.width, h = button_height },
-            button_row,
-        },
-        VerticalSpan:new{ width = Size.padding.fullscreen },
-    }
+        })
+    end
+    table.insert(content, VerticalSpan:new{ width = Size.padding.large })
+    table.insert(content, CenterContainer:new{
+        dimen = Geom:new{ w = self.width, h = button_height },
+        button_row,
+    })
+    table.insert(content, VerticalSpan:new{ width = Size.padding.fullscreen })
     
     -- Frame with background
     self[1] = FrameContainer:new{
@@ -390,9 +405,14 @@ function PlaybackBar:updateProgress(progress)
     if progress ~= self.progress then
         self.progress = progress
         self.progress_bar:setPercentage(progress / 100)
-        UIManager:setDirty(self, function()
-            return "ui", self.progress_bar.dimen
-        end)
+        -- When the progress row is not in the visible tree the widget has
+        -- never been painted, so it has no dimen to refresh (and nothing to
+        -- show).  Keep the value up to date but skip the repaint.
+        if self._progress_shown then
+            UIManager:setDirty(self, function()
+                return "ui", self.progress_bar.dimen
+            end)
+        end
     end
 end
 

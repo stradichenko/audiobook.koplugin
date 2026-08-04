@@ -1390,6 +1390,8 @@ function SyncController:showPlaybackBar()
 
     self.playback_bar = PlaybackBar:new{
         sync_controller = self,
+        show_progress = not (self.plugin
+            and self.plugin:getSetting("hide_tts_progress_bar", false)),
         on_play_pause = function()
             if self:isPlaying() then
                 self:pause()

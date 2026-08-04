@@ -717,6 +717,25 @@ function Audiobook:addToMainMenu(menu_items)
                         help_text = _("Experimental: when enabled, the playback control bar disappears while TTS is playing so the bottom of the page is fully visible for read-along. Pause playback (via tap-to-pause overlay or BT headset button) to bring the bar back."),
                     },
                     {
+                        text = _("Hide progress bar during read-along"),
+                        checked_func = function()
+                            return self:getSetting("hide_tts_progress_bar", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("hide_tts_progress_bar", false)
+                            -- Rebuild the bar so the change is visible right
+                            -- away rather than at the next start.
+                            local sc = self.sync_controller
+                            if sc and sc.playback_bar then
+                                sc:showPlaybackBar()
+                                if sc.playback_bar and sc.isPlaying then
+                                    sc.playback_bar:updatePlayState(sc:isPlaying())
+                                end
+                            end
+                        end,
+                        help_text = _("When enabled, the progress bar row is left out of the control bar during TTS read-along, making the bar one row shorter and leaving more of the page visible. The sentence highlight already shows how far along the page you are. The progress bar is always shown for audiobook playback, where it doubles as the seek control."),
+                    },
+                    {
                         text_func = function()
                             local styles = {
                                 background = _("Background"),
