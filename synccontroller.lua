@@ -128,6 +128,50 @@ function SyncController:start(text)
         "mode=", Screen:getScreenMode(),
         "rotation=", Screen.getRotationMode and Screen:getRotationMode() or "?")
 
+    -- Create the bar BEFORE parsing: showing it reserves the bar's height in
+    -- the page's bottom margin, which reflows/repaginates the page (fewer
+    -- lines per page).  That repagination happens asynchronously in crengine,
+    -- so capturing the page text on the very next line reads a transitional
+    -- layout — sometimes the previous page.  Worse, the captured text then
+    -- disagrees with where the view finally settles, so advanceToNextPage
+    -- turns one page too far and skips the page on screen.  Fix: after a
+    -- FRESH reservation, defer the text capture + read-start until the reflow
+    -- settles (the same scheduleIn pattern advanceToNextPage uses).  On page
+    -- advances the bar already exists / the margin is already reserved, so
+    -- there is no reflow, no defer, and prefetched text stays valid.
+    if not self.playback_bar then
+        local was_reserved = self._bar_space_reserved
+        self:showPlaybackBar()
+        if self._bar_space_reserved and not was_reserved
+           and self.plugin and self.plugin.getCurrentPageText then
+            local controller = self
+            UIManager:scheduleIn(0.25, function()
+                if controller.state ~= controller.STATE.LOADING then
+                    logger.dbg("SyncController: start deferral aborted, state=", controller.state)
+                    return
+                end
+                local fresh = controller.plugin:getCurrentPageText()
+                if fresh and fresh ~= "" then
+                    logger.dbg("SyncController: re-fetched page text after margin reflow settle (",
+                        #text, "->", #fresh, "chars)")
+                    text = fresh
+                end
+                controller:_beginReading(text)
+            end)
+            return
+        end
+    end
+
+    self:_beginReading(text)
+end
+
+--[[--
+Parse the (settled) page text and begin sentence playback.  Split out of
+start() so the initial margin reflow can settle before we capture and read
+the page (see the deferral in start()).
+@param text string The text to read
+--]]
+function SyncController:_beginReading(text)
     -- Parse the full text into sentences and words
     self.parsed_data = self.text_parser:parse(text)
 
@@ -1211,6 +1255,62 @@ end
 --[[--
 Show the playback control bar.
 --]]
+--[[--
+Reserve the playback bar's height in the document's bottom margin so the bar
+never covers book text: the page reflows to end just above the bar.
+
+We deliberately bypass ReaderTypeset's SetPageBottomMargin event — with "sync
+top/bottom margins" enabled it would bump the TOP margin too, and it persists
+to the user's configurable settings.  Instead we compute the same scaled values
+ReaderTypeset:onSetPageMargins would and call document:setPageMargins directly:
+nothing is persisted, and restoring is just re-sending the stock SetPageMargins
+event with the user's own values.  Reflow on a slow e-ink CPU takes a moment,
+which is acceptable at TTS start/stop (and is why start() defers, see above).
+
+Rolling (CreDocument/EPUB) only — paged documents have fixed layout.
+--]]
+function SyncController:_reserveBarSpace()
+    if self._bar_space_reserved then return end
+    if not (self.plugin and self.plugin.ui and self.plugin.ui.rolling) then return end
+    local ui = self.plugin.ui
+    local tp = ui.typeset
+    if not (tp and tp.unscaled_margins and ui.document and ui.document.setPageMargins) then return end
+    if not (self.playback_bar and self.playback_bar.dimen) then return end
+    local bar_h = self.playback_bar.dimen.h
+    if not bar_h or bar_h <= 0 then return end
+    local Screen = require("device").screen
+    local m = tp.unscaled_margins
+    -- Replicate ReaderTypeset:onSetPageMargins scaling (including footer height)
+    local bottom = Screen:scaleBySize(m[4])
+    if ui.view and ui.view.footer and not ui.view.footer.reclaim_height then
+        bottom = bottom + ui.view.footer:getHeight()
+    end
+    local ok = pcall(ui.document.setPageMargins, ui.document,
+        Screen:scaleBySize(m[1]), Screen:scaleBySize(m[2]),
+        Screen:scaleBySize(m[3]), bottom + bar_h)
+    if ok then
+        self._bar_space_reserved = true
+        ui:handleEvent(Event:new("UpdatePos"))
+        logger.dbg("SyncController: reserved", bar_h, "px bottom margin for playback bar")
+    end
+end
+
+--[[--
+Give the reserved bottom-margin space back to the page.  Uses the stock
+SetPageMargins event so the user's own margins (and repaint) are restored.
+--]]
+function SyncController:_releaseBarSpace()
+    if not self._bar_space_reserved then return end
+    self._bar_space_reserved = false
+    if not (self.plugin and self.plugin.ui) then return end
+    local ui = self.plugin.ui
+    local tp = ui.typeset
+    if tp and tp.unscaled_margins then
+        ui:handleEvent(Event:new("SetPageMargins", tp.unscaled_margins))
+        logger.dbg("SyncController: restored user page margins")
+    end
+end
+
 function SyncController:showPlaybackBar()
     if self.playback_bar then
         self:hidePlaybackBar()
@@ -1243,6 +1343,9 @@ function SyncController:showPlaybackBar()
     }
 
     self.playback_bar:show()
+
+    -- Reflow the page so its text ends above the bar (nothing covered).
+    self:_reserveBarSpace()
 
     -- Force an immediate UI refresh so the bar is painted on the very next
     -- cycle, even if another (toast) notification is still visible.
@@ -1291,6 +1394,8 @@ function SyncController:hidePlaybackBar()
         self.playback_bar:hide()
         self.playback_bar = nil
     end
+    -- Give the reserved bottom-margin space back to the page.
+    self:_releaseBarSpace()
     -- Force full screen refresh on e-ink to cleanly remove bar and highlight artifacts
     UIManager:setDirty("all", "full")
 end
