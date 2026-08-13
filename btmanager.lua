@@ -45,6 +45,7 @@ local lipc_bt_service = nil  -- "com.lab126.btfd" or similar
 local lipc_bt_prop = nil     -- readable property ("btEnabled", "BTstate", etc.)
 local lipc_bt_write_prop = nil  -- writable property (may differ from read prop)
 local lipc_bt_write_is_str = false -- true if write prop takes string "true"/"false"
+local lipc_bt_is_audible_available = false -- true if Audible is available
 
 --- Detect which Bluetooth stack this device uses.
 -- Called lazily from dbus_cmd() on first BT operation; a no-op
@@ -69,6 +70,12 @@ local function detectStack()
         -- KAF (Kindle Application Framework) with wifiBTProp or btPowerState
         -- is the correct API for newer firmware.
         -- Also try KAF file-based: /var/local/kaf/bt/power
+        -- isAudibleAvailable determines which value format BTenable expects.
+        -- Kindles without Audible use "1:1"/"0:1" instead of "true"/"false" or "1"/"0".
+        local h = io.popen("lipc-get-prop -s com.lab126.btfd isAudibleAvailable 2>/dev/null")
+        local result = h and h:read("*a") or ""
+        if h then h:close() end
+        lipc_bt_is_audible_available = tonumber(result) == 1
         local lh = io.popen("which lipc-get-prop 2>/dev/null")
         local lr = lh and lh:read("*a") or ""
         if lh then lh:close() end
@@ -535,6 +542,8 @@ end
 -- For BlueZ devices, starts the bluetoothd daemon and resets the HCI
 -- adapter first (required on Kobo Libra 2 and similar).
 -- For Kindle, uses lipc to enable BT through Amazon firmware.
+-- On Kindles without isAudibleAvailable, btfd/BTenable uses
+-- "1:1" to enable and "0:1" to disable Bluetooth.
 -- @treturn bool success
 function BTManager:powerOn()
     detectStack()
@@ -552,9 +561,15 @@ function BTManager:powerOn()
                 end
             else
                 -- Regular LIPC property-based control
-                local val = lipc_bt_write_is_str and "true" or "1"
-                os.execute("lipc-set-prop " .. lipc_bt_service .. " " .. lipc_bt_write_prop .. " " .. val .. " 2>/dev/null")
-                os.execute("sleep 2")
+                if lipc_bt_is_audible_available then
+                    local val = lipc_bt_write_is_str and "true" or "1"
+                    os.execute("lipc-set-prop " .. lipc_bt_service .. " " .. lipc_bt_write_prop .. " " .. val .. " 2>/dev/null")
+                    os.execute("sleep 2")
+                else
+                    -- btfd interface used by Kindles without isAudibleAvailable
+                    os.execute("lipc-set-prop -s com.lab126.btfd BTenable 1:1 2>/dev/null")
+                    os.execute("sleep 2")
+                end
             end
             local powered = self:isPowered()
             logger.warn("BTManager: Kindle powerOn result:", powered,
@@ -744,9 +759,15 @@ function BTManager:powerOff()
                     os.execute("sleep 1")
                 end
             else
-                local val = lipc_bt_write_is_str and "false" or "0"
-                os.execute("lipc-set-prop " .. lipc_bt_service .. " " .. lipc_bt_write_prop .. " " .. val .. " 2>/dev/null")
-                os.execute("sleep 1")
+                if lipc_bt_is_audible_available then
+                    local val = lipc_bt_write_is_str and "false" or "0"
+                    os.execute("lipc-set-prop " .. lipc_bt_service .. " " .. lipc_bt_write_prop .. " " .. val .. " 2>/dev/null")
+                    os.execute("sleep 1")
+                else
+                    -- btfd interface used by Kindles without isAudibleAvailable
+                    os.execute("lipc-set-prop -s com.lab126.btfd BTenable 0:1 2>/dev/null")
+                    os.execute("sleep 1")
+                end
             end
         end
         return true
