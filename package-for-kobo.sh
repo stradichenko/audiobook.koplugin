@@ -47,7 +47,7 @@ rm -rf "$BUNDLE_DIR"
 mkdir -p "$ESPEAK_DEST/bin" "$ESPEAK_DEST/lib" "$ESPEAK_DEST/share/espeak-ng-data/lang/gmw" "$ESPEAK_DEST/share/espeak-ng-data/voices"
 
 # Plugin Lua files first
-for f in absbrowse.lua abscache.lua absclient.lua abssync.lua androidtts.lua audiobookplayer.lua benchmarkrunner.lua btmanager.lua btmediacontrol.lua btui.lua bugreport.lua downloader.lua epubmediaoverlay.lua highlightmanager.lua m4bparser.lua main.lua mediaaligner.lua mediaengine.lua mediasync.lua menubuilder.lua _meta.lua piperqueue.lua playbackbar.lua sessionrecorder.lua synccontroller.lua textparser.lua transcoder.lua ttsengine.lua updater.lua utils.lua wavutils.lua; do
+for f in absbrowse.lua abscache.lua absclient.lua abssync.lua androidmediasession.lua androidtts.lua audiobookplayer.lua benchmarkrunner.lua btmanager.lua btmediacontrol.lua btui.lua bugreport.lua debuglog.lua downloader.lua epubmediaoverlay.lua highlightmanager.lua m4bparser.lua main.lua mediaaligner.lua mediaengine.lua mediasync.lua menubuilder.lua _meta.lua piperqueue.lua playbackbar.lua sessionrecorder.lua synccontroller.lua textparser.lua transcoder.lua ttsengine.lua updater.lua utils.lua wavutils.lua; do
     if [ -f "$SCRIPT_DIR/$f" ]; then
         cp "$SCRIPT_DIR/$f" "$PLUGIN_DEST/"
     fi
@@ -69,15 +69,17 @@ fi
 
 # Android TTS helper (Java source + build script; .dex built in CI or by user)
 mkdir -p "$PLUGIN_DEST/android"
-for f in TtsHelper.java build-dex.sh; do
+for f in TtsHelper.java MediaSessionHelper.java build-dex.sh; do
     if [ -f "$SCRIPT_DIR/android/$f" ]; then
         cp "$SCRIPT_DIR/android/$f" "$PLUGIN_DEST/android/"
     fi
 done
-# Include pre-built .dex if available (CI builds it)
-if [ -f "$SCRIPT_DIR/android/tts_helper.dex" ]; then
-    cp "$SCRIPT_DIR/android/tts_helper.dex" "$PLUGIN_DEST/android/"
-fi
+# Include pre-built .dex if available (CI builds them)
+for f in tts_helper.dex media_session_helper.dex; do
+    if [ -f "$SCRIPT_DIR/android/$f" ]; then
+        cp "$SCRIPT_DIR/android/$f" "$PLUGIN_DEST/android/"
+    fi
+done
 
 # Kindle GStreamer WAV player (pre-compiled ARM binary for Cat 2 Kindles)
 if [ -f "$SCRIPT_DIR/kindle/gst-play" ]; then

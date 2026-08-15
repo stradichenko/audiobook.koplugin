@@ -877,25 +877,34 @@ function MediaSync:pause(auto)
     if self.state ~= self.STATE.PLAYING then return end
     -- Snapshot position before flipping state so a later STOPPED→play restart
     -- (or Android seek-restart) continues from here, not the original start.
+    -- Android only: the other backends compute position as elapsed play time
+    -- plus _seek_offset, so rewriting _seek_offset here would double-count
+    -- the pre-pause elapsed time after resume.
+    local is_android = self.media_engine
+        and self.media_engine.backend == self.media_engine.BACKENDS.ANDROID
     local pos = 0
     if self.media_engine then
         pcall(function() pos = self.media_engine:getPosition() or 0 end)
         if not pos or pos < 0 then pos = 0 end
-        self.media_engine._seek_offset = pos
-        self.media_engine._paused_position = pos
+        if is_android then
+            self.media_engine._seek_offset = pos
+            self.media_engine._paused_position = pos
+        end
     end
     self.state = self.STATE.PAUSED
     if self.media_engine then
         pcall(function() self.media_engine:pause() end)
-        -- Re-read after engine pause (Android re-anchors to MediaPlayer).
-        pcall(function()
-            local p2 = self.media_engine:getPosition()
-            if p2 and p2 >= 0 then
-                pos = p2
-                self.media_engine._seek_offset = pos
-                self.media_engine._paused_position = pos
-            end
-        end)
+        if is_android then
+            -- Re-read after engine pause (Android re-anchors to MediaPlayer).
+            pcall(function()
+                local p2 = self.media_engine:getPosition()
+                if p2 and p2 >= 0 then
+                    pos = p2
+                    self.media_engine._seek_offset = pos
+                    self.media_engine._paused_position = pos
+                end
+            end)
+        end
     end
     -- Pin the SMIL highlight to the pause time immediately.
     pcall(function() self:_updateHighlightAtTime(pos) end)
@@ -915,12 +924,17 @@ end
 function MediaSync:resume(auto)
     if self.state ~= self.STATE.PAUSED then return end
     -- Resume exactly on the SMIL timeline pause mark before starting audio.
+    -- The _seek_offset/_paused_position writes are Android only for the same
+    -- reason as in pause(): non-Android backends derive position from
+    -- elapsed play time plus an unchanged _seek_offset.
+    local is_android = self.media_engine
+        and self.media_engine.backend == self.media_engine.BACKENDS.ANDROID
     local resume_pos = 0
     if self.media_engine then
         resume_pos = self.media_engine._paused_position
             or self.media_engine._seek_offset
             or 0
-        if resume_pos and resume_pos > 0 then
+        if is_android and resume_pos and resume_pos > 0 then
             self.media_engine._seek_offset = resume_pos
             self.media_engine._paused_position = resume_pos
         end

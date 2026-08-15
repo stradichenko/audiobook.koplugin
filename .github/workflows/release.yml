@@ -60,7 +60,7 @@ jobs:
           # Build the .dex
           cd android && bash build-dex.sh
           # Copy into the bundle
-          cp tts_helper.dex ../kobo-tts-bundle/audiobook.koplugin/android/
+          cp tts_helper.dex media_session_helper.dex ../kobo-tts-bundle/audiobook.koplugin/android/
 
       - name: Verify bundle
         run: |
@@ -139,7 +139,7 @@ jobs:
             - Bundled kindle-gst-play (GStreamer WAV player for Cat 2 Kindles)
             - Bundled kindle-gst-play-native (KinAMP-parity fallback for audio-less PW4-class Kindles)
             - Bundled wav-play (ALSA player for PocketBook and other devices without aplay)
-            - Android TTS helper (pre-built tts_helper.dex)
+            - Android TTS helper and MediaSession helpers (pre-built tts_helper.dex, media_session_helper.dex)
 
             ### Install paths
             | Platform | Path |

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 #
-# Build tts_helper.dex from TtsHelper.java using the Android SDK.
+# Build the Android helper .dex files from their Java sources using the
+# Android SDK:
+#   - tts_helper.dex from TtsHelper.java (Android TTS)
+#   - media_session_helper.dex from MediaSessionHelper.java (AVRCP/MediaSession)
 #
 # Prerequisites:
 #   - ANDROID_HOME (or ANDROID_SDK_ROOT) set to the Android SDK path
@@ -12,6 +15,7 @@
 #
 # Output:
 #   android/tts_helper.dex
+#   android/media_session_helper.dex
 #
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -43,20 +47,25 @@ echo "Build tools: $BT_DIR"
 echo "Platform:    $PLATFORM"
 echo "d8:          $D8"
 
-# Compile .java -> .class
-echo "Compiling TtsHelper.java..."
+# Compile .java -> .class (both helpers share one package)
+echo "Compiling TtsHelper.java and MediaSessionHelper.java..."
 mkdir -p build
 javac -source 8 -target 8 \
     -classpath "$ANDROID_JAR" \
     -d build \
-    TtsHelper.java
+    TtsHelper.java MediaSessionHelper.java
 
-# Convert .class -> .dex (include inner/anonymous classes like TtsHelper$1)
-echo "Dexing..."
-"$D8" --min-api 21 --output . build/org/koreader/plugin/audiobook/TtsHelper*.class
-
-# d8 outputs classes.dex; rename to our expected name
-mv classes.dex tts_helper.dex
+# Convert .class -> .dex, one dex per helper (each plugin module loads its
+# own dex via DexClassLoader).  Include inner/anonymous classes like
+# TtsHelper$1 / MediaSessionHelper$1.
+for PAIR in "TtsHelper tts_helper" "MediaSessionHelper media_session_helper"; do
+    set -- $PAIR
+    JAVA_CLASS="$1"
+    DEX_NAME="$2"
+    echo "Dexing $JAVA_CLASS..."
+    "$D8" --min-api 21 --output . "build/org/koreader/plugin/audiobook/${JAVA_CLASS}"*.class
+    # d8 outputs classes.dex; rename to our expected name
+    mv classes.dex "$DEX_NAME.dex"
+    echo "Created $DEX_NAME.dex ($(wc -c < "$DEX_NAME.dex") bytes)"
+done
 rm -rf build
-
-echo "Created tts_helper.dex ($(wc -c < tts_helper.dex) bytes)"
