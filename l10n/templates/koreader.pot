@@ -2731,3 +2731,20 @@ msgstr ""
 msgid "Later"
 msgstr ""
 
+
+#: synccontroller.lua:2225
+msgid ""
+"Piper neural TTS could not keep up on this device: %1.\n"
+"\n"
+"Switching to espeak for the rest of this session. Piper will be tried again the next time you start playback. To keep espeak permanently, select it in:\n"
+"  Audiobook > Voice settings > TTS engine"
+msgstr ""
+
+#: synccontroller.lua:2208
+msgid "it still had not produced any audio after %1 espeak sentences"
+msgstr ""
+
+#: synccontroller.lua:2213
+msgid "it still had not produced any audio after %1 minutes of espeak fallback"
+msgstr ""
+
