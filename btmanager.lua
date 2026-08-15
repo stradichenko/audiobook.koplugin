@@ -45,6 +45,11 @@ local lipc_bt_service = nil  -- "com.lab126.btfd" or similar
 local lipc_bt_prop = nil     -- readable property ("btEnabled", "BTstate", etc.)
 local lipc_bt_write_prop = nil  -- writable property (may differ from read prop)
 local lipc_bt_write_is_str = false -- true if write prop takes string "true"/"false"
+-- com.lab126.btfd isAudibleAvailable probe result: 1 = Audible available,
+-- 0 = definitively unavailable, nil = unknown (probe failed or N/A).
+-- Kindles without Audible reject "true"/"false" and "1"/"0" for BTenable
+-- and require the "1:1"/"0:1" pair format instead (issue #2).
+local lipc_bt_audible_available = nil
 
 --- Detect which Bluetooth stack this device uses.
 -- Called lazily from dbus_cmd() on first BT operation; a no-op
@@ -115,6 +120,17 @@ local function detectStack()
                     end
                 end
                 if has_lipc then break end
+            end
+            if has_lipc then
+                -- Ask btfd whether Audible is available: its BTenable property
+                -- expects a different value format on Kindles without Audible.
+                -- nil means the probe failed, which is treated as unknown and
+                -- handled by the write-retry in powerOn()/powerOff().
+                local ah = io.popen("lipc-get-prop com.lab126.btfd isAudibleAvailable 2>/dev/null")
+                local ar = ah and ah:read("*a") or ""
+                if ah then ah:close() end
+                lipc_bt_audible_available = tonumber(ar:gsub("%s+$", ""))
+                logger.warn("BTManager: btfd isAudibleAvailable =", tostring(lipc_bt_audible_available))
             end
             if not has_lipc then
                 -- Try KAF file-based API as last resort on PW4/PW5.
@@ -551,10 +567,27 @@ function BTManager:powerOn()
                     os.execute("sleep 2")
                 end
             else
-                -- Regular LIPC property-based control
-                local val = lipc_bt_write_is_str and "true" or "1"
-                os.execute("lipc-set-prop " .. lipc_bt_service .. " " .. lipc_bt_write_prop .. " " .. val .. " 2>/dev/null")
-                os.execute("sleep 2")
+                -- Regular LIPC property-based control.  Kindles without
+                -- Audible support reject the usual values for BTenable and
+                -- require the "1:1" pair format instead (issue #2).  Use the
+                -- pair format when the device is definitively without
+                -- Audible, or as a retry when the standard write did not
+                -- take effect (probe failed or unexpected rejection).
+                local use_pair_format = (lipc_bt_audible_available == 0)
+                    and lipc_bt_write_prop == "BTenable"
+                if not use_pair_format then
+                    local val = lipc_bt_write_is_str and "true" or "1"
+                    os.execute("lipc-set-prop " .. lipc_bt_service .. " " .. lipc_bt_write_prop .. " " .. val .. " 2>/dev/null")
+                    os.execute("sleep 2")
+                    if not self:isPowered() then
+                        logger.warn("BTManager: standard BTenable write did not power on, retrying with btfd 1:1 format")
+                        use_pair_format = true
+                    end
+                end
+                if use_pair_format then
+                    os.execute("lipc-set-prop com.lab126.btfd BTenable 1:1 2>/dev/null")
+                    os.execute("sleep 2")
+                end
             end
             local powered = self:isPowered()
             logger.warn("BTManager: Kindle powerOn result:", powered,
@@ -744,9 +777,23 @@ function BTManager:powerOff()
                     os.execute("sleep 1")
                 end
             else
-                local val = lipc_bt_write_is_str and "false" or "0"
-                os.execute("lipc-set-prop " .. lipc_bt_service .. " " .. lipc_bt_write_prop .. " " .. val .. " 2>/dev/null")
-                os.execute("sleep 1")
+                -- Regular LIPC property-based control (see powerOn for the
+                -- non-Audible btfd "1:1"/"0:1" pair format, issue #2).
+                local use_pair_format = (lipc_bt_audible_available == 0)
+                    and lipc_bt_write_prop == "BTenable"
+                if not use_pair_format then
+                    local val = lipc_bt_write_is_str and "false" or "0"
+                    os.execute("lipc-set-prop " .. lipc_bt_service .. " " .. lipc_bt_write_prop .. " " .. val .. " 2>/dev/null")
+                    os.execute("sleep 1")
+                    if self:isPowered() then
+                        logger.warn("BTManager: standard BTenable write did not power off, retrying with btfd 0:1 format")
+                        use_pair_format = true
+                    end
+                end
+                if use_pair_format then
+                    os.execute("lipc-set-prop com.lab126.btfd BTenable 0:1 2>/dev/null")
+                    os.execute("sleep 1")
+                end
             end
         end
         return true
