@@ -144,6 +144,21 @@ local function _jpegDimensions(path)
     return nil, nil
 end
 
+function AudiobookPlayer:_isEink()
+    return Device.hasEinkScreen and Device:hasEinkScreen()
+end
+
+--- Sit above KOReader's footer when the user asked to keep it, or when the
+--- footer is a real page chrome (Overlap status bar off). Otherwise the mini
+--- player paints on top of the progress bar and e-ink ghosts a second bar.
+function AudiobookPlayer:_shouldSitAboveFooter()
+    if self.keep_reader_status_bars then return true end
+    local ui = self.ui_widget or (self.plugin and self.plugin.ui)
+    local view = ui and ui.view
+    if not (view and view.footer_visible and view.footer) then return false end
+    return not view.footer.reclaim_height
+end
+
 function AudiobookPlayer:init()
     self.width = Screen:getWidth()
     self.height = Screen:getHeight()
@@ -152,7 +167,7 @@ function AudiobookPlayer:init()
     -- Do not claim the whole screen / footer while the mini player is up —
     -- otherwise ReaderFooter may skip updates ("lost" status bar).
     self.covers_fullscreen = false
-    self.covers_footer = not self.keep_reader_status_bars
+    self.covers_footer = not self:_shouldSitAboveFooter()
     self._return_hint_active = false
     self._rotation_mode = Screen:getRotationMode()
     self:setupUI()
@@ -768,8 +783,8 @@ end
 --- MediaSync also reflows page margins by this chrome height + mini bar so
 --- book text never renders underneath the player.
 function AudiobookPlayer:_statusBarInset()
-    if not self.keep_reader_status_bars then return 0 end
-    local ui = self.plugin and self.plugin.ui
+    if not self:_shouldSitAboveFooter() then return 0 end
+    local ui = self.ui_widget or (self.plugin and self.plugin.ui)
     local view = ui and ui.view
     if not view or not view.footer_visible or not view.footer then return 0 end
     local ok, h = pcall(function() return view.footer:getHeight() end)
@@ -790,7 +805,7 @@ end
 function AudiobookPlayer:_applyMinimizedGeometry()
     self._minimized = true
     self.covers_fullscreen = false
-    self.covers_footer = not self.keep_reader_status_bars
+    self.covers_footer = not self:_shouldSitAboveFooter()
     self.dimen.h = self._mini_height
     self.dimen.y = self:_miniBarY()
 end
@@ -905,18 +920,53 @@ function AudiobookPlayer:setPlaying(is_playing)
     if self._mini_play_pause then
         self._mini_play_pause:setText(txt, self._mini_play_pause.width)
     end
-    UIManager:setDirty(self, function()
+    self:_dirtyChrome(self._minimized
+        and (self._mini_play_pause and self._mini_play_pause.dimen)
+        or (self.play_pause_button and self.play_pause_button.dimen))
+end
+
+--- Refresh a rectangle. Never fall back to the whole mini bar for a clock
+--- tick — that is what made the entire chrome jump on Kindle e-ink.
+function AudiobookPlayer:_dirtyChrome(region)
+    local mode = self:_isEink() and "fast" or "ui"
+    if not (region and region.w and region.h and region.w > 0 and region.h > 0) then
         if self._minimized then
-            return "ui", self.dimen
+            region = self:_miniTimeDirtyRegion()
+        else
+            UIManager:setDirty(self, mode)
+            return
         end
-        if self.play_pause_button and self.play_pause_button.dimen then
-            return "ui", self.play_pause_button.dimen
-        end
-        return "ui"
+    end
+    UIManager:setDirty(self, function()
+        return mode, region
     end)
 end
 
-function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec)
+--- Tight screen rect around the elapsed/total label (the only 1 Hz change).
+function AudiobookPlayer:_miniTimeDirtyRegion()
+    local t = self._mini_time
+    if t and t.dimen and t.dimen.w and t.dimen.w > 0 then
+        local d = t.dimen
+        local pad = 2
+        return Geom:new{
+            x = math.max(0, d.x - pad),
+            y = math.max(0, d.y - pad),
+            w = d.w + pad * 2,
+            h = d.h + pad * 2,
+        }
+    end
+    local y = self:_miniBarY()
+    local h = math.max(12, math.floor(self._mini_height * 0.42))
+    local w = math.min(Screen:scaleBySize(180), self.width)
+    return Geom:new{
+        x = math.floor((self.width - w) / 2),
+        y = y + self._mini_height - h - 2,
+        w = w,
+        h = h,
+    }
+end
+
+function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec, force)
     local text
     if self._time_display_mode == "chapter" and self._current_chapter_end > self._current_chapter_start then
         local chapter_pos = math.max(0, current_sec - self._current_chapter_start)
@@ -925,32 +975,29 @@ function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec)
     else
         text = self:_formatTime(current_sec) .. " / " .. self:_formatTime(total_sec)
     end
-    if text ~= self.current_time_str then
-        self.current_time_str = text
-        self.time_widget:setText(text)
+    if text == self.current_time_str and not force then return end
+    self.current_time_str = text
+    self.time_widget:setText(text)
+    if self._mini_time then
         self._mini_time:setText(text)
-        UIManager:setDirty(self, function()
-            return "ui", self.time_widget.dimen
-        end)
+    end
+    if self._minimized then
+        self:_dirtyChrome(self:_miniTimeDirtyRegion())
+    else
+        self:_dirtyChrome(self.time_widget and self.time_widget.dimen)
     end
 end
 
-function AudiobookPlayer:updateProgress(progress)
+function AudiobookPlayer:updateProgress(progress, force)
     -- Suppress poller updates while user is dragging the scrubber
     if self._scrubber_dragging then return end
-    if progress ~= self.progress then
-        self.progress = progress
-        self.progress_bar:setPercentage(progress / 100)
-        if self._minimized then
-            UIManager:setDirty(self, function()
-                return "ui", self._mini_bar:getSize()
-            end)
-        else
-            UIManager:setDirty(self, function()
-                return "ui", self.progress_bar.dimen
-            end)
-        end
-    end
+    if progress == self.progress and not force then return end
+    self.progress = progress
+    self.progress_bar:setPercentage(progress / 100)
+    -- Mini chrome has no scrubber; time text is the 1 Hz progress. Dirtying
+    -- the whole bar here is what made Kindle jump.
+    if self._minimized then return end
+    self:_dirtyChrome(self.progress_bar and self.progress_bar.dimen)
 end
 
 function AudiobookPlayer:updateChapterTitle(title)
@@ -962,13 +1009,10 @@ function AudiobookPlayer:updateChapterTitle(title)
         -- Mini bar prefers chapter_title for read-aloud (see _updateMiniWidgets).
         if self._mini_title then
             self:_updateMiniWidgets()
+            self:_dirtyChrome(self._mini_title.dimen or self:_miniTimeDirtyRegion())
+        else
+            self:_dirtyChrome(self.chapter_widget and self.chapter_widget.dimen)
         end
-        UIManager:setDirty(self, function()
-            if self._minimized then
-                return "ui", self.dimen
-            end
-            return "ui", self.chapter_widget and self.chapter_widget.dimen or self.dimen
-        end)
     end
 end
 

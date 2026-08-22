@@ -600,7 +600,7 @@ function Audiobook:addToMainMenu(menu_items)
                                 BtMediaControl.stop()
                             end
                         end,
-                        help_text = _("When enabled, play/pause/next/prev buttons on a Bluetooth headset or speaker will control playback. The connected device will also show playback status.\n\nNote: Kindle Paperwhite does not expose an AVRCP input device for AirPods stem presses (no btui / no media-key evdev). Stem play/pause is not available on this firmware; use the on-screen controls or Kindle buttons."),
+                        help_text = _("When enabled, play/pause/next/prev buttons on a Bluetooth headset or speaker will control playback. The connected device will also show playback status.\n\nOn Kindle, stem clicks are read from Lab126 LIPC (playermgr / audiomgrd) because this firmware has no AVRCP evdev node."),
                     },
                     {
                         text = _("Reconnect BT on track change"),

@@ -582,11 +582,91 @@ function BtMediaControl._startKindleAvrcpSupport()
     if BtMediaControl._kindle_avrcp_active then return end
     BtMediaControl._kindle_avrcp_active = true
     BtMediaControl._kindleAdvertisePlaybackState("paused")
+    BtMediaControl._startKindleLipcEventWatch()
     BtMediaControl._pollKindleAvrcp()
 end
 
 function BtMediaControl._stopKindleAvrcpSupport()
     BtMediaControl._kindle_avrcp_active = false
+    BtMediaControl._stopKindleLipcEventWatch()
+end
+
+-- PW11 / Lab126 Bluedroid never creates an AVRCP evdev node. Headset stem
+-- clicks still land on playermgr / audiomgrd / btfd as LIPC events (Pause,
+-- Play, Stop). Watch those in the background and treat them as toggles.
+local KINDLE_AVRCP_LOG = "/tmp/abk-kindle-avrcp.log"
+local KINDLE_LIPC_WATCH = {
+    "com.lab126.playermgr",
+    "com.lab126.audiomgrd",
+    "com.lab126.btfd",
+    "com.lab126.acsbt",
+}
+
+function BtMediaControl._startKindleLipcEventWatch()
+    if BtMediaControl._kindle_lipc_watch_started then return end
+    BtMediaControl._kindle_lipc_watch_started = true
+    os.execute("rm -f " .. KINDLE_AVRCP_LOG)
+    os.execute("touch " .. KINDLE_AVRCP_LOG)
+    for _, svc in ipairs(KINDLE_LIPC_WATCH) do
+        os.execute(string.format(
+            "( lipc-wait-event -m %s '*' >> %s 2>/dev/null ) &",
+            svc, KINDLE_AVRCP_LOG))
+    end
+    BtMediaControl._kindle_avrcp_log_pos = 0
+    logger.warn("BtMediaControl: Kindle LIPC AVRCP watch started")
+end
+
+function BtMediaControl._stopKindleLipcEventWatch()
+    if not BtMediaControl._kindle_lipc_watch_started then return end
+    BtMediaControl._kindle_lipc_watch_started = false
+    os.execute("pkill -f 'abk-kindle-avrcp' 2>/dev/null")
+    -- The redirect filename is the only unique token we own.
+    os.execute("pkill -f '/tmp/abk-kindle-avrcp.log' 2>/dev/null")
+end
+
+function BtMediaControl._consumeKindleLipcEvents()
+    local f = io.open(KINDLE_AVRCP_LOG, "r")
+    if not f then return end
+    f:seek("set", BtMediaControl._kindle_avrcp_log_pos or 0)
+    local chunk = f:read("*a") or ""
+    BtMediaControl._kindle_avrcp_log_pos = f:seek()
+    f:close()
+    if chunk == "" then return end
+    local now = os.time()
+    for line in chunk:gmatch("[^\n]+") do
+        -- Ignore our own status chatter and volume / connection noise.
+        if line:find("audioOutput", 1, true)
+            or line:find("speakerVolume", 1, true)
+            or line:find("ListConnected", 1, true) then
+            -- skip
+        else
+            local ev = line:lower()
+            local is_pause = ev:find("%f[%a]pause%f[%A]")
+            local is_play = ev:find("%f[%a]play%f[%A]")
+                or ev:find("%f[%a]playparameter%f[%A]")
+            local is_stop = ev:find("%f[%a]stop%f[%A]")
+            local is_next = ev:find("%f[%a]next%f[%A]") or ev:find("forward", 1, true)
+            local is_prev = ev:find("%f[%a]prev%f[%A]") or ev:find("backward", 1, true)
+            if is_pause or is_play or is_stop or is_next or is_prev then
+                if BtMediaControl._kindle_avrcp_debounce
+                    and (now - BtMediaControl._kindle_avrcp_debounce) < 1 then
+                    logger.warn("BtMediaControl: Kindle LIPC debounce", line)
+                else
+                    BtMediaControl._kindle_avrcp_debounce = now
+                    logger.warn("BtMediaControl: Kindle LIPC AVRCP", line)
+                    if is_next then
+                        BtMediaControl._dispatchMediaEvent("MediaNext")
+                    elseif is_prev then
+                        BtMediaControl._dispatchMediaEvent("MediaPrev")
+                    else
+                        -- Stem clicks on Soundcore / AirPods are one button:
+                        -- treat Play, Pause, and Stop as a toggle.
+                        BtMediaControl._dispatchMediaEvent("MediaPlayPause")
+                    end
+                end
+            end
+        end
+    end
 end
 
 function BtMediaControl._btuiAvailable()
@@ -620,11 +700,15 @@ function BtMediaControl._pollKindleAvrcp()
     if not BtMediaControl._kindle_avrcp_active then return end
 
     -- Late-appearing media input nodes after AirPods reconnect.
-    if not BtMediaControl._evdev_active then
+    local scans = (BtMediaControl._kindle_evdev_scans or 0) + 1
+    BtMediaControl._kindle_evdev_scans = scans
+    if not BtMediaControl._evdev_active and scans % 4 == 0 then
         if BtMediaControl._tryEvdevApproach() then
             logger.warn("BtMediaControl: Kindle media input appeared on rescan")
         end
     end
+
+    BtMediaControl._consumeKindleLipcEvents()
 
     -- Some firmwares toggle playermgr InPlayback when the headset sends AVRCP.
     local h = io.popen("lipc-get-prop com.lab126.playermgr InPlayback 2>/dev/null")
@@ -648,7 +732,8 @@ function BtMediaControl._pollKindleAvrcp()
     end
 
     if BtMediaControl._kindle_avrcp_active then
-        UIManager:scheduleIn(1.5, BtMediaControl._pollKindleAvrcp)
+        -- LIPC log is written by background waiters; 0.4s keeps stem clicks snappy.
+        UIManager:scheduleIn(0.4, BtMediaControl._pollKindleAvrcp)
     end
 end
 

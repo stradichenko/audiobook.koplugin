@@ -2685,6 +2685,12 @@ end
 
 function MediaEngine:pause()
     if not self.is_playing or self.is_paused then return end
+    -- Snapshot while the pipeline is still live. Setting is_paused first
+    -- made Kindle getPosition() miss or reuse a stale mark, so resume jumped.
+    local live_pos = 0
+    pcall(function() live_pos = self:getPosition() or 0 end)
+    if not live_pos or live_pos < 0 then live_pos = 0 end
+
     self.is_paused = true
     self._pause_start_time = UIManager:getTime()
 
@@ -2743,9 +2749,7 @@ function MediaEngine:pause()
     -- audiomgrd within seconds; SIGCONT then produces a silent "playing"
     -- pipeline.  Halt content, park a silence keepalive so A2DP stays up.
     if self:_kindleNeedsPipelineRestartOnResume() then
-        local pos = 0
-        pcall(function() pos = self:getPosition() or 0 end)
-        self._paused_position = math.max(0, pos)
+        self._paused_position = math.max(0, live_pos)
         self._seek_offset = self._paused_position
         logger.warn("MediaEngine: Kindle A2DP pause-halt at", self._paused_position,
             "apple=", self:_isAppleAirPodsHeadset() and "yes" or "no")
