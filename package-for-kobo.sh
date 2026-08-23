@@ -47,7 +47,7 @@ rm -rf "$BUNDLE_DIR"
 mkdir -p "$ESPEAK_DEST/bin" "$ESPEAK_DEST/lib" "$ESPEAK_DEST/share/espeak-ng-data/lang/gmw" "$ESPEAK_DEST/share/espeak-ng-data/voices"
 
 # Plugin Lua files first
-for f in absbrowse.lua abscache.lua absclient.lua abssync.lua androidmediasession.lua androidplayer.lua androidtts.lua audiobook_gettext.lua audiobookplayer.lua benchmarkrunner.lua btmanager.lua btmediacontrol.lua btui.lua bugreport.lua debuglog.lua downloader.lua epubmediaoverlay.lua highlightmanager.lua m4bparser.lua main.lua mediaaligner.lua mediaengine.lua mediasync.lua menubuilder.lua _meta.lua piperqueue.lua playbackbar.lua sessionrecorder.lua synccontroller.lua textparser.lua transcoder.lua ttsengine.lua updater.lua utils.lua wavutils.lua; do
+for f in absbrowse.lua abscache.lua absclient.lua abssync.lua androidmediasession.lua androidplayer.lua androidtts.lua audiobook_gettext.lua audiobookplayer.lua benchmarkrunner.lua btmanager.lua btmediacontrol.lua btui.lua bugreport.lua debuglog.lua downloader.lua epubmediaoverlay.lua highlightmanager.lua m4bparser.lua main.lua mediaaligner.lua mediaengine.lua mediasync.lua menubuilder.lua _meta.lua piperqueue.lua sessionrecorder.lua synccontroller.lua textparser.lua transcoder.lua ttsengine.lua updater.lua utils.lua wavutils.lua; do
     if [ -f "$SCRIPT_DIR/$f" ]; then
         cp "$SCRIPT_DIR/$f" "$PLUGIN_DEST/"
     fi

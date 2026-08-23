@@ -11,13 +11,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 L10N = ROOT / "l10n"
-VERSION = "0.1.17.32"
+VERSION = "0.1.17.40"
 
 SKIP_NAME_EXACT = {"debuglog.lua"}
 SKIP_NAME_SUBSTR = (".fix", ".v25")
+# Untracked local checkouts / build outputs that must never feed the catalog.
+SKIP_DIR_NAMES = {"kobo-tts-bundle", "koreader-src"}
 
 
 def should_skip(path: Path) -> bool:
+    if any(part in SKIP_DIR_NAMES for part in path.parts):
+        return True
     name = path.name
     if name in SKIP_NAME_EXACT:
         return True

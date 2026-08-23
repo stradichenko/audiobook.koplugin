@@ -13,12 +13,14 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
+import android.speech.tts.Voice;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -81,6 +83,12 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
      *  Filled on the worker thread after init; never queried from the main
      *  thread because getDefaultEngine() is a binder call. */
     private volatile String defaultEnginePackage = null;
+    /** Cached getVoices() snapshot: name\\tlocale\\tquality\\tnetwork per line.
+     *  Filled on the worker thread; listVoices() never calls the TTS binder
+     *  from JNI. */
+    private volatile String voicesSnapshot = "";
+    /** Result of the most recent setVoice() (TextToSpeech result code). */
+    private volatile int lastVoiceResult = 0;
 
     /** When true, pipeline playback uses the persistent PCM streamer instead
      *  of a per-sentence MediaPlayer (workaround for HALs that tear down
@@ -160,6 +168,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                     } catch (Exception e) {
                         defaultEnginePackage = "unknown";
                     }
+                    refreshVoicesLocked();
                 }
             });
         }
@@ -181,6 +190,97 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
             return defaultEnginePackage;
         }
         return (initStatus == TextToSpeech.SUCCESS) ? "pending" : "not_ready";
+    }
+
+    /**
+     * Installed TTS voices as "name\\tlocale\\tquality\\tnetwork\\n" lines.
+     * Refreshes on the worker thread (getVoices is a binder call) and waits
+     * up to 3 s, matching setLanguage().  Empty string on timeout / error.
+     */
+    public String listVoices() {
+        if (tts == null || initStatus != TextToSpeech.SUCCESS) {
+            return voicesSnapshot != null ? voicesSnapshot : "";
+        }
+        final CountDownLatch latch = new CountDownLatch(1);
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                refreshVoicesLocked();
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(3, TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {}
+        return voicesSnapshot != null ? voicesSnapshot : "";
+    }
+
+    /**
+     * Select a voice by Voice.getName().  Worker-thread binder call with a
+     * 3 s cap.  Returns the TextToSpeech result code, or -1 on miss/timeout.
+     */
+    public int setVoice(final String name) {
+        if (tts == null || initStatus != TextToSpeech.SUCCESS || name == null) {
+            return -1;
+        }
+        final CountDownLatch latch = new CountDownLatch(1);
+        worker.post(new Runnable() {
+            @Override
+            public void run() {
+                int result = -1;
+                try {
+                    if (tts != null) {
+                        Set<Voice> voices = tts.getVoices();
+                        if (voices != null) {
+                            for (Voice v : voices) {
+                                if (v != null && name.equals(v.getName())) {
+                                    result = tts.setVoice(v);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+                lastVoiceResult = result;
+                latch.countDown();
+            }
+        });
+        try {
+            if (latch.await(3, TimeUnit.SECONDS)) {
+                return lastVoiceResult;
+            }
+        } catch (InterruptedException ignored) {}
+        return -1;
+    }
+
+    /** Must run on the worker thread. */
+    private void refreshVoicesLocked() {
+        if (tts == null) return;
+        try {
+            Set<Voice> voices = tts.getVoices();
+            if (voices == null) {
+                voicesSnapshot = "";
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (Voice v : voices) {
+                if (v == null) continue;
+                String name = v.getName();
+                if (name == null || name.length() == 0) continue;
+                name = name.replace('\t', ' ').replace('\n', ' ');
+                Locale loc = v.getLocale();
+                String tag = (loc != null) ? loc.toLanguageTag() : "";
+                int quality = v.getQuality();
+                int network = v.isNetworkConnectionRequired() ? 1 : 0;
+                sb.append(name).append('\t')
+                  .append(tag).append('\t')
+                  .append(quality).append('\t')
+                  .append(network).append('\n');
+            }
+            voicesSnapshot = sb.toString();
+        } catch (Exception e) {
+            // Keep the previous snapshot if the binder call fails.
+        }
     }
 
     /**

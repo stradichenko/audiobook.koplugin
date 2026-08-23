@@ -1609,7 +1609,7 @@ function Audiobook:_checkPendingAlignedStart()
             self:_startMediaPlaybackForDocument(doc_path)
         else
             UIManager:show(InfoMessage:new{
-                text = _("This book does not contain embedded narration/alignment metadata. Use Play unaligned audiobook or Start music playlist to play a separate audio file."),
+                text = _("This book has no built-in audiobook. Use Play unaligned audiobook or Start music playlist to play a separate audio file."),
                 timeout = 6,
             })
         end
@@ -1649,6 +1649,43 @@ function Audiobook:onShowFileDialog(file_manager, file)
     end
 end
 
+--- Session diagnostic snapshot for the built-in audiobook (EPUB Media
+--- Overlay) load path.  Surfaced in bug reports; user-facing UI never
+--- shows these strings.
+function Audiobook:_noteOverlayDiag(fields)
+    self._overlay_diag = self._overlay_diag or {}
+    for k, v in pairs(fields) do
+        self._overlay_diag[k] = v
+    end
+    if fields.ok == true then
+        self._overlay_diag.error = nil
+    end
+    self._overlay_diag.at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+end
+
+--- User-facing progress only; SMIL filenames and counts go to debug.log.
+function Audiobook:_smilProgressUi(loading_msg)
+    return function(prog)
+        if not prog then return end
+        if prog.phase == "smil" and prog.total then
+            local name = prog.detail and tostring(prog.detail):match("([^/]+)$")
+                or tostring(prog.detail or "")
+            dlog("overlay SMIL", tostring(prog.current) .. "/" .. tostring(prog.total), name)
+            loading_msg.text = T(_("Loading the built-in audiobook…\n%1 / %2"),
+                prog.current, prog.total)
+        elseif prog.phase == "done" then
+            dlog("overlay parse done", tostring(prog.detail or ""),
+                "n=", tostring(prog.current))
+            loading_msg.text = _("Built-in audiobook ready")
+        end
+        -- forceRePaint so e-ink shows live progress during the blocking parse.
+        UIManager:setDirty(loading_msg, function()
+            return "ui", loading_msg.dimen
+        end)
+        UIManager:forceRePaint()
+    end
+end
+
 --- @param opts table|nil  { prepare_only = true } arms the overlay (bar, SMIL,
 --- saved position) without starting audio; Play continues from the mark.
 function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
@@ -1684,15 +1721,24 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
     if not (parser and timing_data and self._smil_doc_path == doc_path) then
         local ok, EpubMediaOverlay = pcall(dofile, PLUGIN_PATH .. "epubmediaoverlay.lua")
         if not ok or not EpubMediaOverlay then
+            local why = tostring(EpubMediaOverlay)
+            logger.warn("Audiobook: EpubMediaOverlay module failed:", why)
+            dlog("overlay parser module failed:", why)
+            self:_noteOverlayDiag({
+                ok = false,
+                stage = "parser_module",
+                error = why,
+                book = doc_path and doc_path:match("([^/]+)$") or nil,
+            })
             UIManager:show(InfoMessage:new{
-                text = _("Failed to load EPUB Media Overlay parser."),
+                text = _("Could not load the built-in audiobook."),
                 timeout = 3,
             })
             return
         end
 
         local loading_msg = InfoMessage:new{
-            text = _("Loading Media Overlays..."),
+            text = _("Loading the built-in audiobook…"),
             timeout = 3600,
         }
         UIManager:show(loading_msg)
@@ -1701,28 +1747,24 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
         parser = EpubMediaOverlay:new()
         local plugin_dir = PLUGIN_PATH:sub(1, -2)
         local err
-        timing_data, err = parser:loadFromEpub(doc_path, plugin_dir, function(prog)
-            if not prog then return end
-            if prog.phase == "smil" and prog.total then
-                local name = prog.detail and tostring(prog.detail):match("([^/]+)$") or ""
-                loading_msg.text = T(_("Parsing overlays: %1 / %2\n%3"),
-                    prog.current, prog.total, name)
-            elseif prog.phase == "done" then
-                loading_msg.text = T(_("Loaded %1 timing entries"), prog.current)
-            end
-            -- forceRePaint so e-ink shows live progress during the blocking parse.
-            UIManager:setDirty(loading_msg, function()
-                return "ui", loading_msg.dimen
-            end)
-            UIManager:forceRePaint()
-        end)
+        timing_data, err = parser:loadFromEpub(doc_path, plugin_dir,
+            self:_smilProgressUi(loading_msg))
 
         UIManager:close(loading_msg)
         UIManager:forceRePaint()
 
         if not timing_data then
+            local why = tostring(err or "no timing data")
+            logger.warn("Audiobook: no media overlays:", why)
+            dlog("overlay load failed:", why, "book=", doc_path and doc_path:match("([^/]+)$") or "?")
+            self:_noteOverlayDiag({
+                ok = false,
+                stage = "loadFromEpub",
+                error = why,
+                book = doc_path and doc_path:match("([^/]+)$") or nil,
+            })
             UIManager:show(InfoMessage:new{
-                text = _("No Media Overlays found: ") .. tostring(err),
+                text = _("This book has no built-in audiobook."),
                 timeout = 4,
             })
             return
@@ -1746,8 +1788,17 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
     end
 
     if #files == 0 then
+        logger.warn("Audiobook: overlay timing has no audio_path entries")
+        dlog("overlay has timing entries but no audio files, n=", #timing_data)
+        self:_noteOverlayDiag({
+            ok = false,
+            stage = "extract_audio",
+            error = "no audio_path on timing entries",
+            timing_entries = #timing_data,
+            book = doc_path and doc_path:match("([^/]+)$") or nil,
+        })
         UIManager:show(InfoMessage:new{
-            text = _("Could not extract audio from EPUB."),
+            text = _("Could not find the built-in audiobook audio."),
             timeout = 3,
         })
         return
@@ -1809,10 +1860,17 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
         end
     end
 
-    UIManager:show(InfoMessage:new{
-        text = T(_("%1 sentences · %2 chapters · %3 audio parts"),
-            #timing_data, unique_n, #files),
-        timeout = 3,
+    dlog("overlay ready:", #timing_data, "timing entries,",
+        unique_n, "chapters,", #files, "audio parts",
+        "book=", doc_path and doc_path:match("([^/]+)$") or "?")
+    self:_noteOverlayDiag({
+        ok = true,
+        stage = "ready",
+        error = nil,
+        book = doc_path and doc_path:match("([^/]+)$") or nil,
+        timing_entries = #timing_data,
+        chapters = unique_n,
+        audio_parts = #files,
     })
 
     -- Common startup logic used both for direct starts and after the resume prompt.
@@ -2576,11 +2634,7 @@ function Audiobook:_startSleepTimer(minutes)
         text = T(_("Sleep timer set: %1"), display),
         timeout = 2,
     })
-    if self.media_sync and self.media_sync.playback_bar then
-        pcall(function()
-            self.media_sync.playback_bar:updateSleepTimer(minutes * 60, true)
-        end)
-    end
+    self:_updateSleepTimerBars(minutes * 60, true)
     self:_scheduleSleepTimerCheck()
 end
 
@@ -2680,10 +2734,24 @@ function Audiobook:_cancelSleepTimer()
         UIManager:unschedule(self._sleep_timer_check)
         self._sleep_timer_check = nil
     end
+    self:_updateSleepTimerBars(0, false)
+end
+
+-- Both playback bars (aligned overlay and TTS read-along) show the timer.
+function Audiobook:_updateSleepTimerBars(remaining_seconds, active)
+    local bars = {}
     if self.media_sync and self.media_sync.playback_bar then
-        pcall(function()
-            self.media_sync.playback_bar:updateSleepTimer(0, false)
-        end)
+        table.insert(bars, self.media_sync.playback_bar)
+    end
+    if self.sync_controller and self.sync_controller.playback_bar then
+        table.insert(bars, self.sync_controller.playback_bar)
+    end
+    for _, bar in ipairs(bars) do
+        if bar.updateSleepTimer then
+            pcall(function()
+                bar:updateSleepTimer(remaining_seconds, active)
+            end)
+        end
     end
 end
 
@@ -2706,12 +2774,8 @@ function Audiobook:_scheduleSleepTimerCheck()
             end
             return
         end
-        -- Update playback bar / overlay if it shows timer
-        if self.media_sync and self.media_sync.playback_bar then
-            pcall(function()
-                self.media_sync.playback_bar:updateSleepTimer(remaining, true)
-            end)
-        end
+        -- Update playback bars / overlay if they show the timer
+        self:_updateSleepTimerBars(remaining, true)
         self._sleep_timer_check = UIManager:scheduleIn(5, check)
     end
     self._sleep_timer_check = UIManager:scheduleIn(5, check)
@@ -2865,7 +2929,7 @@ function Audiobook:startAlignedAudioFromSelection(selected_text)
 
     if not self:_hasMediaOverlays() then
         UIManager:show(InfoMessage:new{
-            text = _("This book has no embedded narration/alignment metadata."),
+            text = _("This book has no built-in audiobook."),
             timeout = 4,
         })
         return
@@ -2878,8 +2942,17 @@ function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allo
     allow_resume = (allow_resume ~= false)
     local ok, EpubMediaOverlay = pcall(dofile, PLUGIN_PATH .. "epubmediaoverlay.lua")
     if not ok or not EpubMediaOverlay then
+        local why = tostring(EpubMediaOverlay)
+        logger.warn("Audiobook: EpubMediaOverlay module failed:", why)
+        dlog("overlay parser module failed:", why)
+        self:_noteOverlayDiag({
+            ok = false,
+            stage = "parser_module",
+            error = why,
+            book = doc_path and doc_path:match("([^/]+)$") or nil,
+        })
         UIManager:show(InfoMessage:new{
-            text = _("Failed to load EPUB Media Overlay parser."),
+            text = _("Could not load the built-in audiobook."),
             timeout = 3,
         })
         return
@@ -2909,32 +2982,29 @@ function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allo
     end
     if not parser or not timing_data then
         local loading_msg = InfoMessage:new{
-            text = _("Loading Media Overlays..."),
+            text = _("Loading the built-in audiobook…"),
             timeout = 3600,
         }
         UIManager:show(loading_msg)
         UIManager:forceRePaint()
         parser = EpubMediaOverlay:new()
         local err
-        timing_data, err = parser:loadFromEpub(doc_path, PLUGIN_PATH:sub(1, -2), function(prog)
-            if not prog then return end
-            if prog.phase == "smil" and prog.total then
-                local name = prog.detail and tostring(prog.detail):match("([^/]+)$") or ""
-                loading_msg.text = T(_("Parsing overlays: %1 / %2\n%3"),
-                    prog.current, prog.total, name)
-            elseif prog.phase == "done" then
-                loading_msg.text = T(_("Loaded %1 timing entries"), prog.current)
-            end
-            UIManager:setDirty(loading_msg, function()
-                return "ui", loading_msg.dimen
-            end)
-            UIManager:forceRePaint()
-        end)
+        timing_data, err = parser:loadFromEpub(doc_path, PLUGIN_PATH:sub(1, -2),
+            self:_smilProgressUi(loading_msg))
         UIManager:close(loading_msg)
         UIManager:forceRePaint()
         if not timing_data then
+            local why = tostring(err or "no timing data")
+            logger.warn("Audiobook: no media overlays:", why)
+            dlog("overlay load failed:", why, "book=", doc_path and doc_path:match("([^/]+)$") or "?")
+            self:_noteOverlayDiag({
+                ok = false,
+                stage = "loadFromEpub",
+                error = why,
+                book = doc_path and doc_path:match("([^/]+)$") or nil,
+            })
             UIManager:show(InfoMessage:new{
-                text = _("No Media Overlays found: ") .. tostring(err),
+                text = _("This book has no built-in audiobook."),
                 timeout = 3,
             })
             return

@@ -189,25 +189,33 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         })
     end
 
-    -- Android TTS language override (backend defaults to auto-detection:
-    -- CJK script per chunk, else book metadata; issue #45).
+    -- Android TTS: HuggingFace catalog languages + installed system voices.
+    -- (Piper ONNX models themselves cannot run on Android; they appear here
+    -- as languages, and as voices if the user installed SherpaTTS / similar.)
     if plugin.tts_engine
        and plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ANDROID then
         table.insert(menu, {
             text_func = function()
+                local label = plugin:getSetting("android_tts_voice_label", "")
+                if label ~= "" then
+                    return T(_("Voice: %1"), label)
+                end
                 local lang = plugin:getSetting("android_tts_language", "auto")
                 if lang == "auto" then
-                    return T(_("Android TTS language: %1"), _("Auto-detect"))
+                    return T(_("Voice: %1"), _("Auto-detect"))
                 end
-                return T(_("Android TTS language: %1"), lang)
+                return T(_("Voice: %1"), lang)
             end,
-            sub_item_table_func = function()
-                return MenuBuilder.buildAndroidTtsLanguageMenu(plugin)
+            callback = function(touchmenu_instance)
+                if touchmenu_instance then
+                    touchmenu_instance:closeMenu()
+                end
+                MenuBuilder.showVoicePicker(plugin)
             end,
             help_text = _(
-                "Auto-detect picks the voice from the text script (Chinese, "
-                .. "Japanese, Korean) or the book's language metadata. "
-                .. "Choose a specific language to override detection."
+                "Pick a language from the HuggingFace catalog, or an installed "
+                .. "Android TTS voice. Neural voices on Android come from the "
+                .. "system TTS engine (Google, SherpaTTS, …)."
             ),
         })
     end
@@ -238,8 +246,9 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
         sub_item_table = MenuBuilder.buildVolumeMenu(plugin),
     })
 
-    -- Pause between sentences / paragraphs (espeak-ng only — neural TTS has natural prosody)
-    if plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ESPEAK then
+    -- Pause between sentences / paragraphs (espeak-ng and Android TTS)
+    if plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ESPEAK
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ANDROID then
         table.insert(menu, {
             text_func = function()
                 return T(_("Sentence pause (. ? !): %1s"), plugin:getSetting("sentence_pause", 0.1))
@@ -338,7 +347,7 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 end
             end,
         })
-    else
+    elseif plugin.tts_engine.backend ~= plugin.tts_engine.BACKENDS.ANDROID then
         table.insert(menu, {
             text_func = function()
                 if plugin:getSetting("tts_mbrola_voice", "") ~= "" then
@@ -797,7 +806,9 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
     -- engines found" on Android even though the bridge was working
     -- (issue #44), because every other entry probes CLI binaries that
     -- do not exist there.
-    if engine._android_tts then
+    if engine._android_tts
+        or engine._android_tts_deferred
+        or engine.backend == engine.BACKENDS.ANDROID then
         table.insert(available, {
             id = engine.BACKENDS.ANDROID,
             label = _("Android (system TTS engine)"),
@@ -943,46 +954,6 @@ function MenuBuilder.buildPiperVoiceMenu(plugin)
         })
     end
 
-    return menu
-end
-
---[[--
-Build Android TTS language menu (auto-detect + common overrides).
---]]
-function MenuBuilder.buildAndroidTtsLanguageMenu(plugin)
-    local choices = {
-        { id = "auto",  label = _("Auto-detect (script + book language)") },
-        { id = "en-US", label = "English (US)" },
-        { id = "en-GB", label = "English (UK)" },
-        { id = "zh-CN", label = "Chinese (Simplified)" },
-        { id = "zh-TW", label = "Chinese (Traditional)" },
-        { id = "ja-JP", label = "Japanese" },
-        { id = "ko-KR", label = "Korean" },
-        { id = "fr-FR", label = "French" },
-        { id = "de-DE", label = "German" },
-        { id = "es-ES", label = "Spanish" },
-        { id = "it-IT", label = "Italian" },
-        { id = "pt-BR", label = "Portuguese (Brazil)" },
-        { id = "ru-RU", label = "Russian" },
-    }
-    local menu = {}
-    for _, choice in ipairs(choices) do
-        table.insert(menu, {
-            text = choice.label,
-            checked_func = function()
-                return plugin:getSetting("android_tts_language", "auto") == choice.id
-            end,
-            callback = function()
-                plugin:setSetting("android_tts_language", choice.id)
-                -- Force re-application (and re-warning) on the next chunk
-                if plugin.tts_engine then
-                    plugin.tts_engine._android_tts_lang = nil
-                    plugin.tts_engine._android_lang_warned = nil
-                end
-            end,
-            radio = true,
-        })
-    end
     return menu
 end
 
@@ -1487,6 +1458,598 @@ function MenuBuilder._showNativePrestepDialog(plugin, touchmenu_instance)
         },
     }
     UIManager:show(dialog)
+end
+
+--[[--
+Languages from the bundled HuggingFace Piper catalog (voices.json), plus
+the CJK locales Android TTS already handled.  Used as Android TTS language
+shortcuts; the ONNX models themselves do not run on Android.
+--]]
+function MenuBuilder.huggingfaceLanguageChoices()
+    return {
+        { id = "fr-FR", label = _("French") },
+        { id = "en-US", label = _("English (US)") },
+        { id = "en-GB", label = _("English (UK)") },
+        { id = "es-ES", label = _("Spanish") },
+        { id = "de-DE", label = _("German") },
+        { id = "it-IT", label = _("Italian") },
+        { id = "pt-BR", label = _("Portuguese (Brazil)") },
+        { id = "nl-NL", label = _("Dutch") },
+        { id = "pl-PL", label = _("Polish") },
+        { id = "cs-CZ", label = _("Czech") },
+        { id = "uk-UA", label = _("Ukrainian") },
+        { id = "hi-IN", label = _("Hindi") },
+        { id = "ar-JO", label = _("Arabic") },
+        { id = "ca-ES", label = _("Catalan") },
+        { id = "zh-CN", label = _("Chinese (Simplified)") },
+        { id = "zh-TW", label = _("Chinese (Traditional)") },
+        { id = "ja-JP", label = _("Japanese") },
+        { id = "ko-KR", label = _("Korean") },
+        { id = "da-DK", label = _("Danish") },
+        { id = "fi-FI", label = _("Finnish") },
+        { id = "ru-RU", label = _("Russian") },
+        { id = "el-GR", label = _("Greek") },
+        { id = "no-NO", label = _("Norwegian") },
+        { id = "sv-SE", label = _("Swedish") },
+        { id = "tr-TR", label = _("Turkish") },
+        { id = "hu-HU", label = _("Hungarian") },
+        { id = "ro-RO", label = _("Romanian") },
+    }
+end
+
+local function _localePrefix(tag)
+    if not tag or tag == "" then return "" end
+    return (tag:lower():gsub("_", "-"):match("^(%a+)") or tag:lower())
+end
+
+function MenuBuilder._androidVoiceLabel(voice)
+    local loc = voice.locale or ""
+    local lang_label = loc
+    for _, choice in ipairs(MenuBuilder.huggingfaceLanguageChoices()) do
+        if choice.id:lower() == loc:lower()
+            or _localePrefix(choice.id) == _localePrefix(loc) then
+            lang_label = choice.label
+            break
+        end
+    end
+    local net = voice.network and _("online") or _("offline")
+    if lang_label ~= "" then
+        return T(_("%1 · %2 (%3)"), lang_label, voice.name, net)
+    end
+    return T(_("%1 (%2)"), voice.name, net)
+end
+
+function MenuBuilder.applyTtsLanguage(plugin, lang, label)
+    plugin:setSetting("android_tts_language", lang)
+    plugin:setSetting("android_tts_voice", "")
+    plugin:setSetting("android_tts_voice_label", label or lang)
+    if plugin.tts_engine and plugin.tts_engine.invalidateAndroidVoice then
+        plugin.tts_engine:invalidateAndroidVoice()
+    end
+    local atts = plugin.tts_engine and plugin.tts_engine._android_tts
+    if atts and atts.setLanguage and lang and lang ~= "auto" then
+        pcall(function() atts:setLanguage(lang) end)
+        plugin.tts_engine._android_tts_lang = lang
+        plugin.tts_engine._android_tts_voice = nil
+    end
+    UIManager:show(InfoMessage:new{
+        text = T(_("Voice set to %1."), label or lang),
+        timeout = 2,
+    })
+end
+
+function MenuBuilder.applyAndroidInstalledVoice(plugin, voice)
+    local label = MenuBuilder._androidVoiceLabel(voice)
+    plugin:setSetting("android_tts_voice", voice.name)
+    if voice.locale and voice.locale ~= "" then
+        plugin:setSetting("android_tts_language", voice.locale)
+    end
+    plugin:setSetting("android_tts_voice_label", label)
+    if plugin.tts_engine and plugin.tts_engine.invalidateAndroidVoice then
+        plugin.tts_engine:invalidateAndroidVoice()
+    end
+    local atts = plugin.tts_engine and plugin.tts_engine._android_tts
+    if atts and atts.setVoice then
+        pcall(function() atts:setVoice(voice.name) end)
+        plugin.tts_engine._android_tts_voice = voice.name
+        plugin.tts_engine._android_tts_lang = "voice:" .. voice.name
+    end
+    UIManager:show(InfoMessage:new{
+        text = T(_("Voice set to %1."), label),
+        timeout = 2,
+    })
+end
+
+--[[--
+Paginated ButtonDialog picker.  Full Menu widgets have crashed on Boox;
+this is the same pattern as the chapter list.
+--]]
+function MenuBuilder.showPagedPicker(opts)
+    local items = opts.items or {}
+    if #items == 0 then
+        UIManager:show(InfoMessage:new{
+            text = opts.empty_text or _("No voices found."),
+            timeout = 3,
+        })
+        return
+    end
+    local ok_bd, ButtonDialog = pcall(require, "ui/widget/buttondialog")
+    if not ok_bd or not ButtonDialog then
+        logger.err("MenuBuilder: ButtonDialog unavailable:", ButtonDialog)
+        UIManager:show(InfoMessage:new{
+            text = _("Could not open voice list."),
+            timeout = 4,
+        })
+        return
+    end
+
+    local PAGE_SIZE = 8
+    local page = 1
+    local current = tonumber(opts.current) or 1
+    if current < 1 then current = 1 end
+    if current > #items then current = #items end
+    page = math.floor((current - 1) / PAGE_SIZE) + 1
+
+    local dialog
+    local function close_picker()
+        if dialog then
+            pcall(function() UIManager:close(dialog) end)
+        end
+        dialog = nil
+    end
+
+    local function show_page()
+        local total_pages = math.max(1, math.ceil(#items / PAGE_SIZE))
+        if page < 1 then page = 1 end
+        if page > total_pages then page = total_pages end
+        local first = (page - 1) * PAGE_SIZE + 1
+        local last = math.min(#items, page * PAGE_SIZE)
+
+        local buttons = {}
+        for i = first, last do
+            local item = items[i]
+            if item then
+                local label = tostring(item.text or (_("Item") .. " " .. i))
+                if #label > 80 then
+                    label = label:sub(1, 77) .. "..."
+                end
+                if i == current then
+                    label = "> " .. label
+                end
+                local cb = item.callback
+                local enabled = item.enabled
+                if enabled == nil then enabled = (cb ~= nil) end
+                table.insert(buttons, {{
+                    text = label,
+                    enabled = enabled,
+                    callback = function()
+                        if not cb then return end
+                        close_picker()
+                        UIManager:scheduleIn(0.1, function()
+                            pcall(cb)
+                        end)
+                    end,
+                }})
+            end
+        end
+
+        table.insert(buttons, {
+            {
+                text = _("Prev"),
+                enabled = page > 1,
+                callback = function()
+                    page = page - 1
+                    close_picker()
+                    UIManager:scheduleIn(0.05, show_page)
+                end,
+            },
+            {
+                text = _("Close"),
+                callback = close_picker,
+            },
+            {
+                text = _("Next"),
+                enabled = page < total_pages,
+                callback = function()
+                    page = page + 1
+                    close_picker()
+                    UIManager:scheduleIn(0.05, show_page)
+                end,
+            },
+        })
+
+        local title = string.format("%s (%d/%d)",
+            tostring(opts.title or _("Select voice")), page, total_pages)
+        local ok, err = pcall(function()
+            dialog = ButtonDialog:new{
+                title = title,
+                buttons = buttons,
+            }
+            UIManager:show(dialog)
+        end)
+        if not ok then
+            logger.err("MenuBuilder: voice ButtonDialog failed:", err)
+            UIManager:show(InfoMessage:new{
+                text = _("Could not open voice list.") .. "\n" .. tostring(err),
+                timeout = 6,
+            })
+        end
+    end
+
+    UIManager:scheduleIn(0.15, function()
+        local ok, err = pcall(show_page)
+        if not ok then
+            logger.err("MenuBuilder: voice picker failed:", err)
+            UIManager:show(InfoMessage:new{
+                text = _("Could not open voice list.") .. "\n" .. tostring(err),
+                timeout = 6,
+            })
+        end
+    end)
+end
+
+function MenuBuilder._androidVoicePickerItems(plugin)
+    local items = {}
+    local current_voice = plugin:getSetting("android_tts_voice", "")
+    local current_lang = plugin:getSetting("android_tts_language", "auto")
+    local current_idx = 1
+
+    table.insert(items, {
+        text = _("Auto (book language)"),
+        callback = function()
+            MenuBuilder.applyTtsLanguage(plugin, "auto", _("Auto-detect"))
+        end,
+    })
+    if current_voice == "" and current_lang == "auto" then
+        current_idx = #items
+    end
+
+    table.insert(items, {
+        text = "- " .. _("Languages") .. " -",
+        enabled = false,
+    })
+
+    local book_lang
+    if plugin.tts_engine and plugin.tts_engine._androidBookLanguage then
+        book_lang = plugin.tts_engine:_androidBookLanguage()
+    end
+    local langs = MenuBuilder.huggingfaceLanguageChoices()
+    -- Book language first so a French EPUB surfaces French immediately.
+    table.sort(langs, function(a, b)
+        local function rank(c)
+            if book_lang and (c.id:lower() == book_lang:lower()
+                or _localePrefix(c.id) == _localePrefix(book_lang)) then
+                return 0
+            end
+            return 1
+        end
+        local ra, rb = rank(a), rank(b)
+        if ra ~= rb then return ra < rb end
+        return a.label < b.label
+    end)
+    for _, choice in ipairs(langs) do
+        table.insert(items, {
+            text = choice.label,
+            callback = function()
+                MenuBuilder.applyTtsLanguage(plugin, choice.id, choice.label)
+            end,
+        })
+        if current_voice == "" and current_lang:lower() == choice.id:lower() then
+            current_idx = #items
+        end
+    end
+
+    local voices = {}
+    if plugin.tts_engine and plugin.tts_engine.listAndroidVoices then
+        voices = plugin.tts_engine:listAndroidVoices() or {}
+    end
+    if #voices > 0 then
+        table.insert(items, {
+            text = "- " .. _("Installed voices") .. " -",
+            enabled = false,
+        })
+        local prefer = current_lang ~= "auto" and current_lang or book_lang or ""
+        table.sort(voices, function(a, b)
+            local function rank(v)
+                local r = 2
+                if prefer ~= "" and v.locale
+                    and _localePrefix(v.locale) == _localePrefix(prefer) then
+                    r = 0
+                end
+                if v.network then r = r + 1 end
+                return r, -(v.quality or 0), v.name or ""
+            end
+            local ra, qa, na = rank(a)
+            local rb, qb, nb = rank(b)
+            if ra ~= rb then return ra < rb end
+            if qa ~= qb then return qa < qb end
+            return na < nb
+        end)
+        for _, voice in ipairs(voices) do
+            table.insert(items, {
+                text = MenuBuilder._androidVoiceLabel(voice),
+                callback = function()
+                    MenuBuilder.applyAndroidInstalledVoice(plugin, voice)
+                end,
+            })
+            if current_voice ~= "" and current_voice == voice.name then
+                current_idx = #items
+            end
+        end
+    end
+
+    return items, current_idx
+end
+
+function MenuBuilder._piperVoicePickerItems(plugin)
+    local items = {}
+    local current = 1
+    local voices = plugin.tts_engine and plugin.tts_engine.listPiperVoices
+        and plugin.tts_engine:listPiperVoices() or {}
+    local selected = plugin:getSetting("piper_model", nil)
+    for i, voice in ipairs(voices) do
+        local label = voice.name or voice.path or ("voice " .. i)
+        if voice.quality then
+            label = label .. " (" .. voice.quality .. ")"
+        end
+        table.insert(items, {
+            text = label,
+            callback = function()
+                plugin.tts_engine:setPiperModel(voice.path)
+                plugin:setSetting("piper_model", voice.path)
+                plugin:setSetting("piper_model_label", label)
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Voice set to %1."), label),
+                    timeout = 2,
+                })
+            end,
+        })
+        if selected and selected == voice.path then
+            current = #items
+        end
+    end
+    return items, current
+end
+
+function MenuBuilder._espeakVoicePickerItems(plugin)
+    local items = {}
+    local current = 1
+    local selected = plugin:getSetting("tts_voice", "en")
+    local accents = MenuBuilder.huggingfaceLanguageChoices()
+    for _, choice in ipairs(accents) do
+        local espeak_id = _localePrefix(choice.id)
+        if espeak_id == "en" then
+            espeak_id = (choice.id == "en-US") and "en-us" or "en"
+        elseif espeak_id == "pt" and choice.id == "pt-BR" then
+            espeak_id = "pt-br"
+        end
+        table.insert(items, {
+            text = choice.label,
+            callback = function()
+                local var = plugin:getSetting("tts_voice_variant", "")
+                local full = espeak_id
+                if var ~= "" then full = espeak_id .. "+" .. var end
+                plugin:setSetting("tts_voice", espeak_id)
+                plugin:setSetting("tts_voice_label", choice.label)
+                if plugin.tts_engine then
+                    plugin.tts_engine:setVoice(full)
+                end
+                UIManager:show(InfoMessage:new{
+                    text = T(_("Voice set to %1."), choice.label),
+                    timeout = 2,
+                })
+            end,
+        })
+        if selected == espeak_id then
+            current = #items
+        end
+    end
+    return items, current
+end
+
+--[[--
+Show a voice picker for the active TTS backend.  Safe to call from the
+playback overlay or from Voice settings.
+--]]
+function MenuBuilder.showVoicePicker(plugin)
+    if not plugin or not plugin.tts_engine then
+        UIManager:show(InfoMessage:new{
+            text = _("TTS engine is not available."),
+            timeout = 3,
+        })
+        return
+    end
+    local backend = plugin.tts_engine.backend
+    if backend == plugin.tts_engine.BACKENDS.ANDROID then
+        local info = InfoMessage:new{
+            text = _("Loading voices…"),
+            timeout = 0,
+        }
+        UIManager:show(info)
+        UIManager:scheduleIn(0.05, function()
+            local items, current = MenuBuilder._androidVoicePickerItems(plugin)
+            UIManager:close(info)
+            MenuBuilder.showPagedPicker({
+                title = _("Select voice"),
+                items = items,
+                current = current,
+            })
+        end)
+        return
+    end
+    local items, current
+    if backend == plugin.tts_engine.BACKENDS.PIPER then
+        items, current = MenuBuilder._piperVoicePickerItems(plugin)
+    else
+        items, current = MenuBuilder._espeakVoicePickerItems(plugin)
+    end
+    MenuBuilder.showPagedPicker({
+        title = _("Select voice"),
+        items = items,
+        current = current,
+    })
+end
+
+local function _valuePicker(title, values, current, format_fn, apply_fn)
+    local items = {}
+    local current_idx = 1
+    for i, v in ipairs(values) do
+        table.insert(items, {
+            text = format_fn(v),
+            callback = function() apply_fn(v) end,
+        })
+        if current == v then current_idx = i end
+    end
+    MenuBuilder.showPagedPicker({
+        title = title,
+        items = items,
+        current = current_idx,
+    })
+end
+
+--[[--
+TTS settings from the playback overlay: voice, speed,
+sentence/paragraph pauses, volume.
+--]]
+function MenuBuilder.showTtsSettingsPicker(plugin)
+    if not plugin or not plugin.tts_engine then
+        UIManager:show(InfoMessage:new{
+            text = _("TTS engine is not available."),
+            timeout = 3,
+        })
+        return
+    end
+    local backend = plugin.tts_engine.backend
+    local voice_label
+    if backend == plugin.tts_engine.BACKENDS.ANDROID then
+        voice_label = plugin:getSetting("android_tts_voice_label", "")
+        if voice_label == "" then
+            local lang = plugin:getSetting("android_tts_language", "auto")
+            voice_label = (lang == "auto") and _("Auto-detect") or lang
+        end
+    elseif backend == plugin.tts_engine.BACKENDS.PIPER then
+        voice_label = plugin:getSetting("piper_model_label", "default")
+    else
+        voice_label = plugin:getSetting("tts_voice_label", "English (GB)")
+    end
+    local items = {}
+    table.insert(items, {
+        text = T(_("Voice: %1"), voice_label),
+        callback = function()
+            MenuBuilder.showVoicePicker(plugin)
+        end,
+    })
+    table.insert(items, {
+        text = T(_("Speech rate: %1x"), plugin:getSetting("speech_rate", 1.0)),
+        callback = function()
+            _valuePicker(_("Speech rate"), {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0},
+                plugin:getSetting("speech_rate", 1.0),
+                function(v) return string.format("%.2fx", v) end,
+                function(v)
+                    plugin:setSetting("speech_rate", v)
+                    if plugin.tts_engine then plugin.tts_engine:setRate(v) end
+                    if plugin.sync_controller and plugin.sync_controller.playback_bar
+                        and plugin.sync_controller.playback_bar.updateSpeed then
+                        pcall(function()
+                            plugin.sync_controller.playback_bar:updateSpeed(v)
+                        end)
+                    end
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Speech rate: %1x"), v),
+                        timeout = 1.5,
+                    })
+                end)
+        end,
+    })
+    if backend == plugin.tts_engine.BACKENDS.PIPER then
+        table.insert(items, {
+            text = T(_("Sentence gap (. ? !): %1s"), plugin:getSetting("piper_sentence_gap", 0.3)),
+            callback = function()
+                _valuePicker(_("Sentence pause"), {0, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0},
+                    plugin:getSetting("piper_sentence_gap", 0.3),
+                    function(v) return string.format("%.1fs", v) end,
+                    function(v)
+                        plugin:setSetting("piper_sentence_gap", v)
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Sentence gap (. ? !): %1s"), v),
+                            timeout = 1.5,
+                        })
+                    end)
+            end,
+        })
+        table.insert(items, {
+            text = T(_("Paragraph gap (newlines): %1s"), plugin:getSetting("piper_paragraph_gap", 1.0)),
+            callback = function()
+                _valuePicker(_("Paragraph pause"), {0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0},
+                    plugin:getSetting("piper_paragraph_gap", 1.0),
+                    function(v) return string.format("%.1fs", v) end,
+                    function(v)
+                        plugin:setSetting("piper_paragraph_gap", v)
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Paragraph gap (newlines): %1s"), v),
+                            timeout = 1.5,
+                        })
+                    end)
+            end,
+        })
+    else
+        table.insert(items, {
+            text = T(_("Sentence pause (. ? !): %1s"), plugin:getSetting("sentence_pause", 0.1)),
+            callback = function()
+                _valuePicker(_("Sentence pause"), {0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.8, 1.0},
+                    plugin:getSetting("sentence_pause", 0.1),
+                    function(v) return string.format("%.2fs", v) end,
+                    function(v)
+                        plugin:setSetting("sentence_pause", v)
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Sentence pause (. ? !): %1s"), v),
+                            timeout = 1.5,
+                        })
+                    end)
+            end,
+        })
+        table.insert(items, {
+            text = T(_("Paragraph pause (newlines): %1s"), plugin:getSetting("paragraph_pause", 0.8)),
+            callback = function()
+                _valuePicker(_("Paragraph pause"), {0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0},
+                    plugin:getSetting("paragraph_pause", 0.8),
+                    function(v) return string.format("%.1fs", v) end,
+                    function(v)
+                        plugin:setSetting("paragraph_pause", v)
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Paragraph pause (newlines): %1s"), v),
+                            timeout = 1.5,
+                        })
+                    end)
+            end,
+        })
+    end
+    table.insert(items, {
+        text = T(_("Volume: %1%%"), math.floor(plugin:getSetting("speech_volume", 1.0) * 100)),
+        callback = function()
+            _valuePicker(_("Volume"), {0.25, 0.5, 0.75, 1.0},
+                plugin:getSetting("speech_volume", 1.0),
+                function(v) return string.format("%d%%", math.floor(v * 100)) end,
+                function(v)
+                    plugin:setSetting("speech_volume", v)
+                    if plugin.tts_engine then plugin.tts_engine:setVolume(v) end
+                    if plugin.sync_controller and plugin.sync_controller.playback_bar
+                        and plugin.sync_controller.playback_bar.updateVolume then
+                        pcall(function()
+                            plugin.sync_controller.playback_bar:updateVolume(math.floor(v * 100))
+                        end)
+                    end
+                    UIManager:show(InfoMessage:new{
+                        text = T(_("Volume: %1%%"), math.floor(v * 100)),
+                        timeout = 1.5,
+                    })
+                end)
+        end,
+    })
+    MenuBuilder.showPagedPicker({
+        title = _("TTS settings"),
+        items = items,
+    })
 end
 
 return MenuBuilder

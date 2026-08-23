@@ -276,6 +276,10 @@ function AndroidTts:init()
             "getDefaultEngine", "()Ljava/lang/String;")
         -- Optional methods (newer tts_helper.dex).  Nil when absent — never
         -- leave a NULL jmethodID in the table (LuaJIT NULL is truthy).
+        self._method.listVoices = getMethod(env, helper_class,
+            "listVoices", "()Ljava/lang/String;")
+        self._method.setVoice = getMethod(env, helper_class,
+            "setVoice", "(Ljava/lang/String;)I")
         self._method.seekToMs = getMethod(env, helper_class,
             "seekToMs", "(I)V")
         self._method.playMediaFile = getMethod(env, helper_class,
@@ -706,6 +710,66 @@ function AndroidTts:getDefaultEngine()
         end
         local result = jni:to_string(j_str)
         jni.env[0].DeleteLocalRef(jni.env, j_str)
+        return result
+    end)
+end
+
+--[[--
+Installed Android TTS voices.
+Each entry: { name, locale, quality, network }.
+Empty table when the dex has no listVoices() or the engine is not ready.
+@return table
+--]]
+function AndroidTts:listVoices()
+    if not self._initialized or not self._helper_ref then return {} end
+    if not self._method.listVoices then return {} end
+    local android = self._android
+    local raw = android.jni:context(android.app.activity.vm, function(jni)
+        local j_str = jni.env[0].CallObjectMethod(jni.env,
+            self._helper_ref, self._method.listVoices)
+        if checkException(jni.env) or j_str == nil then
+            logger.err("AndroidTts: listVoices threw exception")
+            return ""
+        end
+        local result = jni:to_string(j_str)
+        jni.env[0].DeleteLocalRef(jni.env, j_str)
+        return result
+    end)
+    local voices = {}
+    if type(raw) ~= "string" or raw == "" then return voices end
+    for line in raw:gmatch("[^\n]+") do
+        local name, locale, quality, network = line:match("^(.-)\t(.-)\t(.-)\t(.-)$")
+        if name and name ~= "" then
+            table.insert(voices, {
+                name = name,
+                locale = locale or "",
+                quality = tonumber(quality) or 0,
+                network = network == "1",
+            })
+        end
+    end
+    return voices
+end
+
+--[[--
+Select a specific Android TTS voice by Voice.getName().
+@param name string
+@return number  TextToSpeech result code, or -1
+--]]
+function AndroidTts:setVoice(name)
+    if not self._initialized or not self._helper_ref then return -1 end
+    if not self._method.setVoice or not name or name == "" then return -1 end
+    local android = self._android
+    return android.jni:context(android.app.activity.vm, function(jni)
+        local env = jni.env
+        local j_name = env[0].NewStringUTF(env, name)
+        local result = env[0].CallIntMethod(env,
+            self._helper_ref, self._method.setVoice, j_name)
+        env[0].DeleteLocalRef(env, j_name)
+        if checkException(env) then
+            logger.err("AndroidTts: setVoice threw exception")
+            return -1
+        end
         return result
     end)
 end

@@ -1326,7 +1326,15 @@ function TTSEngine:_androidBookLanguage()
         lang = lang:lower():gsub("_", "-"):match("^%s*(.-)%s*$")
         if lang == "" then lang = nil end
     end
-    local aliases = { zh = "zh-CN", ja = "ja-JP", ko = "ko-KR", en = "en-US" }
+    local aliases = {
+        zh = "zh-CN", ja = "ja-JP", ko = "ko-KR", en = "en-US",
+        fr = "fr-FR", de = "de-DE", es = "es-ES", it = "it-IT",
+        pt = "pt-BR", nl = "nl-NL", pl = "pl-PL", cs = "cs-CZ",
+        uk = "uk-UA", hi = "hi-IN", ar = "ar-JO", ca = "ca-ES",
+        da = "da-DK", fi = "fi-FI", ru = "ru-RU", el = "el-GR",
+        no = "no-NO", nb = "no-NO", nn = "no-NO", sv = "sv-SE",
+        tr = "tr-TR", hu = "hu-HU", ro = "ro-RO",
+    }
     if lang and aliases[lang] then lang = aliases[lang] end
     self._android_book_lang = lang or false
     logger.dbg("TTSEngine: Android book language =", lang or "(unknown)")
@@ -1429,9 +1437,26 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     -- block (issue #44); the timings pinpoint the culprit in logcat.
     local jni_t0 = UIManager:getTime()
     local chunk_lang = self:_androidChunkLanguage(text)
-    if chunk_lang and chunk_lang ~= self._android_tts_lang then
+    local voice_name = self.plugin
+        and self.plugin:getSetting("android_tts_voice", "")
+        or ""
+    if voice_name ~= "" then
+        if voice_name ~= self._android_tts_voice then
+            local res = atts:setVoice(voice_name)
+            logger.dbg("TTSEngine: Android TTS voice =", voice_name, "result:", res)
+            if res and res >= 0 then
+                self._android_tts_voice = voice_name
+                self._android_tts_lang = "voice:" .. voice_name
+            else
+                -- Voice name unknown to this engine; fall back to language.
+                self._android_tts_voice = false
+                logger.warn("TTSEngine: Android TTS setVoice failed for", voice_name)
+            end
+        end
+    elseif chunk_lang and chunk_lang ~= self._android_tts_lang then
         local res = atts:setLanguage(chunk_lang)
         self._android_tts_lang = chunk_lang
+        self._android_tts_voice = nil
         logger.dbg("TTSEngine: Android TTS language =", chunk_lang, "result:", res)
         if res and res < 0 and not self._android_lang_warned then
             -- LANG_MISSING_DATA / LANG_NOT_SUPPORTED: voice data not
@@ -1451,6 +1476,15 @@ function TTSEngine:synthesizeAndroid(text, audio_file, callback)
     -- round-trip between synthesis and playback.  This keeps audio going
     -- even when the Lua event loop is throttled (app backgrounded).
     local dispatch = atts:synthesizeAndPlay(text, audio_file)
+    -- Right after lazy init / setLanguage the engine can still report
+    -- not-ready (-1).  Brief retries beat skipping the first sentences.
+    if dispatch == -1 then
+        for _ = 1, 8 do
+            os.execute("usleep 50000")
+            dispatch = atts:synthesizeAndPlay(text, audio_file)
+            if dispatch == 0 then break end
+        end
+    end
     local jni_ms = time.to_ms(UIManager:getTime() - jni_t0)
     if jni_ms > 300 then
         logger.warn("TTSEngine: Android TTS JNI calls blocked for", jni_ms, "ms")
@@ -6669,6 +6703,30 @@ end
 
 function TTSEngine:getPiperSampleRate()  return self._piper:getSampleRate() end
 function TTSEngine:listPiperVoices()     return self._piper:listVoices() end
+
+--[[--
+Installed Android TTS voices (empty on other backends or if the helper
+dex is too old).  Ensures the engine is initialized first.
+@return table  list of { name, locale, quality, network }
+--]]
+function TTSEngine:listAndroidVoices()
+    if self.backend ~= self.BACKENDS.ANDROID then return {} end
+    local atts = self:_ensureAndroidTts()
+    if not atts or not atts.listVoices then return {} end
+    local ok, voices = pcall(function() return atts:listVoices() end)
+    if ok and type(voices) == "table" then return voices end
+    return {}
+end
+
+--[[--
+Forget the cached Android language/voice so the next sentence reapplies
+the current settings (after the user picks a new voice).
+--]]
+function TTSEngine:invalidateAndroidVoice()
+    self._android_tts_lang = nil
+    self._android_tts_voice = nil
+    self._android_lang_warned = nil
+end
 
 -- Thin delegates — keep the public API surface unchanged for synccontroller
 function TTSEngine:piperPrefetchAsync(text)     self._piper:enqueue(text) end

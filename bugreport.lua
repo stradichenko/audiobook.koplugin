@@ -293,7 +293,35 @@ local function collectPluginInfo(plugin)
             bt_media_control = plugin:getSetting("bt_media_control", true),
             piper_model = plugin:getSetting("piper_model", nil) and
                 sanitizePath(plugin:getSetting("piper_model", "")) or "none",
+            keep_media_overlay_bar = tostring(plugin:getSetting("keep_media_overlay_bar", false)),
+            lock_koreader_page_margins = tostring(plugin:getSetting("lock_koreader_page_margins", false)),
+            smil_sync_offset_ms = tostring(plugin:getSetting("smil_sync_offset_ms", 0)),
+            media_follow_page_turn = tostring(plugin:getSetting("media_follow_page_turn", false)),
         }
+    end
+
+    -- Built-in audiobook (EPUB Media Overlay / SMIL): technical snapshot
+    -- for diagnosis. User-facing UI never shows these strings. The book
+    -- filename is deliberately omitted (privacy); stage/error/counts suffice.
+    local diag = plugin._overlay_diag
+    if diag then
+        info.overlay_ok = diag.ok and "yes" or "no"
+        info.overlay_stage = diag.stage or "nil"
+        info.overlay_error = diag.error or "none"
+        info.overlay_at = diag.at or "nil"
+        info.overlay_timing_entries = diag.timing_entries or "nil"
+        info.overlay_chapters = diag.chapters or "nil"
+        info.overlay_audio_parts = diag.audio_parts or "nil"
+    else
+        info.overlay_ok = "not loaded this session"
+    end
+    info.has_smil_parser = (plugin._smil_parser ~= nil) and "yes" or "no"
+    info.smil_timing_count = plugin._smil_timing_data and #plugin._smil_timing_data or 0
+    -- Extension only: the document basename identifies the user's book.
+    info.smil_doc_ext = plugin._smil_doc_path
+        and (plugin._smil_doc_path:match("%.([^.]+)$") or "?") or "nil"
+    if plugin._smil_parser and plugin._smil_parser._spine_hrefs then
+        info.smil_spine_docs = #plugin._smil_parser._spine_hrefs
     end
 
     return info

@@ -207,6 +207,7 @@ function SyncController:_beginReading(text, created_bar)
     self.reading_sentence_idx = 0
     self._chain_generation = (self._chain_generation or 0) + 1
     self._highest_dispatched_idx = nil
+    self:_ttsResetClock()
     -- Don't reset _piper_warmed_up here: it persists across page turns
     -- so espeak cold-start doesn't re-trigger when Piper is already warm.
     -- Honor espeak-only mode: if the user enabled the setting, skip Piper
@@ -746,6 +747,7 @@ function SyncController:beginSentencePlayback(sentence)
     if self.playback_bar then
         self.playback_bar:updatePlayState(true)
         self.playback_bar:updateProgress(self:getProgress())
+        self:_refreshTtsTimeUi()
     end
     -- Apply visibility now: state has just transitioned to PLAYING and the
     -- "paused_only" mode needs to suppress the bar on the first sentence,
@@ -1321,8 +1323,13 @@ function SyncController:_reserveBarSpace()
     local ui = self.plugin.ui
     local tp = ui.typeset
     if not (tp and tp.unscaled_margins and ui.document and ui.document.setPageMargins) then return end
-    if not (self.playback_bar and self.playback_bar.dimen) then return end
-    local bar_h = self.playback_bar.dimen.h
+    if not self.playback_bar then return end
+    -- Mini bar height (TTS starts minimized). dimen.h can still be fullscreen
+    -- if geometry has not been applied yet.
+    local bar_h = tonumber(self.playback_bar._mini_height)
+    if (not bar_h or bar_h <= 0) and self.playback_bar.dimen then
+        bar_h = self.playback_bar.dimen.h
+    end
     if not bar_h or bar_h <= 0 then return end
     local Screen = require("device").screen
     local m = tp.unscaled_margins
@@ -1365,35 +1372,127 @@ function SyncController:showPlaybackBar()
         self:hidePlaybackBar()
     end
 
-    -- Load PlaybackBar module
-    local PlaybackBar = dofile(PLUGIN_PATH .. "playbackbar.lua")
+    -- TTS read-along reuses the AudiobookPlayer chrome in tts_mode (mini bar
+    -- with speed/sleep controls, full player with chapter list and scrubber).
+    -- Same hotfix-load convention as MediaSync.
+    local AudiobookPlayer
+    do
+        local candidates = {
+            PLUGIN_PATH .. "audiobookplayer.fix31.lua",
+            PLUGIN_PATH .. "audiobookplayer.fix30.lua",
+            PLUGIN_PATH .. "audiobookplayer.fix29.lua",
+            PLUGIN_PATH .. "audiobookplayer.lua",
+        }
+        for _, path in ipairs(candidates) do
+            local f = io.open(path, "r")
+            if f then
+                f:close()
+                AudiobookPlayer = dofile(path)
+                break
+            end
+        end
+    end
+    if not AudiobookPlayer then
+        AudiobookPlayer = dofile(PLUGIN_PATH .. "audiobookplayer.lua")
+    end
 
-    self.playback_bar = PlaybackBar:new{
-        sync_controller = self,
-        show_progress = not (self.plugin
-            and self.plugin:getSetting("hide_tts_progress_bar", false)),
+    local plugin = self.plugin
+    local title = _("Audiobook")
+    local ui = plugin and plugin.ui
+    if ui and ui.document then
+        local ok_props, props = pcall(function() return ui.document:getProps() end)
+        if ok_props and props and props.title and props.title ~= "" then
+            title = props.title
+        end
+    end
+
+    local keep_footer = false
+    if plugin and plugin.getSetting and plugin:getSetting("keep_reader_status_bars", false) then
+        keep_footer = true
+    elseif ui and ui.view and ui.view.footer_visible and ui.view.footer then
+        keep_footer = not ui.view.footer.reclaim_height
+    end
+
+    local speech_rate = (plugin and plugin.getSetting and plugin:getSetting("speech_rate", 1.0)) or 1.0
+    local volume_pct = math.floor(((plugin and plugin.getSetting
+        and plugin:getSetting("speech_volume", 1.0)) or 1.0) * 100)
+
+    local controller = self
+    self.playback_bar = AudiobookPlayer:new{
+        plugin = plugin,
+        title = title,
+        chapter_title = "",
+        output_name = title,
+        tts_mode = true,
+        start_minimized = true,
+        keep_reader_status_bars = keep_footer,
+        playback_speed = speech_rate,
+        volume_pct = volume_pct,
+        show_progress = not (plugin
+            and plugin:getSetting("hide_tts_progress_bar", false)),
+        ui_widget = ui,
         on_play_pause = function()
-            if self:isPlaying() then
-                self:pause()
-            elseif self:isPaused() then
-                self:resume()
+            if controller:isPlaying() then
+                controller:pause()
+            elseif controller:isPaused() then
+                controller:resume()
             end
         end,
-        on_rewind = function()
-            self:prevSentence()
+        on_skip_back = function()
+            controller:prevSentence()
         end,
-        on_forward = function()
-            self:nextSentence()
+        on_skip_forward = function()
+            controller:nextSentence()
+        end,
+        on_prev_chapter = function()
+            controller:jumpTocRelative(-1)
+        end,
+        on_next_chapter = function()
+            controller:jumpTocRelative(1)
+        end,
+        on_seek = function(pct)
+            controller:seekToProgress(pct)
         end,
         on_close = function()
-            self:stop()
+            controller:stop()
         end,
-        on_realign = function()
-            self:realignToReadingPage()
+        on_chapter_list = function()
+            controller:showTocPicker()
+        end,
+        on_speed = function()
+            controller:cycleSpeechRate()
+        end,
+        on_volume = function(pct)
+            controller:setSpeechVolumePct(pct)
+        end,
+        on_sleep_timer_set = function(minutes)
+            if plugin and plugin._startSleepTimer then
+                plugin:_startSleepTimer(minutes)
+            end
+        end,
+        on_sleep_timer_cancel = function()
+            if plugin and plugin._cancelSleepTimer then
+                plugin:_cancelSleepTimer()
+            end
+        end,
+        on_refocus = function()
+            controller:realignToReadingPage()
+        end,
+        on_tts_settings = function()
+            local MenuBuilder = dofile(PLUGIN_PATH .. "menubuilder.lua")
+            if MenuBuilder and MenuBuilder.showTtsSettingsPicker then
+                MenuBuilder.showTtsSettingsPicker(plugin)
+            end
         end,
     }
 
     self.playback_bar:show()
+    if plugin then
+        pcall(function()
+            self.playback_bar:updateSleepTimer(plugin:getSleepTimerRemaining(),
+                plugin._sleep_timer_end ~= nil)
+        end)
+    end
 
     -- Reflow the page so its text ends above the bar (nothing covered).
     self:_reserveBarSpace()
@@ -1499,6 +1598,7 @@ function SyncController:updatePlaybackBar()
 
     -- Update play/pause state
     self.playback_bar:updatePlayState(self:isPlaying())
+    self:_refreshTtsTimeUi()
 end
 
 --[[--
@@ -1732,6 +1832,7 @@ function SyncController:startSentenceSyncLoop(sentence)
         if self.playback_bar and self.playback_bar._isOverlayActive and self.playback_bar:_isOverlayActive() then
             if not self._auto_paused_by_overlay then
                 self._auto_paused_by_overlay = true
+                logger.warn("SyncController: auto-pause, extra UI widget on stack")
                 self:pause(true)   -- auto=true: overlay-initiated pause
             end
             -- Keep polling so we can resume when the overlay closes
@@ -2000,6 +2101,7 @@ function SyncController:pause(auto)
         if not auto then
             self._user_paused = true
         end
+        self:_ttsMarkPause()
 
         if self.playback_bar then
             self.playback_bar:updatePlayState(false)
@@ -2034,6 +2136,7 @@ function SyncController:resume(auto)
         end
 
         self.tts_engine:resume()
+        self:_ttsMarkPlay()
 
         if self.playback_bar then
             self.playback_bar:updatePlayState(true)
@@ -2433,6 +2536,206 @@ function SyncController:getProgress()
         return math.min(100, (effective_idx / self.total_sentences) * 100)
     end
     return 0
+end
+
+-- Elapsed wall-clock of actual speech (pauses excluded), for the TTS bar's
+-- time display.  Total is estimated as elapsed / progress once enough of
+-- the page has been read to make the estimate meaningful.
+function SyncController:_ttsResetClock()
+    self._tts_elapsed_acc = 0
+    self._tts_play_t0 = UIManager:getTime()
+end
+
+function SyncController:_ttsMarkPlay()
+    self._tts_play_t0 = UIManager:getTime()
+end
+
+function SyncController:_ttsMarkPause()
+    if self._tts_play_t0 then
+        local ok, dt = pcall(function()
+            return time.to_s(UIManager:getTime() - self._tts_play_t0)
+        end)
+        if ok and dt then
+            self._tts_elapsed_acc = (self._tts_elapsed_acc or 0) + dt
+        end
+        self._tts_play_t0 = nil
+    end
+end
+
+function SyncController:_ttsElapsedSec()
+    local acc = self._tts_elapsed_acc or 0
+    if self.state == self.STATE.PLAYING and self._tts_play_t0 then
+        local ok, dt = pcall(function()
+            return time.to_s(UIManager:getTime() - self._tts_play_t0)
+        end)
+        if ok and dt then
+            acc = acc + dt
+        end
+    end
+    return acc
+end
+
+function SyncController:_refreshTtsTimeUi()
+    local bar = self.playback_bar
+    if not bar or not bar.updateTimeDisplay then return end
+    local elapsed = self:_ttsElapsedSec()
+    local progress = self:getProgress() / 100
+    local total = 0
+    if progress > 0.05 and elapsed > 0.5 then
+        total = elapsed / progress
+    end
+    pcall(function() bar:updateTimeDisplay(elapsed, total) end)
+end
+
+-- Same rate list as the speech-rate picker in the TTS settings dialog.
+function SyncController:cycleSpeechRate()
+    local speeds = {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0}
+    local plugin = self.plugin
+    local current = (plugin and plugin.getSetting and plugin:getSetting("speech_rate", 1.0)) or 1.0
+    local next_speed = speeds[1]
+    for i, s in ipairs(speeds) do
+        if math.abs(current - s) < 0.01 then
+            next_speed = speeds[i + 1] or speeds[1]
+            break
+        end
+    end
+    if plugin and plugin.setSetting then
+        plugin:setSetting("speech_rate", next_speed)
+    end
+    if self.tts_engine and self.tts_engine.setRate then
+        self.tts_engine:setRate(next_speed)
+    end
+    if self.playback_bar and self.playback_bar.updateSpeed then
+        pcall(function() self.playback_bar:updateSpeed(next_speed) end)
+    end
+end
+
+function SyncController:setSpeechVolumePct(pct)
+    pct = tonumber(pct) or 100
+    if pct < 0 then pct = 0 end
+    if pct > 100 then pct = 100 end
+    local vol = pct / 100
+    if self.plugin and self.plugin.setSetting then
+        self.plugin:setSetting("speech_volume", vol)
+    end
+    if self.tts_engine and self.tts_engine.setVolume then
+        self.tts_engine:setVolume(vol)
+    end
+end
+
+-- Scrub the page: pct (0-1) maps onto the sentence index, playback restarts
+-- from that sentence.
+function SyncController:seekToProgress(pct)
+    if not self.parsed_data or not self.total_sentences or self.total_sentences < 1 then
+        return
+    end
+    pct = tonumber(pct) or 0
+    if pct < 0 then pct = 0 end
+    if pct > 1 then pct = 1 end
+    local target = math.max(1, math.min(self.total_sentences, math.floor(pct * self.total_sentences + 0.5)))
+    self:_cleanConcatFiles()
+    pcall(function() self.tts_engine:stop() end)
+    if self.highlight_manager then
+        pcall(function() self.highlight_manager:clearHighlights() end)
+    end
+    self._highest_dispatched_idx = nil
+    -- readNextSentence() increments, so land on `target`
+    self.reading_sentence_idx = target - 1
+    self:readNextSentence()
+end
+
+function SyncController:_documentToc()
+    local ui = self.plugin and self.plugin.ui
+    if not (ui and ui.document and ui.document.getToc) then return nil end
+    local ok, toc = pcall(function() return ui.document:getToc() end)
+    if ok and type(toc) == "table" and #toc > 0 then return toc end
+    return nil
+end
+
+function SyncController:_gotoTocEntry(entry)
+    if not entry then return end
+    local ui = self.plugin and self.plugin.ui
+    if not ui then return end
+    if entry.xpointer and ui.rolling then
+        ui:handleEvent(Event:new("GotoXPointer", entry.xpointer))
+    elseif entry.page and ui.document and ui.document.gotoPage then
+        pcall(function() ui.document:gotoPage(entry.page, true) end)
+    end
+    local controller = self
+    UIManager:scheduleIn(0.35, function()
+        if controller.state == controller.STATE.STOPPED then return end
+        local text = controller.plugin and controller.plugin.getCurrentPageText
+            and controller.plugin:getCurrentPageText()
+        if text and text ~= "" then
+            controller:start(text)
+        end
+    end)
+end
+
+function SyncController:jumpTocRelative(delta)
+    local toc = self:_documentToc()
+    if not toc then
+        if delta > 0 then self:nextSentence() else self:prevSentence() end
+        return
+    end
+    local current_page
+    local ui = self.plugin and self.plugin.ui
+    if ui and ui.document and ui.document.getCurrentPage then
+        local ok, page = pcall(function() return ui.document:getCurrentPage() end)
+        if ok then current_page = page end
+    end
+    local idx = 1
+    if current_page then
+        for i, entry in ipairs(toc) do
+            if entry.page and entry.page <= current_page then
+                idx = i
+            end
+        end
+    end
+    idx = idx + delta
+    if idx < 1 then idx = 1 end
+    if idx > #toc then idx = #toc end
+    self:_gotoTocEntry(toc[idx])
+end
+
+function SyncController:showTocPicker()
+    local toc = self:_documentToc()
+    local MenuBuilder = dofile(PLUGIN_PATH .. "menubuilder.lua")
+    if not toc then
+        local InfoMessage = require("ui/widget/infomessage")
+        UIManager:show(InfoMessage:new{
+            text = _("No chapters available."),
+            timeout = 2,
+        })
+        return
+    end
+    local items = {}
+    local current = 1
+    local current_page
+    local ui = self.plugin and self.plugin.ui
+    if ui and ui.document and ui.document.getCurrentPage then
+        local ok, page = pcall(function() return ui.document:getCurrentPage() end)
+        if ok then current_page = page end
+    end
+    for i, entry in ipairs(toc) do
+        local title = entry.title or (_("Chapter") .. " " .. i)
+        table.insert(items, {
+            text = title,
+            callback = function()
+                self:_gotoTocEntry(entry)
+            end,
+        })
+        if current_page and entry.page and entry.page <= current_page then
+            current = i
+        end
+    end
+    if MenuBuilder and MenuBuilder.showPagedPicker then
+        MenuBuilder.showPagedPicker({
+            title = _("Chapters"),
+            items = items,
+            current = current,
+        })
+    end
 end
 
 return SyncController

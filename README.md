@@ -83,7 +83,7 @@ If `opkg` is unavailable, grab the `.ipk` from [nickel-packages](https://github.
 
 **Linux** -- `sudo apt install espeak-ng`
 
-**Android (Boox, etc.)** -- the pre-built release includes `tts_helper.dex`, which bridges to the device's built-in TTS engine (Google, Samsung, etc.). Just unzip and copy the folder like any other platform. No extra steps needed.
+**Android (Boox, etc.)** -- the pre-built release includes `tts_helper.dex`, which bridges to the **device's system TTS engine** (Google, Samsung, SherpaTTS, ...). The bundled Piper / espeak-ng binaries and the HuggingFace `.onnx` voices in `piper/` **do not run on Android**. For natural neural voices, install [SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/) and set it as the default engine. Full walkthrough: [High-quality voices on Android](#high-quality-voices-on-android-sherpatts).
 
 If you cloned the repo instead of downloading a release, build the `.dex` manually (requires Android SDK):
 
@@ -101,6 +101,8 @@ The bundled espeak-ng and Piper binaries are for Linux-based e-readers and will 
 - Or go to **Tools > Audiobook Read-Along > Start reading from current page**.
 
 ## Optional: Piper neural TTS
+
+> **Android:** skip this section. The plugin's Piper binaries and HuggingFace `.onnx` files cannot run on Android. Use a system TTS engine such as SherpaTTS instead: [High-quality voices on Android](#high-quality-voices-on-android-sherpatts).
 
 Piper sounds much more natural than espeak-ng. It runs fully offline on Kobo's ARM processor (~40 MB for engine + voice model). The [pre-built release](https://github.com/stradichenko/audiobook.koplugin/releases/latest) already includes Piper and a default voice (`en_US-danny-low`). For faster load times on Kobo, `low` quality voices like this one are recommended (see [Choosing a voice](#choosing-a-voice)). To build a bundle yourself, see [Building from source](#building-from-source).
 
@@ -191,7 +193,7 @@ All settings are under **Tools > Audiobook Read-Along**:
   - **Bluetooth** - pair, connect, disconnect, scan
   - **Headset media buttons** - use play/pause/next/prev on a Bluetooth headset or speaker to control TTS playback
   - **Disconnect alert** - notify if all BT audio devices disconnect during playback
-- **Voice settings** - TTS engine, voice, speech rate, pitch, volume, sentence/paragraph pauses (espeak-ng), sentence/paragraph gaps (Piper), word gap, clause pause. Includes **Quick start with espeak** (Piper-only) which plays the first sentence with espeak-ng while Piper loads, avoiding the ~3s cold start silence.
+- **Voice settings** - TTS engine, voice, speech rate, pitch, volume, sentence/paragraph pauses (espeak-ng), sentence/paragraph gaps (Piper), word gap, clause pause. Includes **Quick start with espeak** (Piper-only) which plays the first sentence with espeak-ng while Piper loads, avoiding the ~3s cold start silence. **Android:** language and voice are chosen here (or from the overlay **⚙**); neural quality comes from the system engine (see [SherpaTTS](#high-quality-voices-on-android-sherpatts)).
 - **General settings**
   - **Audio output (PocketBook)** - ALSA device selection for PocketBook firmware quirks
   - **Keep playing when lid is closed** - prevents device suspend so audio continues with the case closed
@@ -267,6 +269,7 @@ audiobook.koplugin/
 | No audio player found (Kindle) | Pair BT headphones via the Kindle top-swipe menu **before** starting playback. If already paired, restart KOReader so the plugin re-detects the audio output. |
 | No TTS engine found | Install espeak-ng (see Quick start). |
 | No TTS engine found (Android) | Ensure `android/tts_helper.dex` is present inside the plugin folder. The pre-built release includes it; if you cloned from source, run `./build-dex.sh` in the `android/` directory. The device must also have a TTS engine installed (most do by default). See [Android support](#android-support). |
+| Android TTS is robotic / not my SherpaTTS voice | SherpaTTS is installed but is **not** Android's preferred TTS engine. The plugin always uses the system default. Follow [High-quality voices on Android](#high-quality-voices-on-android-sherpatts), then fully quit KOReader and reopen it. |
 | BT audio silent | Restart KOReader to kill orphan pipelines. Check BT is paired in the plugin menu. |
 | SSH refused on port 22 | KOReader uses port 2222: `ssh root@<ip> -p 2222` |
 | `.adds` not visible | Enable hidden files on your OS. The folder starts with a dot. |
@@ -440,7 +443,7 @@ Attach the report file to a [GitHub issue](https://github.com/stradichenko/audio
 
 ## Android support
 
-Android TTS is supported via a JNI bridge to the device's built-in `TextToSpeech` engine (Google, Samsung, etc.). No Termux, no extra APKs, no root required.
+Android TTS is supported via a JNI bridge to the device's **system** `TextToSpeech` engine (Google, Samsung, SherpaTTS, ...). No Termux and no root required. The plugin does **not** run the bundled Piper / espeak-ng binaries on Android.
 
 | Feature | Status |
 |---------|--------|
@@ -448,8 +451,8 @@ Android TTS is supported via a JNI bridge to the device's built-in `TextToSpeech
 | Text parsing & highlighting | ![Works](https://img.shields.io/badge/-works-brightgreen) |
 | Android system TTS | ![Works](https://img.shields.io/badge/-works-brightgreen) Via JNI bridge to `TextToSpeech` API |
 | Audio playback | ![Works](https://img.shields.io/badge/-works-brightgreen) Via Android `MediaPlayer` |
-| Bundled espeak-ng / Piper | ![No](https://img.shields.io/badge/-not%20supported-red) Linux binaries, won't run on Android |
-| espeak-ng via Termux | ![Untested](https://img.shields.io/badge/-untested-yellow) May work if `espeak-ng` is in PATH |
+| Bundled espeak-ng / Piper / HuggingFace `.onnx` | ![No](https://img.shields.io/badge/-not%20supported-red) Linux/glibc binaries, use SherpaTTS instead |
+| High-quality neural voices | ![Works](https://img.shields.io/badge/-works-brightgreen) Via a system engine such as [SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/) |
 
 ### Setup
 
@@ -476,30 +479,91 @@ For the full technical analysis, see [docs/ANDROID_TTS.md](docs/ANDROID_TTS.md).
 
 ### Limitations
 
-- Uses the device's default TTS voice (voice picker UI not yet implemented)
 - Word timing is estimated (Android TTS does not provide per-word callbacks when synthesizing to file)
 - First sentence may have a brief delay while the TTS engine initializes
+- The plugin uses whatever engine Android has as **preferred TTS**. Installing SherpaTTS is not enough until you set it as that preferred engine.
 
-### Neural TTS engines (offline)
+### High-quality voices on Android (SherpaTTS)
 
-The plugin uses whatever engine you set as Android's default TTS. The factory default (Google or Samsung) is decent, but installing a free, open-source neural engine gives you offline voices comparable to Piper on Linux e-readers.
+On Android the plugin never loads the HuggingFace Piper models shipped in `audiobook.koplugin/piper/`. Those `.onnx` files need the Linux Piper binary (glibc). Android uses Bionic, so that binary cannot start.
 
-#### Quick setup
+What *does* work is the system `TextToSpeech` API. Any app that registers as an Android TTS engine (Google, Samsung, or a neural engine such as **SherpaTTS**) can then speak for KOReader.
 
-1. Install one of the engines below.
-2. Open **Android Settings → System → Languages & input → Text-to-speech output** (path varies by manufacturer skin).
-3. Set "Preferred engine" to the new engine, pick a voice, and tap "Listen to an example" to confirm.
-4. Restart KOReader. The plugin will route synthesis through the new engine automatically.
+SherpaTTS runs Piper / VITS models *inside Android*, offline, with quality close to Piper on Kobo. The example below uses **`fr-FR-miro-high`**. The same steps apply to any other language or model (English lessac, German thorsten, ...).
 
-| Engine | Distribution | Min Android | Models | Notes |
-|--------|--------------|-------------|--------|-------|
-| [SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/) | F-Droid (signed, audited) | 10+ | Piper / VITS via Sherpa-ONNX, downloaded on first launch | Single app with built-in model picker. Easiest, most trustworthy install. |
-| [VoxSherpa TTS](https://github.com/CodeBySonu95/VoxSherpa-TTS) | GitHub APK (sideload) | 11+ | Piper / VITS plus Kokoro 82M; imports any Sherpa-ONNX `.onnx` | Newest. Pick this if you want Kokoro or to drop in your own `.onnx` voices. |
-| [Sherpa-ONNX engine APKs](https://k2-fsa.github.io/sherpa/onnx/tts/apk-engine.html) | Direct APK from k2-fsa | varies | One voice per APK | Use only if you want a specific pre-bundled model and nothing else. |
+#### 1. Install SherpaTTS
 
-If you're unsure, start with **SherpaTTS** from F-Droid. It is signed by F-Droid (no sideloading from random hosts), works on Android 10+, lets you pick models inside the app, and has a longer track record. Move to VoxSherpa later if you want Kokoro or custom `.onnx` imports.
+1. On the tablet, install **[SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/)** (`org.woheller69.ttsengine`) from [F-Droid](https://f-droid.org/). That is the recommended source (signed, updates).
+2. Open **SherpaTTS** once so Android registers it as a TTS engine.
 
-> Android only allows one default TTS engine system-wide, so switching engines for KOReader changes it for every app that uses TTS (TalkBack, navigation, other readers).
+Skip this step if SherpaTTS is already installed.
+
+#### 2. Install the voice inside SherpaTTS (not in the plugin)
+
+Do **not** copy `fr_FR-miro-high.onnx` into `koreader/plugins/audiobook.koplugin/piper/`. The plugin will ignore it on Android.
+
+1. Open **SherpaTTS**.
+2. Open **Manage Languages**.
+3. Choose **French** (or the language you need).
+4. Download / enable **`fr-FR-miro-high`** (the app may show it as `miro` + quality `high`).
+5. If several French models are installed, tap **miro-high** so it is the active model for French.
+6. Optional: play the in-app preview.
+
+Internet is only needed for this download. After that, synthesis is offline.
+
+You already have `fr-FR-miro-high` installed? Confirm it is listed and selected in **Manage Languages**, then go to step 3.
+
+#### 3. Make SherpaTTS the *system* default engine (required)
+
+Android allows only **one** preferred TTS engine. KOReader always talks to that engine. If Google TTS is still preferred, you will keep hearing Google even though Miro is installed in SherpaTTS.
+
+**Onyx Boox** ([official path](https://help.boox.com/hc/en-us/articles/360031058312-How-could-I-download-new-TTS-engine-on-BOOX-device-and-use-it-as-the-default-TTS-on-our-device)):
+
+1. Open the Android **Settings** app (not KOReader, not NeoReader).
+2. Go to **Language & input → Text-to-speech (TTS) output**.
+   On some firmware this is **Language → Voice → Text-to-speech output**.
+3. Under **Preferred engine**, select **SherpaTTS**.
+4. Set **Language** to **French (France)** if the list offers it.
+5. If a gear icon appears next to SherpaTTS, open it and pick the Miro / `fr-FR` voice.
+6. Tap **Listen to an example**. You should hear the neural Miro voice, not Google.
+
+**Other Android devices:** **Settings → System → Languages & input → Text-to-speech**. Same: preferred engine = SherpaTTS, then language / voice.
+
+Fully **quit KOReader** (swipe it away from Recents) and reopen it so it reconnects to the new engine. A plugin reload is not enough if TextToSpeech was already created with Google.
+
+> Changing the preferred engine is system-wide: TalkBack, NeoReader, navigation apps, and other readers will also use SherpaTTS.
+
+#### 4. Use it in this plugin
+
+1. Open a book in KOReader.
+2. Start TTS: long-press a word → **Read aloud from here**, or **Tools → Audiobook Read-Along → Start reading from current page**.
+3. On the playback bar, tap the centre to expand the player (or open **⚙**).
+4. **TTS settings → Voice → French**.
+   - **Auto (book language)** is enough when the EPUB metadata language is French (`fr` / `fr-FR`).
+   - You can also set the voice from **Tools → Audiobook Read-Along → Voice settings → Voice**.
+
+On Android the **Voice** menu lists the voices installed in the system engine and sends the pick to it. It does **not** download HuggingFace models into the plugin. With SherpaTTS as preferred engine and `fr-FR-miro-high` installed, French voices map to Miro.
+
+#### 5. Checks if it is still the wrong voice
+
+| You hear... | Cause | Fix |
+|-----------|--------|-----|
+| Google / Samsung / robotic voice | SherpaTTS is not the preferred engine | Repeat step 3, then fully quit KOReader |
+| English on a French book | Language not set to `fr-FR` | Overlay **⚙ → Voice → French**, or Auto if the book language is French |
+| No speech / "No TTS engine found" | `tts_helper.dex` missing, or no TTS engine at all | Use a release zip; confirm SherpaTTS opens |
+| Model in `audiobook.koplugin/piper/` but unused | Expected on Android | Install the model in SherpaTTS instead (step 2) |
+
+#### Other engines
+
+SherpaTTS from F-Droid is the usual choice. Alternatives:
+
+| Engine | Distribution | Notes |
+|--------|--------------|-------|
+| [SherpaTTS](https://f-droid.org/packages/org.woheller69.ttsengine/) | F-Droid | Piper / VITS via Sherpa-ONNX. Built-in model picker. |
+| [VoxSherpa TTS](https://github.com/CodeBySonu95/VoxSherpa-TTS) | GitHub APK | Kokoro 82M and custom Sherpa-ONNX `.onnx` import. |
+| [Sherpa-ONNX engine APKs](https://k2-fsa.github.io/sherpa/onnx/tts/apk-engine.html) | k2-fsa | One pre-bundled voice per APK. |
+
+Preview Piper-family voices (including Miro) at [piper-samples](https://rhasspy.github.io/piper-samples/) or the [k2-fsa TTS space](https://huggingface.co/spaces/k2-fsa/text-to-speech).
 
 ## Building from source
 
@@ -536,7 +600,6 @@ If you don't want to use the packaging script, you can assemble the Piper runtim
 
 - Implement real word-level timing from TTS engines (SSML / phoneme callbacks)
 - Add PDF/DjVu highlight support (currently EPUB only)
-- Voice picker for Android TTS engines and voices
 - Integrate more TTS backends
 - Improve accessibility
 - Support whole audiobook production with hash-based verification
