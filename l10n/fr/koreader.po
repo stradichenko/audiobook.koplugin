@@ -496,7 +496,7 @@ msgstr "Aucun client disponible."
 msgid "BT"
 msgstr "BT"
 
-#: audiobookplayer.lua:263 audiobookplayer.lua:759 audiobookplayer.lua:1145 audiobookplayer.lua:1529 mediasync.lua:2424 mediasync.lua:2432 synccontroller.lua:1400
+#: audiobookplayer.lua:263 audiobookplayer.lua:759 audiobookplayer.lua:1145 audiobookplayer.lua:1529 mediasync.lua:2424 mediasync.lua:2432 synccontroller.lua:1401
 msgid "Audiobook"
 msgstr "Livre audio"
 
@@ -1138,8 +1138,8 @@ msgid "Android: persistent audio stream"
 msgstr "Android : flux audio persistant"
 
 #: main.lua:788
-msgid "Workaround for Android devices where read-aloud audio cuts off mid-sentence and stalls (seen on some MTK e-readers). Plays synthesized audio through one persistent, continuously-fed audio track instead of a fresh media player per sentence, the same way the system's own TTS plays. Off by default; the plugin also switches to it automatically for the rest of the session when it detects a stalled clip. Takes effect from the next sentence."
-msgstr "Solution de contournement pour les appareils Android où la lecture audio à haute voix coupe le milieu de la phrase et se bloque (observée sur certaines liseuses électroniques MTK). Lit l'audio synthétisé via une piste audio persistante et alimentée en continu au lieu d'un nouveau lecteur multimédia par phrase, de la même manière que le TTS du système est lu. Désactivé par défaut ; le plugin y bascule également automatiquement pour le reste de la session lorsqu'il détecte un clip bloqué. Prend effet à partir de la phrase suivante."
+msgid "Workaround for Android devices where read-aloud audio cuts off mid-sentence and stalls (seen on some MTK e-readers). Plays synthesized audio through one persistent, continuously-fed audio track instead of a fresh media player per sentence. Leave this off for neural engines such as SherpaTTS: the persistent stream adds hiss and pitch artifacts. Off by default; the plugin also switches to it automatically for the rest of the session when it detects a stalled clip, except on neural engines. Takes effect from the next sentence."
+msgstr "Solution de contournement pour les appareils Android où la lecture audio à haute voix coupe le milieu de la phrase et se bloque (observée sur certaines liseuses électroniques MTK). Lit l'audio synthétisé via une piste audio persistante et alimentée en continu au lieu d'un nouveau lecteur multimédia par phrase. Laissez cette option désactivée pour les moteurs neuronaux tels que SherpaTTS : le flux persistant ajoute du souffle et des artefacts de hauteur. Désactivé par défaut ; le plugin y bascule également automatiquement pour le reste de la session lorsqu'il détecte un clip bloqué, sauf sur les moteurs neuronaux. Prend effet à partir de la phrase suivante."
 
 #: main.lua:791
 msgid "Keep playing when lid is closed"
@@ -1417,7 +1417,7 @@ msgstr ""
 "\n"
 "Reconnexion de vos écouteurs… une fois connecté, réessayez."
 
-#: main.lua:1472 main.lua:2924
+#: main.lua:1472 main.lua:2943
 msgid "No document is currently open."
 msgstr "Aucun document n'est actuellement ouvert."
 
@@ -1475,15 +1475,15 @@ msgstr ""
 msgid "Built-in audiobook ready"
 msgstr "Livre audio intégré prêt"
 
-#: main.lua:1734 main.lua:2955
+#: main.lua:1734 main.lua:2974
 msgid "Could not load the built-in audiobook."
 msgstr "Impossible de charger le livre audio intégré."
 
-#: main.lua:1741 main.lua:2985
+#: main.lua:1741 main.lua:3004
 msgid "Loading the built-in audiobook…"
 msgstr "Chargement du livre audio intégré…"
 
-#: main.lua:1767 main.lua:2932 main.lua:3007
+#: main.lua:1767 main.lua:2951 main.lua:3026
 msgid "This book has no built-in audiobook."
 msgstr "Ce livre ne contient pas de livre audio intégré."
 
@@ -1503,31 +1503,31 @@ msgstr ""
 "Aucun fichier audio trouvé dans\n"
 "%1"
 
-#: main.lua:2149 main.lua:2565 main.lua:4256
+#: main.lua:2149 main.lua:2565 main.lua:4261
 msgid "Unknown book"
 msgstr "Livre inconnu"
 
-#: main.lua:2159 main.lua:4259
+#: main.lua:2159 main.lua:4264
 msgid "Resume from %1?"
 msgstr "Reprendre à partir de %1 ?"
 
-#: main.lua:2161 main.lua:2569 main.lua:4261
+#: main.lua:2161 main.lua:2569 main.lua:4266
 msgid "Book: %1"
 msgstr "Livre : %1"
 
-#: main.lua:2164 main.lua:2572 main.lua:4264
+#: main.lua:2164 main.lua:2572 main.lua:4269
 msgid "Chapter: %1"
 msgstr "Chapitre : %1"
 
-#: main.lua:2167 main.lua:2576 main.lua:4267
+#: main.lua:2167 main.lua:2576 main.lua:4272
 msgid "Last played: %1"
 msgstr "Dernière lecture : %1"
 
-#: main.lua:2170 main.lua:2590 main.lua:4270
+#: main.lua:2170 main.lua:2590 main.lua:4275
 msgid "Resume"
 msgstr "Reprendre"
 
-#: main.lua:2178 main.lua:2605 main.lua:4278
+#: main.lua:2178 main.lua:2605 main.lua:4283
 msgid "From start"
 msgstr "Depuis le début"
 
@@ -1603,7 +1603,7 @@ msgstr "Sélectionnez le nombre de minutes."
 msgid "Sleep timer: playback paused."
 msgstr "Minuteur de veille : lecture en pause."
 
-#: main.lua:3049
+#: main.lua:3068
 msgid ""
 "\n"
 "\n"
@@ -1613,11 +1613,11 @@ msgstr ""
 "\n"
 "Ce livre intègre une narration : utilisez plutôt \"Lire un livre audio aligné à partir d'ici\"."
 
-#: main.lua:3052 menubuilder.lua:1857 menubuilder.lua:1917
+#: main.lua:3071 menubuilder.lua:1857 menubuilder.lua:1917
 msgid "TTS engine is not available."
 msgstr "Le moteur TTS n'est pas disponible."
 
-#: main.lua:3077
+#: main.lua:3096
 msgid ""
 "\n"
 "\n"
@@ -1627,11 +1627,11 @@ msgstr ""
 "\n"
 "Pour cette lecture à haute voix EPUB, utilisez « Lire un livre audio aligné à partir d'ici »."
 
-#: main.lua:3080
+#: main.lua:3099
 msgid "Could not retrieve page text for TTS."
 msgstr "Impossible de récupérer le texte de la page pour TTS."
 
-#: main.lua:4196
+#: main.lua:4201
 msgid "Audiobookshelf modules not available."
 msgstr "Modules Audiobookshelf non disponibles."
 
@@ -1669,7 +1669,7 @@ msgstr "Mélange désactivé."
 msgid "Audio playback failed: "
 msgstr "Échec de la lecture audio :"
 
-#: mediasync.lua:2872 mediasync.lua:3017 mediasync.lua:3045 mediasync.lua:3057 synccontroller.lua:2707
+#: mediasync.lua:2872 mediasync.lua:3017 mediasync.lua:3045 mediasync.lua:3057 synccontroller.lua:2715
 msgid "No chapters available."
 msgstr "Aucun chapitre disponible."
 
@@ -1685,11 +1685,11 @@ msgstr "Préc."
 msgid "Close"
 msgstr "Fermer"
 
-#: mediasync.lua:2966 mediasync.lua:3035 mediasync.lua:3090 synccontroller.lua:2734
+#: mediasync.lua:2966 mediasync.lua:3035 mediasync.lua:3090 synccontroller.lua:2742
 msgid "Chapters"
 msgstr "Chapitres"
 
-#: mediasync.lua:3027 mediasync.lua:3081 synccontroller.lua:2721
+#: mediasync.lua:3027 mediasync.lua:3081 synccontroller.lua:2729
 msgid "Chapter"
 msgstr "Chapitre"
 
@@ -2615,15 +2615,15 @@ msgstr ""
 "Piper est toujours en train de synthétiser.\n"
 "Pour une lecture plus rapide, passez au backend espeak dans Outils → Livre audio → Moteur TTS."
 
-#: synccontroller.lua:2257
+#: synccontroller.lua:2265
 msgid "low-resource mode"
 msgstr "mode à faibles ressources"
 
-#: synccontroller.lua:2258
+#: synccontroller.lua:2266
 msgid "sentence splitting"
 msgstr "fractionnement de phrase"
 
-#: synccontroller.lua:2262
+#: synccontroller.lua:2270
 msgid ""
 "Piper is synthesizing slower than playback (%1x realtime).\n"
 "Applying %2 to compensate (this session only)."
@@ -2631,7 +2631,7 @@ msgstr ""
 "Piper synthétise plus lentement que la lecture (%1x en temps réel).\n"
 "Appliquer %2 pour compenser (cette séance uniquement)."
 
-#: synccontroller.lua:2283
+#: synccontroller.lua:2291
 msgid ""
 "This device is too slow for Piper voices.\n"
 "Switching to espeak for this session.\n"
@@ -2641,15 +2641,15 @@ msgstr ""
 "Passage à espeak pour cette session.\n"
 "Piper sera réessayé la prochaine fois que vous lancerez la lecture."
 
-#: synccontroller.lua:2311
+#: synccontroller.lua:2319
 msgid "it still had not produced any audio after %1 espeak sentences"
 msgstr "elle n’avait toujours produit aucun audio après %1 phrases espeak"
 
-#: synccontroller.lua:2316
+#: synccontroller.lua:2324
 msgid "it still had not produced any audio after %1 minutes of espeak fallback"
 msgstr "elle n’avait toujours produit aucun audio après %1 minutes de repli espeak"
 
-#: synccontroller.lua:2328
+#: synccontroller.lua:2336
 msgid ""
 "Piper neural TTS could not keep up on this device: %1.\n"
 "\n"
@@ -2773,7 +2773,7 @@ msgstr ""
 "\n"
 "Sortie d'erreur :"
 
-#: ttsengine.lua:1468
+#: ttsengine.lua:1523
 msgid ""
 "Android TTS: no voice available for %1.\n"
 "Install the matching voice data in Android's Text-to-speech settings, or pick a different language in Voice settings."
@@ -2781,7 +2781,7 @@ msgstr ""
 "Android TTS : aucune voix disponible pour %1.\n"
 "Installez les données vocales correspondantes dans les paramètres de synthèse vocale de Android ou choisissez une langue différente dans les paramètres vocaux."
 
-#: ttsengine.lua:1922
+#: ttsengine.lua:1978
 msgid ""
 "Bluetooth audio pipeline failed.\n"
 "\n"
@@ -2809,11 +2809,11 @@ msgstr ""
 "\n"
 "La lecture audio en lecture continue a été arrêtée."
 
-#: ttsengine.lua:1972
+#: ttsengine.lua:2028
 msgid "No audio file to play."
 msgstr "Aucun fichier audio à lire."
 
-#: ttsengine.lua:1995
+#: ttsengine.lua:2051
 msgid ""
 "No audio output available.\n"
 "\n"
@@ -2827,7 +2827,7 @@ msgstr ""
 "\n"
 "Veuillez générer un rapport de bug (Livre audio > Générer un rapport de bug) et le partager sur le problème GitHub - cela aidera à identifier le chemin audio correct pour ce modèle Kindle."
 
-#: ttsengine.lua:1997
+#: ttsengine.lua:2053
 msgid ""
 "No audio output available.\n"
 "\n"
@@ -2847,7 +2847,7 @@ msgstr ""
 "\n"
 "Puis réessayez."
 
-#: ttsengine.lua:1999
+#: ttsengine.lua:2055
 msgid ""
 "No audio output available.\n"
 "\n"
@@ -2867,7 +2867,7 @@ msgstr ""
 "\n"
 "Si cela ne résout pas le problème, générez un rapport de bug (Livre audio > Générer un rapport de bug) et partagez-le sur GitHub."
 
-#: ttsengine.lua:2001
+#: ttsengine.lua:2057
 msgid ""
 "No audio output available.\n"
 "\n"
@@ -2881,7 +2881,7 @@ msgstr ""
 "\n"
 "Si vous utilisez Bluetooth, assurez-vous que les écouteurs sont appairés et connectés."
 
-#: ttsengine.lua:2092
+#: ttsengine.lua:2148
 msgid ""
 "No audio output available.\n"
 "\n"
@@ -2895,7 +2895,7 @@ msgstr ""
 "\n"
 "Si vous avez déjà des écouteurs connectés, veuillez générer un rapport de bug (Livre audio > Générer un rapport de bug) et partagez-le sur GitHub — cela aidera à identifier le chemin audio correct pour ce modèle Kindle."
 
-#: ttsengine.lua:2094 ttsengine.lua:6260
+#: ttsengine.lua:2150 ttsengine.lua:6322
 msgid ""
 "No audio output available.\n"
 "\n"
@@ -2915,7 +2915,7 @@ msgstr ""
 "3. Scannez et associez vos écouteurs/haut-parleurs\n"
 "4. Recommencez ensuite la lecture."
 
-#: ttsengine.lua:2186
+#: ttsengine.lua:2242
 msgid ""
 "No Bluetooth headphones detected.\n"
 "\n"
@@ -2925,7 +2925,7 @@ msgstr ""
 "\n"
 "Ce Kindle n'a pas de haut-parleur intégré. Connectez les écouteurs Bluetooth dans Paramètres → Wi-Fi & Bluetooth avant de jouer."
 
-#: ttsengine.lua:2251
+#: ttsengine.lua:2307
 msgid ""
 "No audio output available.\n"
 "\n"
@@ -2935,7 +2935,7 @@ msgstr ""
 "\n"
 "Sur ce PocketBook, la lecture directe de ALSA peut endommager le sous-système audio. Veuillez d'abord connecter les écouteurs Bluetooth, puis réessayer."
 
-#: ttsengine.lua:2351
+#: ttsengine.lua:2407
 msgid ""
 "Using Kindle's built-in voice.\n"
 "\n"
@@ -2949,7 +2949,7 @@ msgstr ""
 "\n"
 "La mise en surbrillance des mots peut être légèrement moins précise avec la voix intégrée."
 
-#: ttsengine.lua:2631
+#: ttsengine.lua:2687
 msgid ""
 "Kindle native TTS failed.\n"
 "\n"
@@ -2959,7 +2959,7 @@ msgstr ""
 "\n"
 "Le binaire d'assistance de synthèse vocale n'a pas pu être exécuté. Veuillez générer un rapport de bug et le partager sur GitHub."
 
-#: ttsengine.lua:2643
+#: ttsengine.lua:2699
 msgid ""
 "Kindle native TTS failed.\n"
 "\n"
@@ -2969,7 +2969,7 @@ msgstr ""
 "\n"
 "Le moteur de synthèse vocale n'a pas pu produire de son. Veuillez générer un rapport de bug et le partager sur GitHub."
 
-#: ttsengine.lua:2890
+#: ttsengine.lua:2946
 msgid ""
 "Kindle native TTS failed.\n"
 "\n"
@@ -2983,7 +2983,7 @@ msgstr ""
 "\n"
 "Veuillez générer un rapport de bug et le partager sur GitHub."
 
-#: ttsengine.lua:3008
+#: ttsengine.lua:3064
 msgid ""
 "Audio playback failed on this Kindle model.\n"
 "\n"
@@ -2993,7 +2993,7 @@ msgstr ""
 "\n"
 "Le pipeline ttssrc TTS n'a pas pu démarrer. Veuillez générer un rapport de bug et le partager sur le problème GitHub."
 
-#: ttsengine.lua:3261 ttsengine.lua:3356
+#: ttsengine.lua:3323 ttsengine.lua:3418
 msgid ""
 "Kindle audio playback failed.\n"
 "\n"
@@ -3021,7 +3021,7 @@ msgstr ""
 "\n"
 "Si cela persiste, veuillez générer un rapport de bug (Livre audio > Générer un rapport de bug) et partagez-le sur GitHub."
 
-#: ttsengine.lua:3354
+#: ttsengine.lua:3416
 msgid ""
 "Kindle audio playback failed.\n"
 "\n"
@@ -3043,7 +3043,7 @@ msgstr ""
 "\n"
 "Veuillez générer un rapport de bug (Livre audio > Générer un rapport de bug) et le partager sur GitHub."
 
-#: ttsengine.lua:3532
+#: ttsengine.lua:3594
 msgid ""
 "Audio playback failed on this Kindle model.\n"
 "\n"
@@ -3057,7 +3057,7 @@ msgstr ""
 "\n"
 "Veuillez générer un rapport de bug (Livre audio > Générer un rapport de bug) et le partager sur le problème GitHub."
 
-#: ttsengine.lua:3603
+#: ttsengine.lua:3665
 msgid ""
 "Audio playback failed on this Kindle model.\n"
 "\n"
@@ -3067,7 +3067,7 @@ msgstr ""
 "\n"
 "Le pipeline audio GStreamer n'a pas pu démarrer"
 
-#: ttsengine.lua:3609
+#: ttsengine.lua:3671
 msgid ""
 "\n"
 "\n"
@@ -3077,7 +3077,7 @@ msgstr ""
 "\n"
 "Il s'agit souvent d'un problème de compatibilité de la bibliothèque système. Essayez de connecter les écouteurs Bluetooth via les paramètres Kindle, passez au backend espeak (Outils → Livre audio → Paramètres vocaux → Moteur TTS) ou générez un rapport de bug (Livre audio > Générer un rapport de bug) et partagez-le sur le problème GitHub."
 
-#: ttsengine.lua:6103
+#: ttsengine.lua:6165
 msgid ""
 "Bluetooth audio not connected.\n"
 "\n"
@@ -3099,19 +3099,19 @@ msgstr ""
 "\n"
 "Puis réessayez."
 
-#: ttsengine.lua:6205
+#: ttsengine.lua:6267
 msgid "The audio player keeps crashing, playback was stopped."
 msgstr "Le lecteur audio continue de planter, la lecture a été arrêtée."
 
-#: ttsengine.lua:6206
+#: ttsengine.lua:6268
 msgid "Last error:"
 msgstr "Dernière erreur :"
 
-#: ttsengine.lua:6208
+#: ttsengine.lua:6270
 msgid "Please generate a bug report (Audiobook > Generate bug report) and share it on GitHub."
 msgstr "Veuillez générer un rapport de bug (Livre audio > Générer un rapport de bug) et le partager sur GitHub."
 
-#: ttsengine.lua:6256
+#: ttsengine.lua:6318
 msgid ""
 "No audio output available.\n"
 "\n"

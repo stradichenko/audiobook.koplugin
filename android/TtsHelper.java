@@ -112,7 +112,10 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     public void onInit(int status) {
         initStatus = status;
         if (status == TextToSpeech.SUCCESS) {
-            tts.setLanguage(Locale.US);
+            // Do not force a language here: the plugin sets the book
+            // language before the first utterance, and a forced default
+            // can leave engines like SherpaTTS on a mismatched voice
+            // until then.
             tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {                @Override
                 public void onStart(String utteranceId) {}
 
@@ -423,10 +426,14 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
     // --- Audio focus ---
 
-    /** Speech attributes for short TTS clips (synth-then-play pipeline). */
+    /** Speech attributes for short TTS clips (synth-then-play pipeline).
+     *  Media usage, same as the pre-recorded chapter path: long-form
+     *  narration belongs to the media volume, and the accessibility
+     *  stream on some e-readers (Boox) applies EQ that the engine's own
+     *  preview does not. */
     private static AudioAttributes speechAttributes() {
         return new AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+            .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build();
     }
@@ -1236,7 +1243,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                         .setTransferMode(AudioTrack.MODE_STREAM)
                         .build();
                 } else {
-                    track = new AudioTrack(AudioManager.STREAM_ACCESSIBILITY,
+                    track = new AudioTrack(AudioManager.STREAM_MUSIC,
                         fmtRate, cfg, AudioFormat.ENCODING_PCM_16BIT,
                         bufSize, AudioTrack.MODE_STREAM);
                 }

@@ -312,7 +312,7 @@ local function benchAndroid(engine, text)
     -- what the user hears.  Both setters queue on the Java worker thread
     -- ahead of the synthesis request, so order is preserved.
     atts:setRate(engine.rate or 1.0)
-    local android_pitch = 0.5 + ((engine.pitch or 50) / 99) * 1.5
+    local android_pitch = engine:_androidPitchMultiplier(engine.pitch)
     atts:setPitch(android_pitch)
 
     local dispatch = atts:synthesizeToFile(text, audio_file)

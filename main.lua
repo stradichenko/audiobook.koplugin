@@ -785,7 +785,7 @@ function Audiobook:addToMainMenu(menu_items)
                         enabled_func = function()
                             return (Device.isAndroid and Device:isAndroid()) or false
                         end,
-                        help_text = _("Workaround for Android devices where read-aloud audio cuts off mid-sentence and stalls (seen on some MTK e-readers). Plays synthesized audio through one persistent, continuously-fed audio track instead of a fresh media player per sentence, the same way the system's own TTS plays. Off by default; the plugin also switches to it automatically for the rest of the session when it detects a stalled clip. Takes effect from the next sentence."),
+                        help_text = _("Workaround for Android devices where read-aloud audio cuts off mid-sentence and stalls (seen on some MTK e-readers). Plays synthesized audio through one persistent, continuously-fed audio track instead of a fresh media player per sentence. Leave this off for neural engines such as SherpaTTS: the persistent stream adds hiss and pitch artifacts. Off by default; the plugin also switches to it automatically for the rest of the session when it detects a stalled clip, except on neural engines. Takes effect from the next sentence."),
                     },
                     {
                         text = _("Keep playing when lid is closed"),

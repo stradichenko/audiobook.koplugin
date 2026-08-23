@@ -269,6 +269,8 @@ audiobook.koplugin/
 | No audio player found (Kindle) | Pair BT headphones via the Kindle top-swipe menu **before** starting playback. If already paired, restart KOReader so the plugin re-detects the audio output. |
 | No TTS engine found | Install espeak-ng (see Quick start). |
 | No TTS engine found (Android) | Ensure `android/tts_helper.dex` is present inside the plugin folder. The pre-built release includes it; if you cloned from source, run `./build-dex.sh` in the `android/` directory. The device must also have a TTS engine installed (most do by default). See [Android support](#android-support). |
+| Android TTS sounds high / noisy / unlike the engine's own preview | Keep plugin pitch at the default (50). Turn **off** **Android: persistent audio stream**. Fully quit KOReader after changing the system TTS engine or language. See [Android support](#android-support). |
+| Android underline does not match the spoken sentence | Android TTS has no word timestamps; the plugin underlines the spoken sentence as a contiguous phrase instead of chasing estimated word positions. Fully quit KOReader after updating the plugin. |
 | Android TTS is robotic / not my SherpaTTS voice | SherpaTTS is installed but is **not** Android's preferred TTS engine. The plugin always uses the system default. Follow [High-quality voices on Android](#high-quality-voices-on-android-sherpatts), then fully quit KOReader and reopen it. |
 | BT audio silent | Restart KOReader to kill orphan pipelines. Check BT is paired in the plugin menu. |
 | SSH refused on port 22 | KOReader uses port 2222: `ssh root@<ip> -p 2222` |
@@ -479,7 +481,7 @@ For the full technical analysis, see [docs/ANDROID_TTS.md](docs/ANDROID_TTS.md).
 
 ### Limitations
 
-- Word timing is estimated (Android TTS does not provide per-word callbacks when synthesizing to file)
+- Word timing is estimated (Android TTS does not provide per-word callbacks when synthesizing to file). The plugin underlines the spoken sentence as a contiguous phrase instead of chasing estimated word positions.
 - First sentence may have a brief delay while the TTS engine initializes
 - The plugin uses whatever engine Android has as **preferred TTS**. Installing SherpaTTS is not enough until you set it as that preferred engine.
 

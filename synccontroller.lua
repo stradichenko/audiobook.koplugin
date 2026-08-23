@@ -673,11 +673,12 @@ function SyncController:applySentenceTiming(sentence, timing_data)
         -- counting.  Values are scaled to match real WAV duration later,
         -- so only the proportions between words matter.
         local current_time = 0
-        local is_piper = self.tts_engine
-            and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+        local is_neural = self.tts_engine
+            and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+                or self.tts_engine.backend == self.tts_engine.BACKENDS.ANDROID)
         for _, word in ipairs(sentence.words) do
             local duration
-            if is_piper then
+            if is_neural then
                 local chars = #(word.clean_text or word.text:gsub("[%%p]", ""))
                 duration = math.floor(chars * 80)
                 if word.text:match("[,;:]$") then
@@ -691,7 +692,7 @@ function SyncController:applySentenceTiming(sentence, timing_data)
             word.start_time = current_time
             word.end_time = current_time + duration
             word.duration = duration
-            current_time = current_time + duration + (is_piper and 30 or 50)
+            current_time = current_time + duration + (is_neural and 30 or 50)
         end
     end
 end
@@ -2020,7 +2021,14 @@ function SyncController:highlightCurrentWord(word)
 
     self.current_word_index = word.index
 
-    if self.plugin and self.plugin:getSetting("highlight_words", true) then
+    -- Android synthesizeToFile has no word timestamps, so estimated word
+    -- boxes would drift off the spoken text on neural engines.  Keep the
+    -- sentence-level underline only (highlightWord draws nothing today,
+    -- but skipping keeps estimated word boxes from being treated as truth).
+    local android_tts = self.tts_engine
+        and self.tts_engine.backend == self.tts_engine.BACKENDS.ANDROID
+    if not android_tts
+        and self.plugin and self.plugin:getSetting("highlight_words", true) then
         self.highlight_manager:highlightWord(word, self.parsed_data)
     end
 end
