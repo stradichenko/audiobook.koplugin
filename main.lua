@@ -3328,6 +3328,21 @@ function Audiobook:_ensureBtMediaControl()
     end
 end
 
+--- Publish "playing" to the BT/MediaSession layer.  Android maps a
+--- headset's play/pause key from the published PlaybackState, so keeping
+--- it truthful is what makes the AirPods stem work.
+function Audiobook:notifyAudioPlaying()
+    self:_ensureBtMediaControl()
+    if not BtMediaControl then return end
+    pcall(function() BtMediaControl.sendPlaybackStatus("playing") end)
+end
+
+--- Publish "paused" to the BT/MediaSession layer.
+function Audiobook:notifyAudioPaused()
+    if not BtMediaControl then return end
+    pcall(function() BtMediaControl.sendPlaybackStatus("paused") end)
+end
+
 function Audiobook:pauseReadAlong()
     if not self._init_ok then return end
     -- Pause media playback if active

@@ -278,12 +278,14 @@ function AndroidMediaSession:startPolling(plugin)
                 self._last_dispatch_time = now
                 logger.warn("AndroidMediaSession: command", cmd)
                 local p = self._plugin
-                if cmd == self.CMD_PLAY_PAUSE then
+                -- Some headsets (AirPods Pro stem over AVRCP) repeat
+                -- KEYCODE_MEDIA_PAUSE for both clicks and never send PLAY.
+                -- Route every play/pause variant through the state-based
+                -- toggle so the plugin's real state decides.
+                if cmd == self.CMD_PLAY_PAUSE
+                    or cmd == self.CMD_PLAY
+                    or cmd == self.CMD_PAUSE then
                     pcall(function() p:onMediaPlayPause() end)
-                elseif cmd == self.CMD_PLAY then
-                    pcall(function() p:onMediaPlay() end)
-                elseif cmd == self.CMD_PAUSE then
-                    pcall(function() p:onMediaPause() end)
                 elseif cmd == self.CMD_STOP then
                     pcall(function() p:onMediaStop() end)
                 elseif cmd == self.CMD_NEXT then
