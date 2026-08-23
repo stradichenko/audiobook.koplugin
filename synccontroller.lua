@@ -1459,8 +1459,8 @@ function SyncController:showPlaybackBar()
         on_chapter_list = function()
             controller:showTocPicker()
         end,
-        on_speed = function()
-            controller:cycleSpeechRate()
+        on_speed = function(speed)
+            controller:setSpeechRate(speed)
         end,
         on_volume = function(pct)
             controller:setSpeechVolumePct(pct)
@@ -2587,6 +2587,24 @@ function SyncController:_refreshTtsTimeUi()
     pcall(function() bar:updateTimeDisplay(elapsed, total) end)
 end
 
+-- Apply an explicit TTS rate selected by the shared audiobook-player speed UI.
+-- TTSEngine supports 0.25x..2.0x, which is intentionally narrower than the
+-- aligned-audio player's 0.5x..3.0x range.
+function SyncController:setSpeechRate(speed)
+    speed = tonumber(speed) or 1.0
+    speed = math.max(0.25, math.min(2.0, speed))
+    if self.plugin and self.plugin.setSetting then
+        self.plugin:setSetting("speech_rate", speed)
+    end
+    if self.tts_engine and self.tts_engine.setRate then
+        self.tts_engine:setRate(speed)
+    end
+    if self.playback_bar and self.playback_bar.updateSpeed then
+        pcall(function() self.playback_bar:updateSpeed(speed) end)
+    end
+    return speed
+end
+
 -- Same rate list as the speech-rate picker in the TTS settings dialog.
 function SyncController:cycleSpeechRate()
     local speeds = {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0}
@@ -2599,15 +2617,7 @@ function SyncController:cycleSpeechRate()
             break
         end
     end
-    if plugin and plugin.setSetting then
-        plugin:setSetting("speech_rate", next_speed)
-    end
-    if self.tts_engine and self.tts_engine.setRate then
-        self.tts_engine:setRate(next_speed)
-    end
-    if self.playback_bar and self.playback_bar.updateSpeed then
-        pcall(function() self.playback_bar:updateSpeed(next_speed) end)
-    end
+    self:setSpeechRate(next_speed)
 end
 
 function SyncController:setSpeechVolumePct(pct)

@@ -944,7 +944,126 @@ function AudiobookPlayer:onSeek(pct)
 end
 
 function AudiobookPlayer:onSpeed()
-    if self.on_speed then self.on_speed() end
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local min_speed = self.tts_mode and 0.25 or 0.5
+    local max_speed = self.tts_mode and 2.0 or 3.0
+    local presets = { 0.8, 1.0, 1.25, 1.5, 2.0 }
+    local player = self
+    local current = self.playback_speed or 1.0
+
+    local function closeDialog()
+        if player._speed_dialog then
+            UIManager:close(player._speed_dialog)
+            player._speed_dialog = nil
+        end
+    end
+
+    local function refreshDialog()
+        local dialog = player._speed_dialog
+        if not dialog then return end
+        local value = dialog:getButtonById("speed_value")
+        if value then value:setText(player:_speedText(), value.width) end
+        local slower_10 = dialog:getButtonById("speed_slower_10")
+        if slower_10 then
+            slower_10:enableDisable(current >= min_speed + 0.1 - 0.001)
+        end
+        local slower_05 = dialog:getButtonById("speed_slower_05")
+        if slower_05 then
+            slower_05:enableDisable(current >= min_speed + 0.05 - 0.001)
+        end
+        local faster_05 = dialog:getButtonById("speed_faster_05")
+        if faster_05 then
+            faster_05:enableDisable(current <= max_speed - 0.05 + 0.001)
+        end
+        local faster_10 = dialog:getButtonById("speed_faster_10")
+        if faster_10 then
+            faster_10:enableDisable(current <= max_speed - 0.1 + 0.001)
+        end
+        for _, preset in ipairs(presets) do
+            local button = dialog:getButtonById("speed_preset_" .. tostring(preset))
+            if button then
+                local text = (math.abs(current - preset) < 0.01 and "✓ " or "")
+                    .. string.format("%g×", preset)
+                button:setText(text, button.width)
+            end
+        end
+        UIManager:setDirty(dialog, "ui")
+    end
+
+    local function applySpeed(speed, keep_open)
+        speed = math.max(min_speed, math.min(max_speed,
+            tonumber(speed) or 1.0))
+        speed = math.floor(speed * 100 + 0.5) / 100
+        if not keep_open then closeDialog() end
+        current = speed
+        if player.on_speed then player.on_speed(speed) end
+        if keep_open then refreshDialog() end
+    end
+
+    local function adjustSpeed(delta)
+        applySpeed(current + delta, true)
+    end
+
+    local preset_buttons = {}
+    for _, speed in ipairs(presets) do
+        local preset_speed = speed
+        table.insert(preset_buttons, {
+            id = "speed_preset_" .. tostring(preset_speed),
+            text = (math.abs(current - preset_speed) < 0.01 and "✓ " or "")
+                .. string.format("%g×", preset_speed),
+            callback = function() applySpeed(preset_speed, false) end,
+        })
+    end
+
+    self._speed_dialog = ButtonDialog:new{
+        title = _("Playback speed"),
+        _plugin_chrome = true,
+        buttons = {
+            {
+                {
+                    id = "speed_slower_10",
+                    text = "− 0.1",
+                    enabled = current >= min_speed + 0.1 - 0.001,
+                    callback = function()
+                        adjustSpeed(-0.1)
+                    end,
+                },
+                {
+                    id = "speed_slower_05",
+                    text = "− 0.05",
+                    enabled = current >= min_speed + 0.05 - 0.001,
+                    callback = function()
+                        adjustSpeed(-0.05)
+                    end,
+                },
+                { id = "speed_value", text = self:_speedText(), enabled = false },
+                {
+                    id = "speed_faster_05",
+                    text = "+ 0.05",
+                    enabled = current <= max_speed - 0.05 + 0.001,
+                    callback = function()
+                        adjustSpeed(0.05)
+                    end,
+                },
+                {
+                    id = "speed_faster_10",
+                    text = "+ 0.1",
+                    enabled = current <= max_speed - 0.1 + 0.001,
+                    callback = function()
+                        adjustSpeed(0.1)
+                    end,
+                },
+            },
+            preset_buttons,
+            {
+                {
+                    text = _("Close"),
+                    callback = closeDialog,
+                },
+            },
+        },
+    }
+    UIManager:show(self._speed_dialog)
 end
 
 function AudiobookPlayer:onTtsSettings()

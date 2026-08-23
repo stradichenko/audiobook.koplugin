@@ -2547,18 +2547,8 @@ function MediaSync:showPlaybackBar()
         on_chapter_list = function()
             self:showChapterList()
         end,
-        on_speed = function()
-            -- Cycle speeds: 0.8 → 1.0 → 1.25 → 1.5 → 2.0 → 0.8
-            local speeds = {0.8, 1.0, 1.25, 1.5, 2.0}
-            local current = self.media_engine and self.media_engine:getSpeed() or 1.0
-            local next_speed = speeds[1]
-            for i, s in ipairs(speeds) do
-                if math.abs(current - s) < 0.01 then
-                    next_speed = speeds[i + 1] or speeds[1]
-                    break
-                end
-            end
-            self:setSpeed(next_speed)
+        on_speed = function(speed)
+            self:setSpeed(speed)
         end,
         on_shuffle = function()
             self:shufflePlaylist()
