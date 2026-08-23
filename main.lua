@@ -170,7 +170,7 @@ function Audiobook:init()
                         self:_showInitError()
                         return
                     end
-                    local selected_text = this.selected_text
+                    local selected_text = self:_snapshotSelectedText(this.selected_text)
                     local context = nil
                     if selected_text then
                         context = {
@@ -198,7 +198,7 @@ function Audiobook:init()
                         self:_showInitError()
                         return
                     end
-                    local selected_text = this.selected_text
+                    local selected_text = self:_snapshotSelectedText(this.selected_text)
                     this:onClose()
                     UIManager:scheduleIn(0.3, function()
                         self:startAlignedAudioFromSelection(selected_text)
@@ -276,7 +276,7 @@ function Audiobook:_registerDictButtons()
         callback = function(dict_popup)
             local selected_text = nil
             if dict_popup.highlight and dict_popup.highlight.selected_text then
-                selected_text = dict_popup.highlight.selected_text
+                selected_text = plugin:_snapshotSelectedText(dict_popup.highlight.selected_text)
             end
             UIManager:close(dict_popup)
             UIManager:scheduleIn(0.3, function()
@@ -1250,7 +1250,7 @@ function Audiobook:onDictButtonsReady(dict_popup, buttons)
         callback = function()
             local selected_text = nil
             if dict_popup.highlight and dict_popup.highlight.selected_text then
-                selected_text = dict_popup.highlight.selected_text
+                selected_text = plugin:_snapshotSelectedText(dict_popup.highlight.selected_text)
             end
             UIManager:close(dict_popup)
             UIManager:scheduleIn(0.3, function()
@@ -2786,7 +2786,26 @@ function Audiobook:getSleepTimerRemaining()
     return math.max(0, self._sleep_timer_end - os.time())
 end
 
+--- Copy selection fields before ReaderHighlight:onClose() unlinks the table.
+function Audiobook:_snapshotSelectedText(selected_text)
+    if not selected_text then return nil end
+    return {
+        text = selected_text.text,
+        pos0 = selected_text.pos0,
+        pos1 = selected_text.pos1,
+    }
+end
+
+function Audiobook:_xpointerString(xp)
+    if type(xp) == "string" then return xp end
+    if type(xp) == "table" then
+        return xp.xpointer or xp.pos0 or xp.xPointer
+    end
+    return nil
+end
+
 function Audiobook:_fragmentFromXPointer(xp)
+    xp = self:_xpointerString(xp)
     if type(xp) ~= "string" then return nil end
     -- CRe selections rarely carry a trailing #id; Storyteller spans show up as
     -- [@id='html39-s12'] inside the internal xpointer.
@@ -3258,23 +3277,9 @@ function Audiobook:stopReadAlong(opts)
             self:_savePosition(path, pos)
             logger.warn("Audiobook: saved position", pos, "for", path)
 
-            -- Also save aligned-audiobook position keyed by the EPUB path,
-            -- so we can offer "continue listening" on the next start.
-            if self.media_sync and self.media_sync.overlay_mode then
-                local doc_path = self.ui and self.ui.document
-                    and (self.ui.document.file_path or self.ui.document.file)
-                if doc_path then
-                    local chapter_title = nil
-                    if self.media_sync.getCurrentChapter then
-                        local ok_ch, ch = pcall(function()
-                            return self.media_sync:getCurrentChapter()
-                        end)
-                        if ok_ch and ch then chapter_title = ch.title end
-                    end
-                    self:_saveAlignedPosition(doc_path, path, pos, chapter_title)
-                    logger.warn("Audiobook: saved aligned position", pos, "for", doc_path)
-                end
-            end
+            -- The aligned position is saved by MediaSync:stop() through
+            -- _saveCurrentAlignedProgress(), which also records the current
+            -- fragment id and text document; no duplicate save here.
 
             -- Sync to Audiobookshelf if this is an ABS item
             if self.media_sync._abs_item_id and self._abs_sync then
