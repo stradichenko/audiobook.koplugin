@@ -236,7 +236,8 @@ function Audiobook:_registerDictButtons()
         font_bold = false,
         conditional = true,
         show_func = function(dict_popup)
-            return plugin._init_ok and not dict_popup.is_wiki_fullpage
+            return plugin._init_ok and not dict_popup.is_wiki
+                and not dict_popup.is_wiki_fullpage
         end,
         callback = function(dict_popup)
             local word = dict_popup.word or dict_popup.lookupword
@@ -271,7 +272,8 @@ function Audiobook:_registerDictButtons()
         font_bold = false,
         conditional = true,
         show_func = function(dict_popup)
-            return plugin._init_ok and not dict_popup.is_wiki_fullpage
+            return plugin._init_ok and not dict_popup.is_wiki
+                and not dict_popup.is_wiki_fullpage
         end,
         callback = function(dict_popup)
             local selected_text = nil
