@@ -4,9 +4,18 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.17.44)'
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -14,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
@@ -118,15 +129,15 @@ jobs:
       - name: Create zip
         run: |
           cd kobo-tts-bundle
-          zip -r ../audiobook-koplugin-${{ github.ref_name }}.zip audiobook.koplugin/
+          zip -r ../audiobook-koplugin-${{ env.TAG }}.zip audiobook.koplugin/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: audiobook-koplugin-${{ github.ref_name }}.zip
+          files: audiobook-koplugin-${{ env.TAG }}.zip
           body: |
-            ## Audiobook Read-Along ${{ github.ref_name }}
+            ## Audiobook Read-Along ${{ env.TAG }}
 
             **Download, unzip, and copy `audiobook.koplugin/` to your KOReader plugins directory. Restart KOReader.**
 
