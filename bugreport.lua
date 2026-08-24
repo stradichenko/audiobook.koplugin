@@ -327,6 +327,24 @@ local function collectPluginInfo(plugin)
     return info
 end
 
+--- Capture LIPC events fired by the native TTS stack while VoiceView (the
+-- screen reader) speaks.  Runs only on Kindle, before the heavier probes, so
+-- the listen window overlaps whatever the screen reader is reading.  The
+-- menu flow prompts the user to turn VoiceView on first.  Returns a string
+-- (or nil when not applicable).
+local function collectVoiceViewWatch(skip_intensive)
+    if skip_intensive then return nil end
+    if not (Device.isKindle and Device:isKindle()) then return nil end
+    if not Utils.commandExists("lipc-wait-event") then return nil end
+    return shellCapture([[echo "--- listening for VoiceView / native TTS LIPC events (15s) ---"
+for svc in com.lab126.tts.orchestrator com.lab126.koreader.tts com.lab126.playermgr com.lab126.audiomgrd com.lab126.pillow com.lab126.pillowd com.lab126.voiceview com.lab126.tts; do
+  lipc-wait-event -s 15 -m "$svc" '*' 2>&1 | head -5 &
+done
+sleep 15 2>/dev/null || usleep 15000000 2>/dev/null
+wait 2>/dev/null
+echo "--- end watch ---"]], 20) or "no events captured"
+end
+
 --- Collect system audio and TTS tool availability.
 -- @param plugin table
 -- @param skip_intensive boolean  When true, skip probes that write temp
@@ -1195,8 +1213,12 @@ echo "--- com.lab126.accessibility probe ---"
 lipc-probe com.lab126.accessibility 2>&1 | head -20
 echo "--- com.lab126.tts probe ---"
 lipc-probe com.lab126.tts 2>&1 | head -20
+echo "--- com.lab126.koreader.tts probe (new TTS bridge) ---"
+lipc-probe com.lab126.koreader.tts 2>&1 | head -40
 echo "--- pillow (UI framework) probe ---"
 lipc-probe com.lab126.pillow 2>&1 | head -20
+echo "--- pillowd probe ---"
+lipc-probe com.lab126.pillowd 2>&1 | head -20
 echo "--- full service list (voice/tts/a11y) ---"
 lipc-probe -l 2>/dev/null | grep -iE 'voice|tts|a11y|access|speak|screen.?read|pillow' | head -20
 ]], 10) or "n/a"
@@ -1726,6 +1748,9 @@ function BugReport.generate(plugin)
             .. "% full.  Intensive probes were skipped to avoid a crash."
     end
 
+    local ok_watch, watch = pcall(collectVoiceViewWatch, skip_intensive)
+    if not ok_watch then watch = nil end
+
     local ok_device, device = pcall(collectDeviceInfo)
     if not ok_device then device = {section_error = tostring(device)} end
 
@@ -1756,6 +1781,8 @@ function BugReport.generate(plugin)
         "",
         formatSection("Device", device),
         "",
+        watch and formatSection("VoiceView capture", watch) or "",
+        watch and "" or "",
         formatSection("KOReader", koreader),
         "",
         formatSection("Plugin", pluginInfo),
@@ -1836,6 +1863,24 @@ end
 -- instead of crashing KOReader (issue #28).
 -- @param plugin table  The Audiobook plugin instance
 function BugReport.menuCallback(plugin)
+    local run = function()
+        BugReport._generateAndSave(plugin)
+    end
+    if Device.isKindle and Device:isKindle() then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new{
+            text = _("Before the report runs: if you can, turn on VoiceView (the screen reader) and let it read a few sentences.\n\nThat lets the report capture how the Kindle's own voice works, which helps diagnose audio problems on newer models. The report takes about a minute.\n\nTap Continue when ready, or Skip to proceed without this."),
+            ok_text = _("Continue"),
+            cancel_text = _("Skip"),
+            ok_callback = run,
+            cancel_callback = run,
+        })
+        return
+    end
+    run()
+end
+
+function BugReport._generateAndSave(plugin)
     local ok, filepath = pcall(BugReport.generateAndSave, plugin)
     if ok and filepath then
         local display_path = sanitizePath(filepath)

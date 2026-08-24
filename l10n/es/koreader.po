@@ -496,11 +496,11 @@ msgstr "Ningún cliente disponible."
 msgid "BT"
 msgstr "BT"
 
-#: audiobookplayer.lua:263 audiobookplayer.lua:759 audiobookplayer.lua:1145 audiobookplayer.lua:1529 mediasync.lua:2424 mediasync.lua:2432 synccontroller.lua:1401
+#: audiobookplayer.lua:263 audiobookplayer.lua:759 audiobookplayer.lua:1145 audiobookplayer.lua:1529 mediasync.lua:2436 mediasync.lua:2444 synccontroller.lua:1401
 msgid "Audiobook"
 msgstr "Audiolibro"
 
-#: audiobookplayer.lua:923 mediasync.lua:2883 mediasync.lua:2982 mediasync.lua:2994 mediasync.lua:3096
+#: audiobookplayer.lua:923 mediasync.lua:2893 mediasync.lua:2992 mediasync.lua:3004 mediasync.lua:3106
 msgid "Could not open chapter list."
 msgstr "No se pudo abrir la lista de capítulos."
 
@@ -815,13 +815,35 @@ msgstr ""
 msgid "Bluetooth audio device disconnected."
 msgstr "Bluetooth dispositivo de audio desconectado."
 
-#: bugreport.lua:1843
+#: bugreport.lua:1872
+msgid ""
+"Before the report runs: if you can, turn on VoiceView (the screen reader) and let it read a few sentences.\n"
+"\n"
+"That lets the report capture how the Kindle's own voice works, which helps diagnose audio problems on newer models. The report takes about a minute.\n"
+"\n"
+"Tap Continue when ready, or Skip to proceed without this."
+msgstr ""
+"Antes de que se genere el informe: si puede, active VoiceView (el lector de pantalla) y deje que lea algunas frases.\n"
+"\n"
+"Esto permite que el informe capture cómo funciona la voz del Kindle, lo que ayuda a diagnosticar problemas de audio en modelos recientes. El informe tarda aproximadamente un minuto.\n"
+"\n"
+"Toque Continuar cuando esté listo, u Omitir para continuar sin este paso."
+
+#: bugreport.lua:1873
+msgid "Continue"
+msgstr "Continuar"
+
+#: bugreport.lua:1874
+msgid "Skip"
+msgstr "Omitir"
+
+#: bugreport.lua:1888
 msgid ""
 "Bug report saved to:\n"
 "\n"
 msgstr "Informe de error guardado en:"
 
-#: bugreport.lua:1844
+#: bugreport.lua:1889
 msgid ""
 "\n"
 "\n"
@@ -831,7 +853,7 @@ msgstr ""
 "\n"
 "Conecte su dispositivo a través de USB para recuperar el archivo. Compártalo cuando informe problemas en GitHub."
 
-#: bugreport.lua:1850
+#: bugreport.lua:1895
 msgid ""
 "Could not save bug report file.\n"
 "\n"
@@ -841,7 +863,7 @@ msgstr ""
 "\n"
 "Verifique que /tmp o /var tenga espacio libre y vuelva a intentarlo."
 
-#: bugreport.lua:1857
+#: bugreport.lua:1902
 msgid ""
 "Bug report generation failed.\n"
 "\n"
@@ -1503,31 +1525,31 @@ msgstr ""
 "No se encontraron archivos de audio en\n"
 "%1"
 
-#: main.lua:2149 main.lua:2565 main.lua:4261
+#: main.lua:2149 main.lua:2565 main.lua:4276
 msgid "Unknown book"
 msgstr "Libro desconocido"
 
-#: main.lua:2159 main.lua:4264
+#: main.lua:2159 main.lua:4279
 msgid "Resume from %1?"
 msgstr "¿Continuar desde %1?"
 
-#: main.lua:2161 main.lua:2569 main.lua:4266
+#: main.lua:2161 main.lua:2569 main.lua:4281
 msgid "Book: %1"
 msgstr "Libro: %1"
 
-#: main.lua:2164 main.lua:2572 main.lua:4269
+#: main.lua:2164 main.lua:2572 main.lua:4284
 msgid "Chapter: %1"
 msgstr "Capítulo: %1"
 
-#: main.lua:2167 main.lua:2576 main.lua:4272
+#: main.lua:2167 main.lua:2576 main.lua:4287
 msgid "Last played: %1"
 msgstr "Último jugado: %1"
 
-#: main.lua:2170 main.lua:2590 main.lua:4275
+#: main.lua:2170 main.lua:2590 main.lua:4290
 msgid "Resume"
 msgstr "Continuar"
 
-#: main.lua:2178 main.lua:2605 main.lua:4283
+#: main.lua:2178 main.lua:2605 main.lua:4298
 msgid "From start"
 msgstr "Desde el inicio"
 
@@ -1587,7 +1609,7 @@ msgstr "Temporizador de sueño: horas"
 msgid "Select the number of hours."
 msgstr "Selecciona el número de horas."
 
-#: main.lua:2695 mediasync.lua:2955 menubuilder.lua:1651
+#: main.lua:2695 mediasync.lua:2965 menubuilder.lua:1651
 msgid "Next"
 msgstr "Siguiente"
 
@@ -1631,7 +1653,7 @@ msgstr ""
 msgid "Could not retrieve page text for TTS."
 msgstr "No se pudo recuperar el texto de la página para TTS."
 
-#: main.lua:4201
+#: main.lua:4216
 msgid "Audiobookshelf modules not available."
 msgstr "Módulos Audiobookshelf no disponibles."
 
@@ -1649,51 +1671,51 @@ msgstr ""
 msgid "Cannot play this audio file. Kindle's GStreamer can only play raw PCM WAV files; MP3/M4B/AAC files need the bundled ffmpeg decoder. Please install the release .zip (not 'Source code') from GitHub so plugins/audiobook.koplugin/bin/ffmpeg is present."
 msgstr "No se puede reproducir este archivo de audio. GStreamer de Kindle solo puede reproducir archivos PCM WAV sin formato; Los archivos MP3/M4B/AAC necesitan el decodificador ffmpeg incluido. Instale la versión .zip (no el 'código fuente') de GitHub para que plugins/audiobook.koplugin/bin/ffmpeg esté presente."
 
-#: mediasync.lua:1646
+#: mediasync.lua:1658
 msgid "Loop disabled."
 msgstr "Bucle desactivado."
 
-#: mediasync.lua:1646
+#: mediasync.lua:1658
 msgid "Loop enabled."
 msgstr "Bucle activado."
 
-#: mediasync.lua:1698
+#: mediasync.lua:1710
 msgid "Playlist shuffled."
 msgstr "Lista de reproducción mezclada."
 
-#: mediasync.lua:1698
+#: mediasync.lua:1710
 msgid "Shuffle disabled."
 msgstr "Mezcla desactivada."
 
-#: mediasync.lua:2384
+#: mediasync.lua:2396
 msgid "Audio playback failed: "
 msgstr "Error en la reproducción de audio:"
 
-#: mediasync.lua:2872 mediasync.lua:3017 mediasync.lua:3045 mediasync.lua:3057 synccontroller.lua:2715
+#: mediasync.lua:2882 mediasync.lua:3027 mediasync.lua:3055 mediasync.lua:3067 synccontroller.lua:2715
 msgid "No chapters available."
 msgstr "No hay capítulos disponibles."
 
-#: mediasync.lua:2919 menubuilder.lua:1612
+#: mediasync.lua:2929 menubuilder.lua:1612
 msgid "Item"
 msgstr "Elemento"
 
-#: mediasync.lua:2942 menubuilder.lua:1638
+#: mediasync.lua:2952 menubuilder.lua:1638
 msgid "Prev"
 msgstr "Ant."
 
-#: mediasync.lua:2951 menubuilder.lua:1647
+#: mediasync.lua:2961 menubuilder.lua:1647
 msgid "Close"
 msgstr "Cerrar"
 
-#: mediasync.lua:2966 mediasync.lua:3035 mediasync.lua:3090 synccontroller.lua:2742
+#: mediasync.lua:2976 mediasync.lua:3045 mediasync.lua:3100 synccontroller.lua:2742
 msgid "Chapters"
 msgstr "Capítulos"
 
-#: mediasync.lua:3027 mediasync.lua:3081 synccontroller.lua:2729
+#: mediasync.lua:3037 mediasync.lua:3091 synccontroller.lua:2729
 msgid "Chapter"
 msgstr "Capítulo"
 
-#: mediasync.lua:3193
+#: mediasync.lua:3203
 msgid "Playlist"
 msgstr "Lista de reproducción"
 
