@@ -210,6 +210,7 @@ function ABSBrowse.buildMainMenu(plugin)
                 plugin:setSetting("abs_browse_library_id", "")
                 plugin:setSetting("abs_browse_page", "0")
                 plugin._abs_page_cache = nil
+                plugin._abs_all_items = nil
                 UIManager:show(InfoMessage:new{
                     text = _("Logged out from Audiobookshelf."),
                     timeout = 2,
@@ -599,6 +600,7 @@ function ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, p
             text = _("Refresh list"),
             callback = function()
                 plugin._abs_page_cache = {}
+                plugin._abs_all_items = nil
                 UIManager:close(window)
                 ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
             end,
@@ -671,7 +673,135 @@ end
 -- Library search
 -- ---------------------------------------------------------------------------
 
---- Prompt for a free-text query and search the library (server-side).
+-- Fold common Latin-1 accented characters to their base letter so that
+-- "José" matches a query for "jose".  Keys are the two-byte UTF-8 pairs
+-- (this file is UTF-8 encoded, so "á" is the byte pair C3 A1).
+local DIACRITICS = {
+    ["Á"]="a", ["À"]="a", ["Â"]="a", ["Ä"]="a", ["Ã"]="a", ["Å"]="a",
+    ["á"]="a", ["à"]="a", ["â"]="a", ["ä"]="a", ["ã"]="a", ["å"]="a",
+    ["É"]="e", ["È"]="e", ["Ê"]="e", ["Ë"]="e",
+    ["é"]="e", ["è"]="e", ["ê"]="e", ["ë"]="e",
+    ["Í"]="i", ["Ì"]="i", ["Î"]="i", ["Ï"]="i",
+    ["í"]="i", ["ì"]="i", ["î"]="i", ["ï"]="i",
+    ["Ó"]="o", ["Ò"]="o", ["Ô"]="o", ["Ö"]="o", ["Õ"]="o",
+    ["ó"]="o", ["ò"]="o", ["ô"]="o", ["ö"]="o", ["õ"]="o",
+    ["Ú"]="u", ["Ù"]="u", ["Û"]="u", ["Ü"]="u",
+    ["ú"]="u", ["ù"]="u", ["û"]="u", ["ü"]="u",
+    ["Ñ"]="n", ["ñ"]="n", ["Ç"]="c", ["ç"]="c", ["Ý"]="y", ["ý"]="y", ["ÿ"]="y",
+}
+
+--- Lowercase and strip Latin diacritics for accent-insensitive matching.
+local function fold_text(s)
+    if not s or s == "" then
+        return ""
+    end
+    s = s:lower()
+    s = s:gsub("(\195[\128-\191])", DIACRITICS)
+    return s
+end
+
+--- Filter and rank library items client-side (issue #65).
+-- Matches title, author, or series as a case- and accent-insensitive
+-- substring.  Items whose title STARTS with the query come first, so
+-- searching "The" lists "The Hobbit" before "Mother Night".  Items arrive
+-- sorted by title from the server, so each group stays alphabetical.
+function ABSBrowse._filterLibraryItems(items, query)
+    local q = fold_text(query)
+    if q == "" then
+        return {}
+    end
+    local prefix_matches, other_matches = {}, {}
+    for _, item in ipairs(items) do
+        local meta = item.media and item.media.metadata or {}
+        local title = fold_text(meta.title)
+        local author = fold_text(meta.authorName)
+        local series = fold_text(meta.seriesName)
+        if title:find(q, 1, true) or author:find(q, 1, true) or series:find(q, 1, true) then
+            if title:sub(1, #q) == q then
+                table.insert(prefix_matches, item)
+            else
+                table.insert(other_matches, item)
+            end
+        end
+    end
+    local out = {}
+    for _, it in ipairs(prefix_matches) do table.insert(out, it) end
+    for _, it in ipairs(other_matches) do table.insert(out, it) end
+    return out
+end
+
+--- Run a library search: fetch the whole library once per session, then
+-- filter locally.  The server quick-search endpoint caps at 12 fuzzy
+-- matches with no offset, which hid most results on large libraries
+-- (issue #65).  The bulk list also pre-fills the page cache so page turns
+-- after a search are instant.
+function ABSBrowse._runSearch(plugin, client, library_id, library_name, query, page)
+    local all = plugin._abs_all_items
+    if all and all.library_id == library_id then
+        -- Already have the full list for this library: filter immediately.
+        ABSBrowse._finishSearch(plugin, client, library_id, library_name, query, page, all)
+        return
+    end
+
+    local busy = InfoMessage:new{
+        text = T(_("Searching for %1…"), query),
+        timeout = 0,
+    }
+    UIManager:show(busy)
+    UIManager:scheduleIn(0.1, function()
+        local data, err = client:getAllLibraryItems(library_id)
+        UIManager:close(busy)
+        if not data then
+            UIManager:show(InfoMessage:new{
+                text = _("Search failed: ") .. (err or _("unknown error")),
+                timeout = 5,
+            })
+            ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+            return
+        end
+
+        local items = data.results or {}
+        local total = tonumber(data.total) or #items
+        if total <= 0 then total = #items end
+        all = { library_id = library_id, items = items, total = total }
+        plugin._abs_all_items = all
+
+        -- Pre-fill every page of the browse cache from the bulk list
+        -- (minified items; the detail view re-fetches audio file lists).
+        local page_size = 100
+        local npages = math.ceil(#items / page_size)
+        if npages < 1 then npages = 1 end
+        plugin._abs_page_cache = plugin._abs_page_cache or {}
+        for p = 0, npages - 1 do
+            local slice = {}
+            local last = math.min((p + 1) * page_size, #items)
+            for i = p * page_size + 1, last do
+                table.insert(slice, items[i])
+            end
+            if #slice > 0 then
+                plugin._abs_page_cache[library_id .. ":" .. p] = { results = slice, total = total }
+            end
+        end
+
+        ABSBrowse._finishSearch(plugin, client, library_id, library_name, query, page, all)
+    end)
+end
+
+--- Filter the bulk list and open the results view (or report no matches).
+function ABSBrowse._finishSearch(plugin, client, library_id, library_name, query, page, all)
+    local results = ABSBrowse._filterLibraryItems(all.items, query)
+    if #results == 0 then
+        UIManager:show(InfoMessage:new{
+            text = T(_("No results for: %1"), query),
+            timeout = 3,
+        })
+        ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
+        return
+    end
+    ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page, 0)
+end
+
+--- Prompt for a free-text query and search the library.
 function ABSBrowse._showSearchDialog(plugin, client, library_id, library_name, page)
     local InputDialog = require("ui/widget/inputdialog")
     local dialog
@@ -697,25 +827,7 @@ function ABSBrowse._showSearchDialog(plugin, client, library_id, library_name, p
                             ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
                             return
                         end
-                        local busy = InfoMessage:new{
-                            text = T(_("Searching for %1…"), query),
-                            timeout = 0,
-                        }
-                        UIManager:show(busy)
-                        UIManager:scheduleIn(0.1, function()
-                            local results, err = client:searchLibrary(library_id, query)
-                            UIManager:close(busy)
-                            if not results or #results == 0 then
-                                UIManager:show(InfoMessage:new{
-                                    text = results and T(_("No results for: %1"), query)
-                                        or (_("Search failed: ") .. (err or _("unknown error"))),
-                                    timeout = 3,
-                                })
-                                ABSBrowse._showLibraryItems(plugin, client, library_id, library_name, page)
-                                return
-                            end
-                            ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page)
-                        end)
+                        ABSBrowse._runSearch(plugin, client, library_id, library_name, query, page)
                     end,
                 },
             },
@@ -724,10 +836,14 @@ function ABSBrowse._showSearchDialog(plugin, client, library_id, library_name, p
     UIManager:show(dialog)
 end
 
---- Render search results (already fetched) as an item list, no network call.
--- Downloading from here re-renders from the in-memory results, and
+--- Render search results (already filtered) with local pagination, so a
+-- query matching hundreds of titles ("The", an author name) stays browsable.
+-- Downloading from here re-renders the current results page, and
 -- "Back to library" returns to the page the search was launched from.
-function ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page)
+function ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page, results_page)
+    results_page = results_page or 0
+    local page_size = 100
+
     -- Load cache to check download status
     local ABSCache
     local pp = plugin.path and (plugin.path .. "/") or "./"
@@ -747,7 +863,21 @@ function ABSBrowse._showSearchResults(plugin, client, library_id, library_name, 
         end,
     })
 
-    for idx, item in ipairs(results) do
+    -- Previous results page
+    if results_page > 0 then
+        table.insert(menu_items, {
+            text = _("← Previous page"),
+            callback = function()
+                UIManager:close(window)
+                ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page, results_page - 1)
+            end,
+        })
+    end
+
+    local first = results_page * page_size + 1
+    local last = math.min(#results, first + page_size - 1)
+    for idx = first, last do
+        local item = results[idx]
         local meta = item.media and item.media.metadata or {}
         local title = meta.title or _("Untitled")
         local author = meta.authorName or ""
@@ -764,7 +894,7 @@ function ABSBrowse._showSearchResults(plugin, client, library_id, library_name, 
             return function()
                 ABSBrowse._showItemDetail(plugin, client, it, cache, downloaded, function()
                     UIManager:close(window)
-                    ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page)
+                    ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page, results_page)
                 end)
             end
         end
@@ -772,6 +902,17 @@ function ABSBrowse._showSearchResults(plugin, client, library_id, library_name, 
         table.insert(menu_items, {
             text = title .. (author ~= "" and "  — " .. author or "") .. "  (" .. dur_str .. ")" .. status_str,
             callback = make_callback(item, is_downloaded),
+        })
+    end
+
+    -- Next results page
+    if last < #results then
+        table.insert(menu_items, {
+            text = _("Next page →"),
+            callback = function()
+                UIManager:close(window)
+                ABSBrowse._showSearchResults(plugin, client, library_id, library_name, query, results, page, results_page + 1)
+            end,
         })
     end
 
@@ -838,7 +979,11 @@ function ABSBrowse._showItemDetail(plugin, client, item, cache, is_downloaded, r
         end
         table.insert(menu_items, {
             text = btn_text,
-            enabled = has_audio_files,
+            -- Stay enabled even when the list item omitted audioFiles:
+            -- the callback re-fetches full details first (_fetchAndDownload).
+            -- Disabled here meant "Download" was greyed out exactly when the
+            -- lightweight list response lacked the file list.
+            enabled = true,
             callback = function()
                 -- Close the detail window before the refresh so the re-opened
                 -- library list isn't stacked underneath a zombie window.

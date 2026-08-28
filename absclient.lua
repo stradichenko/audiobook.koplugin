@@ -244,39 +244,28 @@ function ABSClient:getLibraryItems(library_id, limit, page)
 end
 
 --[[--
-Free-text search within a library (title, author, series).
-Uses GET /api/libraries/{id}/search?q=... — a single request, no pagination.
+Fetch every item in a library in a single request (minified payloads).
+
+Used for client-side search.  The server's GET /api/libraries/{id}/search
+endpoint is a quick-search capped at 12 relevance-ordered matches with no
+offset, which silently truncated large libraries (issue #65); the items
+endpoint accepts an arbitrarily large limit and returns every title,
+so the plugin fetches the whole list once and filters locally.
+
 @param library_id string
-@param query string
-@return table|nil, string|nil  flat array of library items, error_message
+@param max_items number  safety cap for enormous libraries (default 10000)
+@return table|nil, string|nil  {results, total}, error_message
 --]]
-function ABSClient:searchLibrary(library_id, query)
-    if not query or query == "" then
-        return nil, _("Empty search query.")
-    end
-    -- URL-encode the query. Prefer luasocket's socket.url.escape when present;
-    -- fall back to a manual percent-encoder so a missing module never breaks it.
-    local esc = query
-    local ok, urlmod = pcall(require, "socket/url")
-    if ok and urlmod and urlmod.escape then
-        esc = urlmod.escape(query)
-    else
-        esc = query:gsub("([^%w%-_%.~ ])", function(c)
-            return string.format("%%%02X", string.byte(c))
-        end):gsub(" ", "%%20")
-    end
-    local endpoint = string.format("/api/libraries/%s/search?q=%s", library_id, esc)
+function ABSClient:getAllLibraryItems(library_id, max_items)
+    max_items = max_items or 10000
+    local endpoint = string.format(
+        "/api/libraries/%s/items?limit=%d&page=0&sort=media.metadata.title&minified=1",
+        library_id, max_items)
     local data, err = self:_request(endpoint)
-    if not data then return nil, err end
-    -- Book libraries key matches under "book", podcast libraries under "podcast".
-    local matches = data.book or data.podcast or {}
-    local items = {}
-    for _, m in ipairs(matches) do
-        if m.libraryItem then
-            table.insert(items, m.libraryItem)
-        end
+    if not data then
+        return nil, err
     end
-    return items, nil
+    return data, nil
 end
 
 --[[--
