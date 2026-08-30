@@ -602,7 +602,7 @@ function Audiobook:addToMainMenu(menu_items)
                                 BtMediaControl.stop()
                             end
                         end,
-                        help_text = _("When enabled, play/pause/next/prev buttons on a Bluetooth headset or speaker will control playback. The connected device will also show playback status.\n\nNote: Kindle Paperwhite does not expose an AVRCP input device for AirPods stem presses (no btui / no media-key evdev). Stem play/pause is not available on this firmware; use the on-screen controls or Kindle buttons."),
+                        help_text = _("When enabled, play/pause/next/prev buttons on a Bluetooth headset or speaker will control playback. The connected device will also show playback status.\n\nOn Kindle, stem clicks are read from Lab126 LIPC (playermgr / audiomgrd) because this firmware has no AVRCP evdev node."),
                     },
                     {
                         text = _("Reconnect BT on track change"),
@@ -3268,9 +3268,40 @@ function Audiobook:_killOrphanProcessesFromPreviousSession()
     -- 6. Kill orphan server wrapper shells
     os.execute("pkill -9 -f 'piper_server_.*\\.sh' 2>/dev/null")
 
-    -- 7. Clean up stale temp files
+    -- 7. Kill orphan LIPC headset-button watchers (btmediacontrol pidfiles).
+    --    Verify the pid still names a lipc process before killing: pids
+    --    recycle, and a stale pidfile must never kill an unrelated process.
+    do
+        local h2 = io.popen("ls /tmp/abk_lipc_*.pid 2>/dev/null")
+        if h2 then
+            for pid_file in h2:lines() do
+                local pf = io.open(pid_file, "r")
+                if pf then
+                    local pid = tonumber(pf:read("*l"))
+                    pf:close()
+                    local is_lipc = false
+                    if pid and pid > 1 then
+                        local c = io.open("/proc/" .. pid .. "/cmdline", "r")
+                        if c then
+                            is_lipc = (c:read("*a"):find("lipc", 1, true) ~= nil)
+                            c:close()
+                        end
+                    end
+                    if is_lipc then
+                        os.execute(string.format("kill -9 %d 2>/dev/null", pid))
+                        dominated = true
+                        logger.warn("Audiobook: Startup cleanup — killed orphan lipc-wait-event", pid)
+                    end
+                    os.remove(pid_file)
+                end
+            end
+            h2:close()
+        end
+    end
+
+    -- 8. Clean up stale temp files
     os.execute("rm -f /tmp/audiobook_fifo /tmp/audiobook_pipeline.sh /tmp/audiobook_ctrl/gst_pid /tmp/audiobook_ctrl/stop /tmp/audiobook_ctrl/play /tmp/audiobook_ctrl/done 2>/dev/null")
-    os.execute("rm -f /tmp/piper_server_*.pid /tmp/piper_server_*.piper_pid /tmp/piper_server_*.sh /tmp/piper_server_*.log 2>/dev/null")
+    os.execute("rm -f /tmp/piper_server_*.pid /tmp/piper_server_*.piper_pid /tmp/piper_server_*.sh /tmp/piper_server_*.log /tmp/abk_lipc_*.pid 2>/dev/null")
 
     if dominated then
         -- Give kernel time to release sockets after SIGKILL

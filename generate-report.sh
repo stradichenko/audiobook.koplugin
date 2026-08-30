@@ -407,6 +407,21 @@ if [ "$PLATFORM" = "kindle" ] && command -v lipc-get-prop >/dev/null 2>&1; then
     )
     [ -z "$KINDLE_TTS_TEST" ] && KINDLE_TTS_TEST="failed"
 
+    # v0.1.17.48: LIPC headset-button watch diagnostics. Watchers alive and
+    # what they logged tells us whether stem clicks reach playermgr/audiomgrd
+    # (the plugin watches them in btmediacontrol.lua).
+    KINDLE_LIPC_AVRCP=$(
+        echo "--- lipc headset-button watch ---"
+        echo "watchers=$(pgrep -a lipc-wait-event 2>/dev/null || echo none)"
+        echo "pidfiles=$(ls /tmp/abk_lipc_*.pid 2>/dev/null | tr '\n' ' ' || echo none)"
+        echo "log=$(ls -la /tmp/abk-kindle-avrcp.log 2>/dev/null || echo absent)"
+        echo "--- log tail ---"
+        tail -20 /tmp/abk-kindle-avrcp.log 2>/dev/null || echo "no log"
+        echo "--- InPlayback now ---"
+        echo "inplayback=$(lipc-get-prop com.lab126.playermgr InPlayback 2>&1)"
+    )
+    [ -z "$KINDLE_LIPC_AVRCP" ] && KINDLE_LIPC_AVRCP="failed"
+
     # v0.1.5.32: Deeper TTS + audio path exploration
     KINDLE_TTS_ORCH_STARTED=$(lipc-get-prop com.lab126.tts.orchestrator orchestratorStarted 2>&1 || echo "n/a")
     KINDLE_TTS_ORCH_HASH_CMD=$(which lipc-hash-prop 2>/dev/null || echo "not_found")
@@ -773,6 +788,7 @@ $(printf '%b' "$KINDLE_AUDIO_BINS")  kindle_snd_modules: ${KINDLE_SND_MODULES}
   kindle_gst_inspect_ttssrc: ${KINDLE_GST_INSPECT_TTSSRC}
   kindle_gst_inspect_mixersink: ${KINDLE_GST_INSPECT_MIXERSINK}
   kindle_tts_test: ${KINDLE_TTS_TEST}
+  kindle_lipc_avrcp: ${KINDLE_LIPC_AVRCP}
   kindle_tts_orch_started: ${KINDLE_TTS_ORCH_STARTED}
   kindle_tts_orch_hash_cmd: ${KINDLE_TTS_ORCH_HASH_CMD}
   kindle_tts_orch_langs: ${KINDLE_TTS_ORCH_LANGS}

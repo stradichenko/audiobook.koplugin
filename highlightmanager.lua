@@ -103,10 +103,35 @@ function HighlightManager:_refreshHighlight(new_boxes, page)
     if new_boxes and #new_boxes > 0 then
         table.insert(arrays, new_boxes)
     end
-    UIManager:setDirty(self.ui.dialog or "all", "ui",
-        boxesUnionRegion(arrays))
+    local region = boxesUnionRegion(arrays)
+    if region then
+        -- Keep the e-ink refresh off the mini player / KOReader footer so
+        -- sentence updates do not flash a second ghost bar at the bottom.
+        local bar_top = self:_overlayBarTop()
+        if bar_top and region.y + region.h > bar_top then
+            region.h = math.max(0, bar_top - region.y)
+        end
+        if region.h > 0 then
+            UIManager:setDirty(self.ui.dialog or "all", "ui", region)
+        end
+    end
     self._last_boxes = new_boxes
     self._last_boxes_page = page
+end
+
+function HighlightManager:_overlayBarTop()
+    local p = self.plugin
+    local bar = p and p.media_sync and p.media_sync.playback_bar
+    if bar and bar._minimized then
+        if bar.dimen and bar.dimen.y and bar.dimen.y > 0 then
+            return bar.dimen.y
+        end
+        if bar._miniBarY then
+            local ok, y = pcall(function() return bar:_miniBarY() end)
+            if ok and type(y) == "number" and y > 0 then return y end
+        end
+    end
+    return nil
 end
 
 function HighlightManager:setStyle(style)
