@@ -54,6 +54,36 @@ function EpubMediaOverlay:_escapeUnzipMember(path)
     return path:gsub("%[", "[[]")
 end
 
+--- Percent-decode %HH sequences in a URI-style path.  OPF hrefs and SMIL
+-- srcs are URIs, so re-save tools (Calibre, Readest) write
+-- "MediaOverlays/005%20-%20PROLOGUE.smil" while the zip member keeps the
+-- literal space; unzip then misses every SMIL and we report "no built-in
+-- audiobook" even though detection (unzip -l) still sees them.  Decoding
+-- is only ever tried as a FALLBACK: members genuinely named with percent
+-- signs keep working because the raw path is always tried first.
+function EpubMediaOverlay:_urlDecode(path)
+    -- plain find: "%" is one percent.  A "%%" pattern here would search
+    -- for two consecutive percent signs and skip every real %20 / %2C.
+    if not path or not path:find("%", 1, true) then
+        return path
+    end
+    return (path:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
+--- Zip member names to try, in order: exactly as written, then
+-- percent-decoded.  Call sites validate each candidate AFTER decoding:
+-- "%2e%2e%2f" decodes to "../" and must hit the validator, not unzip.
+function EpubMediaOverlay:_zipMemberCandidates(path)
+    local list = { path }
+    local decoded = self:_urlDecode(path)
+    if decoded and decoded ~= path then
+        list[#list + 1] = decoded
+    end
+    return list
+end
+
 --- Quote an argument for POSIX sh: single quotes make the whole string
 -- literal, with the standard '\'' escape for embedded quotes. Never build
 -- a shell command with double-quote-and-escape: $(), backticks and friends
@@ -199,19 +229,35 @@ end
 -- ---------------------------------------------------------------------------
 
 function EpubMediaOverlay:_extractFromZip(epub_path, internal_path)
-    -- Extract a single file from the EPUB using unzip
-    if not self:_validateZipMember(internal_path) then
-        logger.warn("EpubMediaOverlay: refusing unsafe archive member path",
-            tostring(internal_path))
-        return nil
+    -- Extract a single file from the EPUB using unzip.  Paths arrive as
+    -- URIs (OPF hrefs, SMIL srcs): try each as written first, then
+    -- percent-decoded, so re-saved books (encoded hrefs over literal-space
+    -- members) extract while raw-named members keep working.
+    local last_unsafe
+    for _, path in ipairs(self:_zipMemberCandidates(internal_path)) do
+        if not self:_validateZipMember(path) then
+            last_unsafe = path
+        else
+            local zip_member = self:_escapeUnzipMember(path)
+            local cmd = string.format(
+                'unzip -p %s %s',
+                self:_quoteShell(epub_path),
+                self:_quoteShell(zip_member)
+            )
+            local out = self:_runCommand(cmd)
+            -- _runCommand merges stderr, so a missed member surfaces as
+            -- "filename not matched" text instead of a nil return.
+            if out and out ~= ""
+                and not out:find("filename not matched", 1, true) then
+                return out
+            end
+        end
     end
-    local zip_member = self:_escapeUnzipMember(internal_path)
-    local cmd = string.format(
-        'unzip -p %s %s',
-        self:_quoteShell(epub_path),
-        self:_quoteShell(zip_member)
-    )
-    return self:_runCommand(cmd)
+    if last_unsafe then
+        logger.warn("EpubMediaOverlay: refusing unsafe archive member path",
+            tostring(last_unsafe))
+    end
+    return nil
 end
 
 function EpubMediaOverlay:_findOpfPath(epub_path)
@@ -461,42 +507,43 @@ function EpubMediaOverlay:_extractAudioFile(epub_path, internal_path, cache_dir)
     -- called once per SMIL par entry (thousands of times per book, with a
     -- handful of distinct audio files), and the old check against only the
     -- flattened name made every single entry re-extract its multi-MB audio
-    -- file from the zip.
-    if not self:_validateZipMember(internal_path) then
-        logger.warn("EpubMediaOverlay: refusing unsafe audio path",
-            tostring(internal_path))
-        return nil
-    end
-    local extracted = cache_dir .. "/" .. internal_path
-    if self:_fileExists(extracted) then
-        return extracted
-    end
+    -- file from the zip.  Paths arrive as URIs, so each candidate (as
+    -- written, then percent-decoded) gets its own cache lookup, validation
+    -- and unzip pass.
+    for _, path in ipairs(self:_zipMemberCandidates(internal_path)) do
+        if not self:_validateZipMember(path) then
+            logger.warn("EpubMediaOverlay: refusing unsafe audio path",
+                tostring(path))
+        else
+            local extracted = cache_dir .. "/" .. path
+            if self:_fileExists(extracted) then
+                return extracted
+            end
 
-    local cache_path = cache_dir .. "/" .. internal_path:gsub("/", "_")
-    if self:_fileExists(cache_path) then
-        return cache_path
-    end
+            local cache_path = cache_dir .. "/" .. path:gsub("/", "_")
+            if self:_fileExists(cache_path) then
+                return cache_path
+            end
 
-    -- Extract the file
-    local zip_member = self:_escapeUnzipMember(internal_path)
-    local cmd = string.format(
-        'unzip -o %s %s -d %s >/dev/null 2>&1',
-        self:_quoteShell(epub_path),
-        self:_quoteShell(zip_member),
-        self:_quoteShell(cache_dir)
-    )
-    os.execute(cmd)
+            -- Extract the file
+            local zip_member = self:_escapeUnzipMember(path)
+            local cmd = string.format(
+                'unzip -o %s %s -d %s >/dev/null 2>&1',
+                self:_quoteShell(epub_path),
+                self:_quoteShell(zip_member),
+                self:_quoteShell(cache_dir)
+            )
+            os.execute(cmd)
 
-    -- The extracted file will be at cache_dir/internal_path
-    -- But unzip preserves the directory structure, so we need to find it
-    local extracted = cache_dir .. "/" .. internal_path
-    if self:_fileExists(extracted) then
-        return extracted
-    end
-
-    -- Fallback: try flat cache path
-    if self:_fileExists(cache_path) then
-        return cache_path
+            -- unzip preserves the directory structure, so the file lands
+            -- at cache_dir/<member>; the flat name is the legacy fallback.
+            if self:_fileExists(extracted) then
+                return extracted
+            end
+            if self:_fileExists(cache_path) then
+                return cache_path
+            end
+        end
     end
 
     logger.warn("EpubMediaOverlay: failed to extract", internal_path)

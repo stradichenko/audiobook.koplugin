@@ -16,6 +16,27 @@ local function escape_unzip_member(path)
     return path:gsub("%[", "[[]")
 end
 
+-- Mirrors EpubMediaOverlay:_urlDecode.  OPF hrefs are URIs, so re-save
+-- tools (Calibre, Readest) write "a%20b.smil" over a literal-space member;
+-- the module decodes only as a fallback after the raw path misses.
+local function url_decode(path)
+    if not path or path:find("%", 1, true) == nil then
+        return path
+    end
+    return (path:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
+local function zip_member_candidates(path)
+    local list = { path }
+    local decoded = url_decode(path)
+    if decoded and decoded ~= path then
+        list[#list + 1] = decoded
+    end
+    return list
+end
+
 local function compact_xml(xml)
     return xml:gsub(">%s+<", "><")
 end
@@ -74,6 +95,31 @@ end
 local opf = read_file(fixtures .. "/content.opf")
 if not opf then
     table.insert(failures, "missing fixture content.opf")
+end
+
+local encoded = "MediaOverlays/005%20-%20PROLOGUE.smil"
+if url_decode(encoded) ~= "MediaOverlays/005 - PROLOGUE.smil" then
+    table.insert(failures, "url_decode spaces: " .. tostring(url_decode(encoded)))
+end
+local encoded_comma = "MediaOverlays/011%20-%20V%20LE%20ROI%2C%20SES.smil"
+if url_decode(encoded_comma) ~= "MediaOverlays/011 - V LE ROI, SES.smil" then
+    table.insert(failures, "url_decode comma: " .. tostring(url_decode(encoded_comma)))
+end
+if url_decode("MediaOverlays/plain.smil") ~= "MediaOverlays/plain.smil" then
+    table.insert(failures, "url_decode should leave plain paths alone")
+end
+-- Invalid sequences stay put ("100%.smil" is a real member name); a valid
+-- lookalike decodes, which is why candidates must try the raw path first.
+if url_decode("Chapter 100%.smil") ~= "Chapter 100%.smil" then
+    table.insert(failures, "url_decode must leave invalid % sequences alone")
+end
+local cands = zip_member_candidates("MediaOverlays/005%20-%20PROLOGUE.smil")
+if #cands ~= 2 or cands[1] ~= encoded
+    or cands[2] ~= "MediaOverlays/005 - PROLOGUE.smil" then
+    table.insert(failures, "candidates must be raw first, decoded second")
+end
+if #zip_member_candidates("MediaOverlays/plain.smil") ~= 1 then
+    table.insert(failures, "plain paths need no decoded candidate")
 end
 
 local storyteller_member =
