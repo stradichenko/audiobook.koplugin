@@ -54,6 +54,31 @@ function EpubMediaOverlay:_escapeUnzipMember(path)
     return path:gsub("%[", "[[]")
 end
 
+--- Calibre / Readest rewrite OPF hrefs as percent-encoded URLs
+-- (`MediaOverlays/005%20-%20PROLOGUE.smil`) while the zip members keep
+-- literal spaces.  unzip then misses every SMIL and we report "no
+-- built-in audiobook" even though Readest still plays the same file.
+function EpubMediaOverlay:_urlDecode(path)
+    -- plain find: "%" is one percent. "%%" would look for two percents
+    -- and skip every real %20 / %2C href (Readest/Calibre).
+    if not path or not path:find("%", 1, true) then
+        return path
+    end
+    return (path:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
+--- Zip member names to try: as written, then percent-decoded.
+function EpubMediaOverlay:_zipMemberCandidates(path)
+    local list = { path }
+    local decoded = self:_urlDecode(path)
+    if decoded and decoded ~= path then
+        list[#list + 1] = decoded
+    end
+    return list
+end
+
 --- Quote an argument for POSIX sh: single quotes make the whole string
 -- literal, with the standard '\'' escape for embedded quotes. Never build
 -- a shell command with double-quote-and-escape: $(), backticks and friends
@@ -200,18 +225,29 @@ end
 
 function EpubMediaOverlay:_extractFromZip(epub_path, internal_path)
     -- Extract a single file from the EPUB using unzip
-    if not self:_validateZipMember(internal_path) then
-        logger.warn("EpubMediaOverlay: refusing unsafe archive member path",
-            tostring(internal_path))
-        return nil
+    local last_unsafe
+    for _, path in ipairs(self:_zipMemberCandidates(internal_path)) do
+        if not self:_validateZipMember(path) then
+            last_unsafe = path
+        else
+            local zip_member = self:_escapeUnzipMember(path)
+            local cmd = string.format(
+                'unzip -p %s %s',
+                self:_quoteShell(epub_path),
+                self:_quoteShell(zip_member)
+            )
+            local out = self:_runCommand(cmd)
+            if out and out ~= ""
+                and not out:find("filename not matched", 1, true) then
+                return out
+            end
+        end
     end
-    local zip_member = self:_escapeUnzipMember(internal_path)
-    local cmd = string.format(
-        'unzip -p %s %s',
-        self:_quoteShell(epub_path),
-        self:_quoteShell(zip_member)
-    )
-    return self:_runCommand(cmd)
+    if last_unsafe then
+        logger.warn("EpubMediaOverlay: refusing unsafe archive member path",
+            tostring(last_unsafe))
+    end
+    return nil
 end
 
 function EpubMediaOverlay:_findOpfPath(epub_path)
@@ -264,7 +300,7 @@ function EpubMediaOverlay:_parseOpfManifest(opf_xml)
         if id and href then
             manifest_items[id] = {
                 id = id,
-                href = href,
+                href = self:_urlDecode(href) or href,
                 media_type = media_type,
                 media_overlay = media_overlay,
             }
@@ -333,6 +369,10 @@ function EpubMediaOverlay:_parseSmil(smil_xml, smil_base_path)
             local clip_end = audio_block:match('clipEnd%s*=%s*"([^"]+)"')
 
             if audio_src then
+                audio_src = self:_urlDecode(audio_src) or audio_src
+                if text_src then
+                    text_src = self:_urlDecode(text_src) or text_src
+                end
                 -- Resolve relative paths
                 local resolved_audio = audio_src
                 if audio_src:sub(1, 1) ~= "/" and audio_base ~= "" then
@@ -462,6 +502,7 @@ function EpubMediaOverlay:_extractAudioFile(epub_path, internal_path, cache_dir)
     -- handful of distinct audio files), and the old check against only the
     -- flattened name made every single entry re-extract its multi-MB audio
     -- file from the zip.
+    internal_path = self:_urlDecode(internal_path) or internal_path
     if not self:_validateZipMember(internal_path) then
         logger.warn("EpubMediaOverlay: refusing unsafe audio path",
             tostring(internal_path))

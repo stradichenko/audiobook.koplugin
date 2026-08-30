@@ -16,6 +16,15 @@ local function escape_unzip_member(path)
     return path:gsub("%[", "[[]")
 end
 
+local function url_decode(path)
+    if not path or not path:find("%", 1, true) then
+        return path
+    end
+    return (path:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
 local function compact_xml(xml)
     return xml:gsub(">%s+<", "><")
 end
@@ -74,6 +83,18 @@ end
 local opf = read_file(fixtures .. "/content.opf")
 if not opf then
     table.insert(failures, "missing fixture content.opf")
+end
+
+local encoded = "MediaOverlays/005%20-%20PROLOGUE.smil"
+if url_decode(encoded) ~= "MediaOverlays/005 - PROLOGUE.smil" then
+    table.insert(failures, "url_decode spaces: " .. tostring(url_decode(encoded)))
+end
+local encoded_comma = "MediaOverlays/011%20-%20V%20LE%20ROI%2C%20SES.smil"
+if url_decode(encoded_comma) ~= "MediaOverlays/011 - V LE ROI, SES.smil" then
+    table.insert(failures, "url_decode comma: " .. tostring(url_decode(encoded_comma)))
+end
+if url_decode("MediaOverlays/plain.smil") ~= "MediaOverlays/plain.smil" then
+    table.insert(failures, "url_decode should leave plain paths alone")
 end
 
 local storyteller_member =
