@@ -3224,7 +3224,22 @@ function Audiobook:_killOrphanProcessesFromPreviousSession()
         end
     end
 
-    -- 3. Kill orphan feeder/server shell scripts by PID file
+    -- 3. Kill orphan espeak-ng processes.  espeak synthesis runs through a
+    --    blocking io.popen, so a KOReader exit mid-sentence reparents the
+    --    child to init and it keeps synthesizing forever (observed as
+    --    PPid=1 espeak-ng processes on Kindle, issue #77).
+    h = io.popen("pgrep -c espeak 2>/dev/null")
+    if h then
+        local count = tonumber(h:read("*a"))
+        h:close()
+        if count and count > 0 then
+            os.execute("killall -9 espeak-ng 2>/dev/null")
+            dominated = true
+            logger.warn("Audiobook: Startup cleanup — killed orphan espeak-ng")
+        end
+    end
+
+    -- 4. Kill orphan feeder/server shell scripts by PID file
     local pid_files = {
         "/tmp/audiobook_ctrl/gst_pid",    -- persistent pipeline gst PID
         "/tmp/piper_server_1.pid",         -- piper server 1 reader PID
@@ -3246,14 +3261,14 @@ function Audiobook:_killOrphanProcessesFromPreviousSession()
         end
     end
 
-    -- 4. Kill the feeder wrapper shell by finding /bin/sh audiobook_pipeline
+    -- 5. Kill the feeder wrapper shell by finding /bin/sh audiobook_pipeline
     --    This catches the wrapper that io.popen("script & echo $!") spawned.
     os.execute("pkill -9 -f 'audiobook_pipeline\\.sh' 2>/dev/null")
 
-    -- 5. Kill orphan server wrapper shells
+    -- 6. Kill orphan server wrapper shells
     os.execute("pkill -9 -f 'piper_server_.*\\.sh' 2>/dev/null")
 
-    -- 6. Clean up stale temp files
+    -- 7. Clean up stale temp files
     os.execute("rm -f /tmp/audiobook_fifo /tmp/audiobook_pipeline.sh /tmp/audiobook_ctrl/gst_pid /tmp/audiobook_ctrl/stop /tmp/audiobook_ctrl/play /tmp/audiobook_ctrl/done 2>/dev/null")
     os.execute("rm -f /tmp/piper_server_*.pid /tmp/piper_server_*.piper_pid /tmp/piper_server_*.sh /tmp/piper_server_*.log 2>/dev/null")
 

@@ -87,10 +87,10 @@ __asm__(".symver __res_maybe_init_compat, __res_maybe_init@GLIBC_PRIVATE");
 #endif /* !KGP_NATIVE_GLIBC */
 
 #ifdef KGP_NATIVE_GLIBC
-#define VERSION "0.5.0-native"
+#define VERSION "0.6.0-native"
 #define BUILD_VARIANT "native"
 #else
-#define VERSION "0.5.0-compat"
+#define VERSION "0.6.0-compat"
 #define BUILD_VARIANT "compat"
 #endif
 
@@ -234,6 +234,61 @@ static void preload_ivona_libs(void)
     }
 }
 
+/* ---- ttssrc property introspection (probe only) ----
+ *
+ * Firmware 5.19.x (KT6, PW6 Gen12) removed the "content-texts" property
+ * from ttssrc: the pipeline still builds, but gst_tts_src_start() aborts
+ * with "No content texts specified for TTS" because the text never
+ * arrives.  Report the property's presence plus the full property-name
+ * list so ttsengine.lua can retire the native fallback on those
+ * firmwares and so bug reports carry the replacement API names.
+ *
+ * No gobject headers needed: every GObject starts with a GTypeInstance
+ * whose single member is the class pointer, and GParamSpec's second
+ * member is the property name, so both are plain pointer reads.  The
+ * only symbols needed from libgobject are g_object_class_find_property
+ * and g_object_class_list_properties.
+ */
+static void probe_ttssrc_properties(void *ttssrc_inst)
+{
+    void *gobj = dlopen("libgobject-2.0.so.0", RTLD_LAZY);
+    if (!gobj)
+        gobj = dlopen("/usr/lib/libgobject-2.0.so.0", RTLD_LAZY);
+    if (!gobj || !ttssrc_inst) {
+        printf("ttssrc_content_texts=unknown\n");
+        return;
+    }
+    void *(*find_prop)(void *, const char *) =
+        (void *(*)(void *, const char *))dlsym(gobj, "g_object_class_find_property");
+    /* GTypeInstance.g_class is the first member of every GObject. */
+    void *klass = find_prop ? *(void **)ttssrc_inst : NULL;
+    if (!find_prop || !klass) {
+        printf("ttssrc_content_texts=unknown\n");
+        return;
+    }
+    void *pspec = find_prop(klass, "content-texts");
+    printf("ttssrc_content_texts=%s\n", pspec ? "yes" : "no");
+
+    /* Dump every property name (comma-separated, one line).  GParamSpec
+       places `name` right after the GTypeInstance header, i.e. at one
+       pointer offset on both 32-bit and 64-bit glib.  Best-effort: a
+       NULL name prints as "?". */
+    void *(*list_props)(void *, unsigned int *) =
+        (void *(*)(void *, unsigned int *))dlsym(gobj, "g_object_class_list_properties");
+    if (!list_props)
+        return;
+    unsigned int n = 0;
+    void **props = list_props(klass, &n);
+    printf("ttssrc_properties=");
+    for (unsigned int i = 0; props && i < n; i++) {
+        const char *name = props[i]
+            ? *(const char **)((char *)props[i] + sizeof(void *))
+            : NULL;
+        printf("%s%s", i ? "," : "", name ? name : "?");
+    }
+    printf("\n");
+}
+
 /* ---- Probe mode ---- */
 static int do_probe(void)
 {
@@ -290,6 +345,8 @@ static int do_probe(void)
             void *inst = gst_element_factory_make_(elems[i], "probe_test");
             if (inst) {
                 can_make = 1;
+                if (strcmp(elems[i], "ttssrc") == 0)
+                    probe_ttssrc_properties(inst);
                 gst_object_unref_(inst);
             }
         }

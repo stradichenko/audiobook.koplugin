@@ -2914,7 +2914,11 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                         -- Do NOT fall back to gst-play WAV mode if ttssrc is
                         -- available (it is more reliable than WAV on stripped
                         -- GStreamer firmware) or if gst-play is known broken.
+                        -- 5.19.x firmware removed ttssrc's text-injection
+                        -- property, so a "found" ttssrc cannot rescue playback
+                        -- there (issues #73/#77).
                         local use_ttssrc = engine._ttssrc_available
+                            and not engine._ttssrc_api_broken
                         if not use_ttssrc and not engine._gst_play_broken
                             and engine._kindle_gst_play_bin and engine.current_audio_file then
                             logger.warn("TTSEngine: native TTS failed, falling back to kindle-gst-play (issue #18)")
@@ -4088,6 +4092,18 @@ end
 -- @treturn string|nil  "kindle-native-tts-fallback" if selected, else nil
 function TTSEngine:_tryKindleNativeTtsFallback(context)
     if not Device:isKindle() then return nil end
+    -- Firmware 5.19.x removed both legacy text-injection APIs (the ttssrc
+    -- "content-texts" property and the orchestrator "speak" property;
+    -- issues #73/#77).  orchestratorStarted=1 and ttssrc=found still
+    -- report true there, but selecting the fallback only makes every
+    -- sentence fail after a 5s stall while the Piper/espeak audio is
+    -- discarded, so retire it for WAV-producing backends.  An explicit
+    -- Kindle-native backend keeps its path via 0b in findAudioPlayer().
+    if self._ttssrc_api_broken and self.backend ~= self.BACKENDS.KINDLE_NATIVE then
+        logger.warn("TTSEngine: skipping native TTS fallback (ttssrc content-texts property gone on this firmware), context=",
+            tostring(context or "?"))
+        return nil
+    end
     local orch_ok = false
     local h = io.popen("lipc-get-prop com.lab126.tts.orchestrator orchestratorStarted 2>/dev/null")
     if h then
@@ -4239,6 +4255,7 @@ function TTSEngine:findAudioPlayer()
                             if ph then
                                 local probe = ph:read("*a") or ""
                                 ph:close()
+                                self:_noteTtssrcProbe(probe)
                                 local ttssrc_ok = probe:match("ttssrc=found")
                                 local ttssrc_broken = probe:match("ttssrc=broken")
                                 local mixersink_ok = probe:match("mixersink=found")
@@ -4250,7 +4267,10 @@ function TTSEngine:findAudioPlayer()
                                         self.plugin:setSetting("_ttssrc_broken", true)
                                     end
                                 end
-                                if ttssrc_ok and mixersink_ok then
+                                -- A found ttssrc no longer implies a usable one:
+                                -- 5.19.x firmware dropped its text-injection
+                                -- property (issues #73/#77).
+                                if ttssrc_ok and mixersink_ok and not self._ttssrc_api_broken then
                                     self._ttssrc_available = true
                                     self.audio_player_type = "kindle-ttssrc"
                                     self._no_real_audio_output = false
@@ -4297,6 +4317,7 @@ function TTSEngine:findAudioPlayer()
                         if ph then
                             local probe = ph:read("*a") or ""
                             ph:close()
+                            self:_noteTtssrcProbe(probe)
                             local has_plugin_error = probe:match("Failed to load plugin")
                                 or probe:match("undefined symbol")
                                 or probe:match("GStreamer%-WARNING")
@@ -4351,7 +4372,29 @@ function TTSEngine:findAudioPlayer()
                                         logger.warn("TTSEngine: Selected kindle-gst-play WAV mode on stripped firmware")
                                         return "kindle-gst-play"
                                     end
-                                    logger.warn("TTSEngine: gst-play WAV mode failed on stripped firmware")
+                                    -- The compat binary runs through the bundled
+                                    -- modern-glibc ld-linux; on some newer
+                                    -- firmwares that mix fails at dlopen time even
+                                    -- though --probe loads (issue #77).  Retry the
+                                    -- same end-to-end probe with the native-glibc
+                                    -- builds before declaring WAV playback dead.
+                                    for _, native_bin in ipairs({
+                                        plugin_dir .. "/kindle/gst-play-native-pw2",
+                                        plugin_dir .. "/kindle/gst-play-native",
+                                    }) do
+                                        local nf = io.open(native_bin, "r")
+                                        if nf then
+                                            nf:close()
+                                            if self:_probeKindleGstPlayWav(native_bin) then
+                                                self.audio_player_type = "kindle-gst-play"
+                                                self._kindle_gst_play_bin = native_bin
+                                                self._no_real_audio_output = false
+                                                logger.warn("TTSEngine: Selected kindle-gst-play WAV mode via native-glibc build on stripped firmware")
+                                                return "kindle-gst-play"
+                                            end
+                                        end
+                                    end
+                                    logger.warn("TTSEngine: gst-play WAV mode failed on stripped firmware (compat and native builds)")
                                     -- Flag that this Kindle cannot play WAV files produced by
                                     -- external TTS backends (Piper, espeak).  Used to show a
                                     -- clearer pre-synthesis warning in main.lua.
@@ -5313,6 +5356,28 @@ function TTSEngine:_probeKindleGstPlayWav(gst_play_cmd)
     return false
 end
 
+--- Update ttssrc API availability flags from a gst-play --probe report.
+-- Firmware 5.19.x (KT6, PW6 Gen12; issues #73/#77) removed the
+-- "content-texts" property from ttssrc: the element still loads and the
+-- pipeline still builds, but gst_tts_src_start() aborts with "No content
+-- texts specified" because the text assignment is silently ignored.
+-- When the probe proves the property gone, remember it so the native TTS
+-- fallback and the kindle-ttssrc player are not selected on top of a
+-- dead API.  The probe's property-name dump is logged verbatim so bug
+-- reports carry the replacement API names.
+function TTSEngine:_noteTtssrcProbe(probe)
+    local props = probe:match("ttssrc_properties=([^\n]*)")
+    if props and props ~= "" and props ~= "unknown" then
+        logger.warn("TTSEngine: ttssrc properties:", props)
+    end
+    if probe:match("ttssrc_content_texts=no") then
+        if not self._ttssrc_api_broken then
+            logger.warn("TTSEngine: ttssrc has no content-texts property (firmware removed the text-injection API)")
+        end
+        self._ttssrc_api_broken = true
+    end
+end
+
 --- Probe the bundled kindle/gst-play helper candidates and return the first
 --- command whose --probe reports mixersink=found, or nil.
 --- Mirrors MediaEngine:_detectKindleGstPlay (which runs without any playermgr
@@ -5345,21 +5410,42 @@ function TTSEngine:_probeKindleGstPlayBin()
             table.insert(candidates, native_bin)
         end
     end
+    -- The loop historically broke on the first candidate reporting
+    -- mixersink=found.  On 5.19.x firmware that first candidate can be the
+    -- compat build whose bundled-glibc process cannot dlopen the device's
+    -- Ivona libraries, leaving the selected binary unable to run --ttssrc
+    -- even where the ttssrc property still exists (issue #77).  Keep the
+    -- first passing candidate as the default, but prefer the first passing
+    -- candidate that ALSO preloaded both Ivona libraries.  Devices where
+    -- the compat build preloads fine (PW5/Colorsoft era) pick it exactly
+    -- as before, because it is the first Ivona-capable passer.
+    local first_pass, best = nil, nil
     for _, cand in ipairs(candidates) do
         local ph = io.popen(cand .. " --probe 2>&1")
         if ph then
             local probe = ph:read("*a") or ""
             ph:close()
+            self:_noteTtssrcProbe(probe)
             if probe:match("mixersink=found")
                 and not probe:match("mixersink=broken")
                 and not probe:match("gstreamer=not_found") then
-                logger.warn("TTSEngine: gst-play probe OK:", cand)
-                return cand
+                if not first_pass then first_pass = cand end
+                if probe:match("preloaded /usr/lib/tts/libIvonaEInkAPI%.so")
+                    and probe:match("preloaded /usr/lib/tts/libIvonaEInkCommon%.so") then
+                    best = cand
+                    break
+                end
             end
-            logger.dbg("TTSEngine: gst-play probe failed:", cand, "->", probe:gsub("\n", " "):sub(1, 120))
+            logger.dbg("TTSEngine: gst-play probe:", cand, "->",
+                probe:gsub("\n", " "):sub(1, 160))
         end
     end
-    return nil
+    local chosen = best or first_pass
+    if chosen then
+        logger.warn("TTSEngine: gst-play probe OK:", chosen,
+            best and "(Ivona preloaded)" or "(no Ivona-preloading candidate)")
+    end
+    return chosen
 end
 
 --- Keep the Kindle A2DP datapath alive between sentences.
