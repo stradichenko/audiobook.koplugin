@@ -1820,13 +1820,23 @@ function MediaEngine:_playSystemGstLaunch(gen)
     self:_killOrphanKindleGstPipelines("kindle-gst-wav", 150000,
         self._keepalive_pid and { content_only = true } or nil)
 
-    local caps = string.format(
-        "audio/x-raw-int,endianness=1234,signed=true,width=%d,depth=%d,rate=%d,channels=%d",
-        bits, bits, rate, channels)
+    local caps, gst_cmd
+    if MediaEngine:commandExists("gst-launch-0.10") then
+        gst_cmd = "gst-launch-0.10"
+        caps = string.format(
+            "audio/x-raw-int,endianness=1234,signed=true,width=%d,depth=%d,rate=%d,channels=%d",
+            bits, bits, rate, channels)
+    else
+        -- Newer firmware ships GStreamer 1.0 only; use 1.0 raw caps + binary.
+        gst_cmd = "gst-launch-1.0"
+        caps = string.format(
+            "audio/x-raw,format=%s,rate=%d,channels=%d,layout=interleaved",
+            bits == 16 and "S16LE" or "U8", rate, channels)
+    end
     local cmd = string.format(
-        "gst-launch-0.10 filesrc location='%s' ! capsfilter caps='%s'"
+        "%s filesrc location='%s' ! capsfilter caps='%s'"
         .. " ! mixersink stream-type=Music sync=true",
-        raw_file:gsub("'", "'\\''"), caps)
+        gst_cmd, raw_file:gsub("'", "'\\''"), caps)
     logger.warn("MediaEngine: system gst-launch gen=", gen,
         "rate=", rate, "ch=", channels, "seek_offset=", self._seek_offset or 0,
         "apple_airpods=", apple and "yes" or "no")
@@ -1856,7 +1866,20 @@ would otherwise be swallowed by the ring/BT chain at EOS.
 --]]
 function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     local ffmpeg = self:_findFfmpeg()
-    if not ffmpeg or not self:commandExists("gst-launch-0.10") then
+    if not ffmpeg then
+        return nil
+    end
+    local gst_cmd, raw_caps, fdsrc_args
+    if self:commandExists("gst-launch-0.10") then
+        gst_cmd = "gst-launch-0.10"
+        raw_caps = "audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234"
+        fdsrc_args = "fdsrc"
+    elseif self:commandExists("gst-launch-1.0") then
+        -- Newer firmware ships GStreamer 1.0 only; use 1.0 raw caps + binary.
+        gst_cmd = "gst-launch-1.0"
+        raw_caps = "audio/x-raw,format=S16LE,rate=22050,channels=1,layout=interleaved"
+        fdsrc_args = "fdsrc do-timestamp=true"
+    else
         return nil
     end
 
@@ -1908,11 +1931,12 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
         "%s -loglevel error -progress '%s' -nostats -ss %.3f -i '%s'"
         .. " -f s16le -ar 22050 -ac 1"
         .. " -af adelay=%d:all=1%s,apad=pad_dur=%.1f - 2>/dev/null"
-        .. " | gst-launch-0.10 fdsrc"
-        .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
+        .. " | %s %s"
+        .. " ! '%s'"
         .. " ! mixersink stream-type=Music sync=true",
         ffmpeg:gsub("'", "'\\''"), progress_file:gsub("'", "'\\''"), seek,
-        self.current_path:gsub("'", "'\\''"), adelay_ms, self:_volumeFilterPart(), apad_s)
+        self.current_path:gsub("'", "'\\''"), adelay_ms, self:_volumeFilterPart(), apad_s,
+        gst_cmd, fdsrc_args, raw_caps)
     -- out_time is the PRODUCER side: it leads what the listener hears by the
     -- whole downstream buffer -- OS pipe (~1.5 s when full) + gst/mixersink
     -- ring (~0.9 s) + BT chain (~0.3 s) ~= 2.7 s.  AirPods buffer a bit more.
@@ -2284,7 +2308,7 @@ function MediaEngine:_playKindleGstPlay(gen)
     -- sets neither stream-type nor sync on mixersink and hangs on these
     -- firmwares.  Fall back to it only for non-PCM-WAV input or when
     -- gst-launch-0.10 is missing.
-    if self:commandExists("gst-launch-0.10") then
+    if self:commandExists("gst-launch-0.10") or self:commandExists("gst-launch-1.0") then
         local ok = self:_playSystemGstLaunch(gen)
         if ok then return ok end
     end
