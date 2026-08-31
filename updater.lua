@@ -475,11 +475,33 @@ function Updater._performUpdate(plugin, release)
             return
         end
     end
-    -- Test archive integrity with unzip -t.  Some platforms fall back to
-    -- BusyBox unzip; if the test fails here, we abort before touching the
-    -- installed plugin directory.
-    local test_cmd = 'unzip -t "' .. zip_path .. '" >/dev/null 2>&1'
-    local test_ok = os.execute(test_cmd)
+    -- Probe the downloaded archive before touching the installed plugin
+    -- directory.  Info-ZIP's `unzip -t` CRC-checks every entry, but the
+    -- BusyBox unzip shipped on Kobo and PocketBook firmwares has no -t
+    -- option at all and rejects EVERY archive with a usage error
+    -- ("unzip: invalid option -- 't'" on Kobo fw 4.45, busybox 1.31.1),
+    -- which made every fully downloaded zip look corrupt and got it
+    -- deleted.  When -t fails, retry with `unzip -l`: both flavors
+    -- support it and it validates the central directory, so truncated
+    -- or garbage downloads still fail there.  Deep CRC damage is not
+    -- detectable through BusyBox, but the byte count was just verified
+    -- against the GitHub asset over TLS, extraction below is CRC-checked
+    -- by libarchive, and the backup/restore plus critical-file sweep
+    -- guard the installed plugin.  If unzip is missing entirely, skip
+    -- the probe for the same reason.
+    local test_ok
+    local have_unzip = os.execute('command -v unzip >/dev/null 2>&1')
+    if have_unzip == 0 or have_unzip == true then
+        test_ok = os.execute('unzip -t "' .. zip_path .. '" >/dev/null 2>&1')
+        if test_ok ~= 0 and test_ok ~= true then
+            -- BusyBox unzip: -t unsupported.  -l is the lowest common
+            -- denominator structural check on both flavors.
+            test_ok = os.execute('unzip -l "' .. zip_path .. '" >/dev/null 2>&1')
+        end
+    else
+        logger.warn("Updater: no unzip binary found, skipping archive probe")
+        test_ok = true
+    end
     if test_ok ~= 0 and test_ok ~= true then
         logger.warn("Updater: zip integrity test failed for", zip_path)
         os.remove(zip_path)
