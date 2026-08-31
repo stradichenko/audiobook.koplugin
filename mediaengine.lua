@@ -186,10 +186,21 @@ function MediaEngine:_startKindleA2dpKeepalive(reason)
     end
     MediaEngine._takeMusicFocusOnce(true)
     -- Tag the cmdline with abk-keepalive so content-only cleanup can spare it.
-    local h = io.popen(
-        "gst-launch-0.10 filesrc location=/dev/zero"
-        .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
-        .. " ! mixersink stream-type=Music sync=true"
+    -- Prefer the 0.10 binary; newer firmware ships 1.0 only, with raw caps
+    -- under a different element namespace (see _playSystemGstLaunch).
+    local keepalive_pipeline
+    if self:commandExists("gst-launch-0.10") then
+        keepalive_pipeline =
+            "gst-launch-0.10 filesrc location=/dev/zero"
+            .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
+            .. " ! mixersink stream-type=Music sync=true"
+    else
+        keepalive_pipeline =
+            "gst-launch-1.0 filesrc location=/dev/zero"
+            .. " ! 'audio/x-raw,format=S16LE,rate=22050,channels=1,layout=interleaved'"
+            .. " ! mixersink stream-type=Music sync=true"
+    end
+    local h = io.popen(keepalive_pipeline
         .. " >/tmp/abk-keepalive.log 2>&1 & echo $!")
     local pid_str = h and h:read("*a") or ""
     if h then h:close() end
@@ -752,7 +763,8 @@ function MediaEngine:_detectKindleGstPlay()
     if not gf then
         logger.dbg("MediaEngine: kindle/gst-play not bundled")
         -- System pipelines alone are enough (see comment below).
-        if self:commandExists("gst-launch-0.10") then
+        if self:commandExists("gst-launch-0.10")
+                or self:commandExists("gst-launch-1.0") then
             self._gst_play_cmd = nil
             return "kindle-gst-play"
         end
@@ -829,13 +841,14 @@ function MediaEngine:_detectKindleGstPlay()
     -- _playSystemGstLaunch*).  Selecting kindle-lipc here instead used to
     -- strand PW5 on the dead playermgr ("none of 4 strategies got
     -- InPlayback=1").
-    if self:commandExists("gst-launch-0.10") then
-        logger.warn("MediaEngine: bundled gst-play unusable, using system gst-launch-0.10 pipelines")
+    if self:commandExists("gst-launch-0.10")
+            or self:commandExists("gst-launch-1.0") then
+        logger.warn("MediaEngine: bundled gst-play unusable, using system gst-launch pipelines")
         self._gst_play_cmd = nil
         return "kindle-gst-play"
     end
 
-    logger.warn("MediaEngine: kindle-gst-play probe failed and no system gst-launch-0.10")
+    logger.warn("MediaEngine: kindle-gst-play probe failed and no system gst-launch binary")
     return nil
 end
 
@@ -1660,8 +1673,9 @@ end
 -- ---------------------------------------------------------------------------
 
 --[[--
-Kill any previous audiobook pipeline spawned for the Kindle gst-launch-0.10
-backends.  The ffmpeg path is identifiable by its -progress file path
+Kill any previous audiobook pipeline spawned for the Kindle system-gst
+backends (gst-launch-0.10, or gst-launch-1.0 on firmware that dropped it).
+The ffmpeg path is identifiable by its -progress file path
 containing "abk-progress", and every audiobook pipeline ends in
 "mixersink stream-type=Music".  Calling this before starting a new stream
 prevents two streams from mixing in mixersink, which the user hears as an
@@ -1682,11 +1696,15 @@ function MediaEngine:_killOrphanKindleGstPipelines(name, wait_us, opts)
     -- Content gst side (fdsrc → mixersink).  Keep /dev/zero keepalive alive
     -- when content_only so pause→resume does not drop the A2DP datapath.
     os.execute("pkill -9 -f 'gst-launch-0.10 fdsrc' 2>/dev/null")
+    -- 1.0 content pipelines carry do-timestamp on fdsrc; the /dev/zero
+    -- keepalive uses filesrc and the MTK BT wrapper plain "fdsrc fd=0", so
+    -- this pattern spares both of those.
+    os.execute("pkill -9 -f 'gst-launch-1.0 fdsrc do-timestamp' 2>/dev/null")
     os.execute("pkill -9 -f 'kindle-gst-pid-' 2>/dev/null")
     if not content_only then
         -- Full cleanup: every Music mixersink, including TTS/audiobook keepalive.
         os.execute("pkill -9 -f 'mixersink stream-type=Music' 2>/dev/null")
-        os.execute("killall -9 gst-launch-0.10 2>/dev/null")
+        os.execute("killall -9 gst-launch-0.10 gst-launch-1.0 2>/dev/null")
         self._keepalive_pid = nil
     end
 
@@ -1699,19 +1717,23 @@ function MediaEngine:_killOrphanKindleGstPipelines(name, wait_us, opts)
     end
 
     if not content_only then
-        -- Verify: on some firmwares pkill/killall silently fail.  Poll until no
-        -- audiobook gst-launch-0.10 process remains, up to a short timeout.
+        -- Verify: on some firmwares pkill/killall silently fail.  Poll until
+        -- no audiobook gst-launch process (either generation) remains, up to
+        -- a short timeout.
         local deadline = UIManager:getTime() + 1.5
         while UIManager:getTime() < deadline do
-            local h = io.popen("pgrep -c 'gst-launch-0.10' 2>/dev/null")
-            local count
-            if h then
-                count = tonumber(h:read("*a"))
-                h:close()
+            local count = 0
+            for _, binary in ipairs({ "gst-launch-0.10", "gst-launch-1.0" }) do
+                local h = io.popen("pgrep -c '" .. binary .. "' 2>/dev/null")
+                if h then
+                    local n = tonumber(h:read("*a"))
+                    h:close()
+                    if n then count = count + n end
+                end
             end
-            if not count or count == 0 then break end
-            logger.warn("MediaEngine:", count, "gst-launch-0.10 still alive; re-killing")
-            os.execute("killall -9 gst-launch-0.10 2>/dev/null")
+            if count == 0 then break end
+            logger.warn("MediaEngine:", count, "gst-launch still alive; re-killing")
+            os.execute("killall -9 gst-launch-0.10 gst-launch-1.0 2>/dev/null")
             os.execute("pkill -9 -f 'mixersink stream-type=Music' 2>/dev/null")
             os.execute("usleep 100000")
         end
@@ -1720,7 +1742,8 @@ function MediaEngine:_killOrphanKindleGstPipelines(name, wait_us, opts)
 end
 
 --[[--
-Play a WAV through the system gst-launch-0.10 with the pipeline verified
+Play a WAV through the system gst-launch pipeline (0.10, or 1.0 on
+firmware that dropped 0.10) with the pipeline verified
 working on PW5/PW6 firmware:
 
     filesrc ! caps ! mixersink stream-type=Music sync=true
@@ -1813,20 +1836,33 @@ function MediaEngine:_playSystemGstLaunch(gen)
         self.position_latency_s = 2.2
     end
 
-    -- Nuke any previous audiobook gst-launch-0.10 pipeline before attaching
+    -- Nuke any previous audiobook gst-launch pipeline before attaching
     -- a new stream to mixersink.  If the old pipeline is still draining its
     -- ring buffer while the new one starts, the user hears both streams as an
     -- echo/loop ("this is this is an an example example").
     self:_killOrphanKindleGstPipelines("kindle-gst-wav", 150000,
         self._keepalive_pid and { content_only = true } or nil)
 
-    local caps = string.format(
-        "audio/x-raw-int,endianness=1234,signed=true,width=%d,depth=%d,rate=%d,channels=%d",
-        bits, bits, rate, channels)
+    local caps, gst_cmd
+    if self:commandExists("gst-launch-0.10") then
+        gst_cmd = "gst-launch-0.10"
+        caps = string.format(
+            "audio/x-raw-int,endianness=1234,signed=true,width=%d,depth=%d,rate=%d,channels=%d",
+            bits, bits, rate, channels)
+    else
+        -- Newer firmware ships GStreamer 1.0 only: raw caps moved from
+        -- x-raw-int to x-raw with a named format.  8-bit WAV PCM is
+        -- unsigned, so it maps to U8 (the old signed=true caps were
+        -- wrong for it anyway).
+        gst_cmd = "gst-launch-1.0"
+        caps = string.format(
+            "audio/x-raw,format=%s,rate=%d,channels=%d,layout=interleaved",
+            bits == 16 and "S16LE" or "U8", rate, channels)
+    end
     local cmd = string.format(
-        "gst-launch-0.10 filesrc location='%s' ! capsfilter caps='%s'"
+        "%s filesrc location='%s' ! capsfilter caps='%s'"
         .. " ! mixersink stream-type=Music sync=true",
-        raw_file:gsub("'", "'\\''"), caps)
+        gst_cmd, raw_file:gsub("'", "'\\''"), caps)
     logger.warn("MediaEngine: system gst-launch gen=", gen,
         "rate=", rate, "ch=", channels, "seek_offset=", self._seek_offset or 0,
         "apple_airpods=", apple and "yes" or "no")
@@ -1843,7 +1879,12 @@ Play a non-WAV file (mp3/m4b/aac/...) on Kindle by streaming bundled-ffmpeg
 output into the system GStreamer:
 
     ffmpeg -ss <seek> -i file -f s16le -ar 22050 -ac 1 -af apad=pad_dur=1 -
-      | gst-launch-0.10 fdsrc ! caps ! mixersink stream-type=Music sync=true
+      | gst-launch fdsrc ! caps ! mixersink stream-type=Music sync=true
+
+Runs under gst-launch-0.10 where it exists; on firmware that ships
+GStreamer 1.0 only, the same shape runs under gst-launch-1.0 with x-raw
+caps and "fdsrc do-timestamp=true" (1.0's fdsrc does not timestamp its
+buffers by default, and a sync=true sink cannot pace untimed buffers).
 
 Verified on PW5 against Storyteller EPUB audio.  No temp files, instant
 start, seeking via ffmpeg -ss.  22050/mono is deliberate: audiomgrd's
@@ -1856,7 +1897,21 @@ would otherwise be swallowed by the ring/BT chain at EOS.
 --]]
 function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     local ffmpeg = self:_findFfmpeg()
-    if not ffmpeg or not self:commandExists("gst-launch-0.10") then
+    if not ffmpeg then
+        return nil
+    end
+    local gst_cmd, raw_caps, fdsrc_args
+    if self:commandExists("gst-launch-0.10") then
+        gst_cmd = "gst-launch-0.10"
+        raw_caps = "audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234"
+        fdsrc_args = "fdsrc"
+    elseif self:commandExists("gst-launch-1.0") then
+        -- Newer firmware ships GStreamer 1.0 only: use the 1.0 binary with
+        -- x-raw caps and explicit buffer timestamps for the sync=true sink.
+        gst_cmd = "gst-launch-1.0"
+        raw_caps = "audio/x-raw,format=S16LE,rate=22050,channels=1,layout=interleaved"
+        fdsrc_args = "fdsrc do-timestamp=true"
+    else
         return nil
     end
 
@@ -1908,11 +1963,12 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
         "%s -loglevel error -progress '%s' -nostats -ss %.3f -i '%s'"
         .. " -f s16le -ar 22050 -ac 1"
         .. " -af adelay=%d:all=1%s,apad=pad_dur=%.1f - 2>/dev/null"
-        .. " | gst-launch-0.10 fdsrc"
-        .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
+        .. " | %s %s"
+        .. " ! '%s'"
         .. " ! mixersink stream-type=Music sync=true",
         ffmpeg:gsub("'", "'\\''"), progress_file:gsub("'", "'\\''"), seek,
-        self.current_path:gsub("'", "'\\''"), adelay_ms, self:_volumeFilterPart(), apad_s)
+        self.current_path:gsub("'", "'\\''"), adelay_ms, self:_volumeFilterPart(), apad_s,
+        gst_cmd, fdsrc_args, raw_caps)
     -- out_time is the PRODUCER side: it leads what the listener hears by the
     -- whole downstream buffer -- OS pipe (~1.5 s when full) + gst/mixersink
     -- ring (~0.9 s) + BT chain (~0.3 s) ~= 2.7 s.  AirPods buffer a bit more.
@@ -2279,12 +2335,13 @@ function MediaEngine:_startPersistentCompletionWatcher(gen, duration)
 end
 
 function MediaEngine:_playKindleGstPlay(gen)
-    -- Prefer the system gst-launch-0.10 pipeline (verified working on
-    -- PW5/PW6, see _playSystemGstLaunch).  The bundled gst-play binary
-    -- sets neither stream-type nor sync on mixersink and hangs on these
-    -- firmwares.  Fall back to it only for non-PCM-WAV input or when
-    -- gst-launch-0.10 is missing.
-    if self:commandExists("gst-launch-0.10") then
+    -- Prefer the system gst-launch pipeline (verified working on PW5/PW6,
+    -- see _playSystemGstLaunch; newer firmware ships 1.0 only).  The
+    -- bundled gst-play binary sets neither stream-type nor sync on
+    -- mixersink and hangs on these firmwares.  Fall back to it only for
+    -- non-PCM-WAV input or when no system gst-launch binary exists.
+    if self:commandExists("gst-launch-0.10")
+            or self:commandExists("gst-launch-1.0") then
         local ok = self:_playSystemGstLaunch(gen)
         if ok then return ok end
     end

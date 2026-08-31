@@ -34,6 +34,10 @@ ffmpeg → gst-launch-0.10 fdsrc → mixersink stream-type=Music
        → audiomgrd → btfd / Bluedroid A2DP → AirPods Pro 3
 ```
 
+On firmware that ships GStreamer 1.0 only (no `gst-launch-0.10`), the same
+pipeline runs under `gst-launch-1.0` with `audio/x-raw` caps and
+`fdsrc do-timestamp=true`.
+
 ---
 
 ## Hardware / software under test

@@ -382,7 +382,7 @@ if [ "$PLATFORM" = "kindle" ] && command -v lipc-get-prop >/dev/null 2>&1; then
     KINDLE_TTS_ORCHESTRATOR=$(capture lipc-probe com.lab126.tts.orchestrator 2>/dev/null | head -30)
     [ -z "$KINDLE_TTS_ORCHESTRATOR" ] && KINDLE_TTS_ORCHESTRATOR="not found"
     KINDLE_AUDIOMGRD_IS_STARTED=$(lipc-get-prop com.lab126.audiomgrd isStarted 2>/dev/null || echo "n/a")
-    KINDLE_GST_TOOLS="gst_launch=$(which gst-launch-1.0 2>/dev/null || echo not_found) gst_inspect=$(which gst-inspect-1.0 2>/dev/null || echo not_found) amixer=$(which amixer 2>/dev/null || echo not_found)"
+    KINDLE_GST_TOOLS="gst_launch=$(which gst-launch-1.0 2>/dev/null || echo not_found) gst_launch_0_10=$(which gst-launch-0.10 2>/dev/null || echo not_found) gst_inspect=$(which gst-inspect-1.0 2>/dev/null || echo not_found) amixer=$(which amixer 2>/dev/null || echo not_found)"
     KINDLE_SHM=$(ls -la /dev/shm/ 2>/dev/null || echo "no /dev/shm")
     KINDLE_A2DP_SOCKETS=$(cat /proc/net/unix 2>/dev/null | grep -i a2dp || echo "none")
     KINDLE_GST_INSPECT_TTSSRC=$(gst-inspect-1.0 ttssrc 2>/dev/null | head -30 || echo "n/a")
