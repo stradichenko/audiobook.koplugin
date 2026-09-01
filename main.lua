@@ -2820,6 +2820,20 @@ function Audiobook:_normalizeSelText(text)
     return Utils.normalizeForMatching(text)
 end
 
+--- Element path of the node addressed by a CRe internal xpointer.
+-- "/body/DocFragment[2]/body/p[3]/span/text().31" -> "body/p[3]/span".
+-- The path identifies the tapped element inside its content document, which
+-- stays unique even when several sentences repeat the same words (issue #64).
+function Audiobook:_elementPathFromXPointer(xp)
+    xp = self:_xpointerString(xp)
+    if type(xp) ~= "string" then return nil end
+    local path = xp:match("DocFragment%[%d+%]([^#]*)")
+    if not path then return nil end
+    path = path:gsub("^/", ""):gsub("/$", "")
+    path = path:gsub("/text%(%)[%.%d]*", "")
+    return path ~= "" and path or nil
+end
+
 function Audiobook:_matchSmilEntryFromSelection(selected_text, timing_data, parser)
     -- Resolve the SMIL timing entry that best matches a user selection.
     -- Prefer fragment id from the CRe xpointer, then scored text matches in
@@ -2878,6 +2892,50 @@ function Audiobook:_matchSmilEntryFromSelection(selected_text, timing_data, pars
         return e.text_doc and e.text_doc:match("([^/]+)$") == cur_base
     end
 
+    -- Structural identity first: the tapped element's path pins the sentence
+    -- even when several entries repeat the same words.  Text containment
+    -- cannot tell twins apart, and the on-screen distance bonus below is
+    -- unreliable because resolving a bare "#id" xpointer can return a
+    -- position that does not correspond to the element (observed clustered
+    -- near the top of the page on CRe, issue #64).
+    local tap_path = self:_elementPathFromXPointer(selected_text.pos0)
+        or self:_elementPathFromXPointer(selected_text.pos1)
+    if tap_path then
+        tap_path = tap_path:gsub("%[1%]", "")
+    end
+    local candidates = timing_data
+    if tap_path then
+        local matches, best_len = {}, -1
+        for _, e in ipairs(timing_data) do
+            if in_current_doc(e) and e.elem_path then
+                local same = tap_path == e.elem_path
+                    or tap_path:sub(1, #e.elem_path + 1) == e.elem_path .. "/"
+                if same then
+                    table.insert(matches, e)
+                    if #e.elem_path > best_len then best_len = #e.elem_path end
+                end
+            end
+        end
+        if best_len >= 0 then
+            local best_matches = {}
+            for _, e in ipairs(matches) do
+                if #e.elem_path == best_len then
+                    table.insert(best_matches, e)
+                end
+            end
+            if #best_matches == 1 then
+                logger.warn("Audiobook: matched selection via element path",
+                    tap_path, "->", best_matches[1].fragment_id)
+                return best_matches[1]
+            end
+            if #best_matches > 1 then
+                -- One element carries several audio entries: let text
+                -- scoring pick among them below.
+                candidates = best_matches
+            end
+        end
+    end
+
     -- Needle: prefer a distinctive prefix of the selection.
     local needle = sel_text
     if #needle > 80 then needle = needle:sub(1, 80) end
@@ -2892,7 +2950,7 @@ function Audiobook:_matchSmilEntryFromSelection(selected_text, timing_data, pars
     end
 
     local best, best_score = nil, -1
-    for _, e in ipairs(timing_data) do
+    for _, e in ipairs(candidates) do
         if in_current_doc(e) and e.text and e.text ~= "" then
             local et = self:_normalizeSelText(e.text)
             local score = 0
@@ -2917,7 +2975,10 @@ function Audiobook:_matchSmilEntryFromSelection(selected_text, timing_data, pars
                     score = score + math.max(0, 500 - math.floor(dist / 2))
                 end
             end
-            if score > best_score then
+            -- On tied scores prefer the LATER entry: the tapped sentence is
+            -- at or after the expansion's start, and the old earlier-wins
+            -- tie break is what made the previous sentence play (issue #64).
+            if score >= best_score then
                 best_score = score
                 best = e
             end

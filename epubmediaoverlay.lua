@@ -466,7 +466,69 @@ function EpubMediaOverlay:_extractSentenceTexts(epub_path, html_zip_path)
             break
         end
     end
-    return map
+    return map, self:_extractSentencePaths(html)
+end
+
+--- Extract the crengine-style element path of every id-bearing element.
+-- Internal CRe xpointers address nodes with a child-index path like
+-- "body/p[3]/span" (the "[n]" suffix is omitted for a first child).  The
+-- same path appears in selection xpointers, so recording it per fragment id
+-- lets a selection be resolved by structure, which stays correct when
+-- several sentences repeat the same words and text matching cannot tell
+-- them apart (issue #64).
+-- Returns a map id -> path string.
+function EpubMediaOverlay:_extractSentencePaths(html)
+    local paths = {}
+    local stack = {}  -- frames: { tag, idx, counters = { [tag] = n } }
+    local pos, n = 1, #html
+    while pos <= n do
+        local lt = html:find("<", pos)
+        if not lt then break end
+        local is_close = html:sub(lt + 1, lt + 1) == "/"
+        local s, e, tag, attrs
+        if is_close then
+            s, e, tag = html:find("^</([a-zA-Z][%w:]*)", lt)
+        else
+            s, e, tag, attrs = html:find("^<([a-zA-Z][%w:]*)%s*([^>]*)>", lt)
+        end
+        if not s then
+            pos = lt + 1
+        elseif is_close then
+            if #stack > 0 then table.remove(stack) end
+            pos = e + 1
+        else
+            tag = tag:lower()
+            local self_close = attrs and attrs:match("/%s*$") ~= nil
+            local parent = stack[#stack]
+            local idx = 1
+            if parent then
+                parent.counters[tag] = (parent.counters[tag] or 0) + 1
+                idx = parent.counters[tag]
+            end
+            local frame = { tag = tag, idx = idx, counters = {} }
+            if tag == "body" then
+                -- CRe paths start at the document's <body> with no index.
+                frame.idx = 1
+                stack = { frame }
+            elseif not self_close then
+                table.insert(stack, frame)
+            end
+            local id = attrs and attrs:match('id%s*=%s*"([^"]+)"')
+            if id and not self_close and #stack > 0 and frame ~= stack[1]
+                and not paths[id] then
+                local parts = {}
+                for _, f in ipairs(stack) do
+                    parts[#parts + 1] = f.tag .. "[" .. f.idx .. "]"
+                end
+                -- crengine usually writes a child index for every element
+                -- ("body/p[1]/span") but may omit "[1]" for first children;
+                -- normalizing both sides keeps the comparison style-blind.
+                paths[id] = table.concat(parts, "/"):gsub("%[1%]", "")
+            end
+            pos = e + 1
+        end
+    end
+    return paths
 end
 
 --- Load chapter titles from the NCX table of contents.
@@ -693,13 +755,17 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
                 doc_path = doc_path:gsub("^%./", "")
                 entry.fragment_id = frag
                 entry.text_doc = doc_path
-                local map = html_text_cache[doc_path]
-                if map == nil then
-                    map = self:_extractSentenceTexts(epub_path, doc_path) or false
-                    html_text_cache[doc_path] = map
+                local cached = html_text_cache[doc_path]
+                if cached == nil then
+                    local tmap, pmap = self:_extractSentenceTexts(epub_path, doc_path)
+                    cached = { text = tmap or false, paths = pmap }
+                    html_text_cache[doc_path] = cached
                 end
-                local txt = map and map[frag]
+                local txt = cached.text and cached.text[frag]
                 if txt then entry.text = txt end
+                if cached.paths then
+                    entry.elem_path = cached.paths[frag]
+                end
             end
             table.insert(all_timing_data, entry)
         end
