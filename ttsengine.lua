@@ -3595,7 +3595,7 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                         engine.is_speaking = false
                         engine.play_generation = (engine.play_generation or 0) + 1
                         engine:cleanup()
-                        local msg = _("Audio playback failed on this Kindle model.\n\nThe GStreamer pipeline started but could not produce audio. This usually means the firmware's GStreamer installation is too stripped (missing audioconvert / audioresample plugins).\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue.")
+                        local msg = _("Audio playback failed on this Kindle model.\n\nThe pipeline reached the audio mixer but no sound was produced. On newer Kindle firmware there is no ALSA sound card and audio must leave the device through Amazon's audio manager, so this is usually a firmware audio-route change rather than a missing component. The bug report runs pipeline tests that identify the cause.\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue.")
                         UIManager:show(InfoMessage:new{
                             text = msg,
                             timeout = 12,

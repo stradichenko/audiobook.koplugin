@@ -121,6 +121,15 @@ local function collectDeviceInfo()
     -- Architecture
     info.arch = shellCapture("uname -m", 2)
 
+    -- Kindle firmware build and the model string KOReader resolved.  On new
+    -- hardware KOReader's model/platform come back "unknown" (issue #81),
+    -- and the firmware build number is the only version evidence left.
+    if info.is_kindle then
+        info.kindle_fw_version = shellCapture("cat /etc/version.txt 2>/dev/null | head -2", 3)
+            or "not found"
+        info.kindle_device_name = Device.getName and Device:getName() or nil
+    end
+
     -- Android-specific
     if info.is_android then
         info.android_version = shellCapture("getprop ro.build.version.release", 2)
@@ -1069,7 +1078,11 @@ lipc-set-prop com.lab126.audiomgrd setFocus 'com.lab126.koreader.tts' 2>&1
         if not skip_intensive then
             -- v0.1.6.5: Raw PCM via gst-launch-0.10 with explicit caps.
             -- If mixersink accepts raw audio without wavparse, this works.
-            info.kindle_gst_raw_pipeline_test = shellCapture([[trap 'rm -f /tmp/.gst_raw_test.wav /tmp/.gst_raw_test.raw' EXIT
+            -- v0.1.17.52: report an honest skip when 0.10 is missing, which
+            -- is the norm on modern firmware (issue #81); the gst-launch-1.0
+            -- matrix test below covers those devices.
+            if shellCapture("command -v gst-launch-0.10", 3) then
+                info.kindle_gst_raw_pipeline_test = shellCapture([[trap 'rm -f /tmp/.gst_raw_test.wav /tmp/.gst_raw_test.raw' EXIT
 
 dd if=/dev/zero bs=44100 count=1 2>/dev/null | {
   printf 'RIFF$¬  WAVEfmt      "V  D¬    data¬  '
@@ -1088,9 +1101,68 @@ else
 fi
 rm -f /tmp/.gst_raw_test.wav /tmp/.gst_raw_test.raw
 ]], 15) or "failed"
+            else
+                info.kindle_gst_raw_pipeline_test =
+                    "skipped (gst-launch-0.10 not present on this firmware; see the gst-launch-1.0 matrix tests)"
+            end
         else
             info.kindle_gst_raw_pipeline_test = "skipped (/var nearly full)"
         end
+
+        if not skip_intensive then
+            -- v0.1.17.52: gst-launch-1.0 pipeline matrix (issue #81).
+            -- The probes above call gst-launch-0.10, which modern Kindle
+            -- firmware no longer ships, so they silently no-op there.  Each
+            -- variant below feeds one second of PCM noise (22050 Hz mono
+            -- S16) to mixersink and reports exit code, GStreamer criticals,
+            -- and whether the pipeline reached PLAYING.  A variant that
+            -- exits 0 with no criticals has almost certainly produced
+            -- audio; the reporter confirms the noise audibly.  Variant 1
+            -- is the pipeline kindle-gst-play builds today and reproduces
+            -- the BYTES/TIME segment assertion seen on 2026 firmware;
+            -- variants 2 and 3 test the rawaudioparse fix candidates.
+            local function gstMatrixVariant(label, cmd)
+                local out = shellCapture([[RAW=/tmp/.gst_m.raw
+LOG=/tmp/.gst_m.log
+dd if=/dev/urandom of=$RAW bs=1024 count=43 2>/dev/null
+if [ ! -s $RAW ]; then echo "raw_file_missing=/var_full?"; exit 0; fi
+if ! command -v gst-launch-1.0 >/dev/null 2>&1; then
+  echo "gst-launch-1.0=not_found"
+  rm -f $RAW
+  exit 0
+fi
+lipc-set-prop com.lab126.audiomgrd setFocus Music 2>/dev/null
+]] .. cmd .. [[ > $LOG 2>&1
+rc=$?
+echo "exit=$rc criticals=$(grep -c CRITICAL $LOG 2>/dev/null) playing=$(grep -c PLAYING $LOG 2>/dev/null)"
+tail -3 $LOG
+rm -f $RAW $LOG
+]], 15)
+                return label .. ": " .. (out and (out:gsub("^%s+", "")) or "failed")
+            end
+            info.kindle_gst_matrix_current = gstMatrixVariant("current filesrc+caps sync=true",
+                [[timeout 5 gst-launch-1.0 -v filesrc location=$RAW ! 'audio/x-raw,format=S16LE,rate=22050,channels=1,layout=interleaved' ! mixersink stream-type=Music sync=true]])
+            info.kindle_gst_matrix_rawparse = gstMatrixVariant("rawaudioparse sync=true",
+                [[timeout 5 gst-launch-1.0 -v filesrc location=$RAW ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=22050 num-channels=1 ! audioconvert ! mixersink stream-type=Music sync=true]])
+            info.kindle_gst_matrix_rawparse_nosync = gstMatrixVariant("rawaudioparse sync=false",
+                [[timeout 5 gst-launch-1.0 -v filesrc location=$RAW ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le sample-rate=22050 num-channels=1 ! audioconvert ! mixersink stream-type=Music sync=false]])
+        else
+            info.kindle_gst_matrix_current = "skipped (/var nearly full)"
+            info.kindle_gst_matrix_rawparse = "skipped (/var nearly full)"
+            info.kindle_gst_matrix_rawparse_nosync = "skipped (/var nearly full)"
+        end
+
+        -- v0.1.17.52: which processes map the Kindle mixer shared buffer?
+        -- A foreign holder can block mixersink sessions on newer firmware.
+        info.kindle_mixer_shm_users = shellCapture([[
+for m in /proc/[0-9]*/maps; do
+  if grep -q mixer_playOut "$m" 2>/dev/null; then
+    p=${m#/proc/}
+    p=${p%/maps}
+    echo "$p: $(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)"
+  fi
+done
+]], 8) or "none"
 
         -- amixer: check ALSA mixer controls (audiomgrd may expose some)
         info.kindle_amixer = shellCapture("amixer 2>&1 | head -20", 3) or "n/a"
@@ -1669,6 +1741,44 @@ find /usr /system /vendor /mnt /data -maxdepth 4 -name '*audio*.so*' 2>/dev/null
         -- Last ttssrc fallback log (stderr from kindle-native-tts-fallback path)
         info.kindle_ttssrc_fallback_log = shellCapture(
             "cat /tmp/.ttssrc_fallback.log 2>/dev/null", 2) or "none"
+    end
+
+    -- v0.1.17.52: join the collected signals into a short diagnosis so the
+    -- report carries a conclusion instead of only raw evidence.  The canned
+    -- "stripped GStreamer" toast misled on the 2026 Kindle firmware, where
+    -- every element is present but no ALSA card exists (issue #81).
+    if info.is_kindle then
+        local diag = {}
+        local no_alsa = info.alsa_cards
+            and (info.alsa_cards:find("no soundcards", 1, true)
+                or info.alsa_cards == "none"
+                or info.alsa_cards:find("not available", 1, true))
+        local mixer = info.kindle_gst_plugins
+            and info.kindle_gst_plugins:find("libgstmixersink", 1, true)
+        if no_alsa then
+            table.insert(diag, "No ALSA sound card is visible on this model;"
+                .. " every ALSA route (aplay, alsasink, dmix) cannot work.")
+        end
+        if no_alsa and mixer then
+            table.insert(diag, "Audio can only leave the device through"
+                .. " mixersink/audiomgrd.")
+        end
+        if info.kindle_gst_play_last_log
+            and info.kindle_gst_play_last_log:find("segment%->format == format") then
+            table.insert(diag, "The bundled player hit the GStreamer"
+                .. " BYTES/TIME segment assertion: a sync=true sink was fed"
+                .. " a raw filesrc segment. See the matrix tests: the"
+                .. " rawaudioparse variants are the fix candidates.")
+        end
+        local rawparse = info.kindle_gst_matrix_rawparse or ""
+        local current = info.kindle_gst_matrix_current or ""
+        if rawparse:find("exit=0", 1, true) and current:find("exit=[1-9]") then
+            table.insert(diag, "CONFIRMED: the rawaudioparse variant completed"
+                .. " where the current pipeline failed; switching the Kindle"
+                .. " pipelines to rawaudioparse should restore audio.")
+        end
+        info.kindle_audio_diagnosis = #diag > 0
+            and table.concat(diag, " ") or "no known failure pattern matched"
     end
 
     -- Root-cause diagnostic: find deleted files in /var/ still held open
