@@ -87,10 +87,10 @@ __asm__(".symver __res_maybe_init_compat, __res_maybe_init@GLIBC_PRIVATE");
 #endif /* !KGP_NATIVE_GLIBC */
 
 #ifdef KGP_NATIVE_GLIBC
-#define VERSION "0.6.0-native"
+#define VERSION "0.6.1-native"
 #define BUILD_VARIANT "native"
 #else
-#define VERSION "0.6.0-compat"
+#define VERSION "0.6.1-compat"
 #define BUILD_VARIANT "compat"
 #endif
 
@@ -484,6 +484,8 @@ static int do_play(const char *wav_path)
      * before launching us.  Verified on PW5 firmware 5.x (2025-04).
      */
     char desc[512];
+    void *error = NULL;
+    void *pipeline = NULL;
     if (gst_version_minor == 10) {
         /* GStreamer 0.10: audio/x-raw-int with explicit field types */
         snprintf(desc, sizeof(desc),
@@ -498,22 +500,49 @@ static int do_play(const char *wav_path)
             " ! mixersink stream-type=Music sync=true",
             raw_path, rate, channels, bits, bits,
             bits == 16 ? "true" : "false");
+        pipeline = gst_parse_launch_(desc, &error);
     } else {
-        /* GStreamer 1.0: audio/x-raw with format string */
+        /* GStreamer 1.0.
+         * v0.6.1 (issues #81, #73): raw filesrc buffers carry a BYTES-format
+         * segment, and the 2026 firmware's mixersink breaks its clock math
+         * on that ("gst_segment_to_running_time: assertion 'segment->format
+         * == format' failed"): speech starts and dies after a word or two,
+         * because a sync=true sink needs a TIME-format segment.  Insert
+         * rawaudioparse, which timestamps the raw PCM into that TIME-format
+         * stream; the element ships in the firmware's libgstrawparse.so.
+         * The legacy caps-only chain remains as the fallback for firmware
+         * without the element. */
         const char *format = (bits == 16) ? "S16LE" : "U8";
+        const char *pcm_format = (bits == 16) ? "s16le" : "u8";
         snprintf(desc, sizeof(desc),
             "filesrc location=%s ! "
+            "rawaudioparse use-sink-caps=false format=pcm "
+            "pcm-format=%s sample-rate=%u num-channels=%u ! "
+            "audioconvert ! "
             "audio/x-raw,"
             "format=(string)%s,"
             "rate=(int)%u,"
             "channels=(int)%u,"
             "layout=(string)interleaved"
             " ! mixersink stream-type=Music sync=true",
-            raw_path, format, rate, channels);
+            raw_path, pcm_format, rate, channels, format, rate, channels);
+        pipeline = gst_parse_launch_(desc, &error);
+        if (!pipeline) {
+            fprintf(stderr, "gst-play: rawaudioparse chain failed to parse,"
+                    " falling back to bare caps chain\n");
+            error = NULL;
+            snprintf(desc, sizeof(desc),
+                "filesrc location=%s ! "
+                "audio/x-raw,"
+                "format=(string)%s,"
+                "rate=(int)%u,"
+                "channels=(int)%u,"
+                "layout=(string)interleaved"
+                " ! mixersink stream-type=Music sync=true",
+                raw_path, format, rate, channels);
+            pipeline = gst_parse_launch_(desc, &error);
+        }
     }
-
-    void *error = NULL;
-    void *pipeline = gst_parse_launch_(desc, &error);
     if (!pipeline) {
         fprintf(stderr, "gst-play: pipeline creation failed: %s\n", desc);
         unlink(raw_path);
