@@ -274,6 +274,8 @@ audiobook.koplugin/
 | Android TTS sounds high / noisy / unlike the engine's own preview | Keep plugin pitch at the default (50). Turn **off** **Android: persistent audio stream**. Fully quit KOReader after changing the system TTS engine or language. See [Android support](#android-support). |
 | Android underline does not match the spoken sentence | Android TTS has no word timestamps; the plugin underlines the spoken sentence as a contiguous phrase instead of chasing estimated word positions. Fully quit KOReader after updating the plugin. |
 | Android TTS is robotic / not my SherpaTTS voice | SherpaTTS is installed but is **not** Android's preferred TTS engine. The plugin always uses the system default. Follow [High-quality voices on Android](#high-quality-voices-on-android-sherpatts), then fully quit KOReader and reopen it. |
+| Android TTS is high / noisy / not the SherpaTTS in-app voice | Plugin pitch must stay at the default (50). Turn **off** **Android: persistent audio stream**. Fully quit KOReader after changing the system TTS engine or language. See [Android support](#android-support). |
+| Android underline does not match the spoken sentence | Android TTS has no word timestamps; the plugin underlines the spoken sentence as a contiguous phrase instead of a short coincidental prefix. Fully quit KOReader after updating the plugin. |
 | BT audio silent | Restart KOReader to kill orphan pipelines. Check BT is paired in the plugin menu. |
 | SSH refused on port 22 | KOReader uses port 2222: `ssh root@<ip> -p 2222` |
 | `.adds` not visible | Enable hidden files on your OS. The folder starts with a dot. |

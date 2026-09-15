@@ -1418,6 +1418,48 @@ function TTSEngine:_androidEngineIsNeural()
         or pkg:find("piper", 1, true)
         or pkg:find("k2fsa", 1, true)
         or pkg:find("k2-fsa", 1, true)
+        or pkg:find("voxsherpa", 1, true)
+        or pkg:find("codebysonu", 1, true)
+end
+
+--[[--
+Friendly label for an Android TTS engine package name.
+@return string|nil
+--]]
+function TTSEngine.androidEngineLabelForPackage(pkg)
+    if type(pkg) ~= "string" or pkg == "" then return nil end
+    if pkg == "pending" then return _("Detecting…") end
+    if pkg == "not_ready" or pkg == "unknown" then return _("Not detected") end
+    local p = pkg:lower()
+    -- VoxSherpa contains "sherpa"; match it before the generic SherpaTTS apps.
+    if p:find("woheller69", 1, true) then return _("SherpaTTS") end
+    if p:find("voxsherpa", 1, true) or p:find("codebysonu", 1, true) then
+        return _("VoxSherpa TTS")
+    end
+    if p:find("k2fsa", 1, true) or p:find("k2-fsa", 1, true)
+        or p:find("sherpa", 1, true) then
+        return _("SherpaTTS")
+    end
+    if p:find("google", 1, true) then return _("Google") end
+    if p:find("samsung", 1, true) then return _("Samsung") end
+    if p:find("pico", 1, true) or p:find("svox", 1, true) then
+        return _("Pico TTS")
+    end
+    if p:find("rhvoice", 1, true) then return _("RHVoice") end
+    if p:find("piper", 1, true) then return _("Piper") end
+    local short = pkg:match("([^.]+)$") or pkg
+    return T(_("Unknown (%1)"), short)
+end
+
+--[[--
+Android's preferred TTS engine, as shown in TTS toasts and menus.
+Returns nil when the helper is not initialized yet.
+@return string|nil
+--]]
+function TTSEngine:androidEngineDisplayName()
+    local pkg = self:_androidEnginePackage()
+    if not pkg then return nil end
+    return TTSEngine.androidEngineLabelForPackage(pkg)
 end
 
 --[[--

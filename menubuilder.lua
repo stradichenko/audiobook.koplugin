@@ -20,6 +20,40 @@ local Utils = dofile(_dir .. "utils.lua")
 
 local MenuBuilder = {}
 
+--[[--
+Friendly name of Android's preferred TTS engine (SherpaTTS, Google, ...).
+@return string|nil
+--]]
+function MenuBuilder.androidSystemEngineName(plugin)
+    local engine = plugin and plugin.tts_engine
+    if not engine or not engine.androidEngineDisplayName then
+        return nil
+    end
+    return engine:androidEngineDisplayName()
+end
+
+--[[--
+"System TTS" or "System TTS (SherpaTTS)" when the preferred engine is known.
+--]]
+function MenuBuilder.systemTtsMenuLabel(plugin)
+    local name = MenuBuilder.androidSystemEngineName(plugin)
+    if name and name ~= "" then
+        return T(_("System TTS (%1)"), name)
+    end
+    return _("System TTS")
+end
+
+--[[--
+Engine picker row: keep "(Android)" until the preferred engine is known.
+--]]
+function MenuBuilder.systemTtsAndroidChoiceLabel(plugin)
+    local name = MenuBuilder.androidSystemEngineName(plugin)
+    if name and name ~= "" then
+        return T(_("System TTS (Android): %1"), name)
+    end
+    return _("System TTS (Android)")
+end
+
 function MenuBuilder.buildVoiceSettingsMenu(plugin)
     local menu = {}
 
@@ -33,7 +67,7 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 pico = _("Pico TTS"),
                 flite = _("Flite"),
                 festival = _("Festival"),
-                android = _("Android"),
+                android = MenuBuilder.systemTtsMenuLabel(plugin),
                 ["platform-native"] = _("Platform-native helper"),
             }
             return T(_("TTS engine: %1"), labels[backend] or backend)
@@ -347,7 +381,10 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 end
             end,
         })
-    elseif plugin.tts_engine.backend ~= plugin.tts_engine.BACKENDS.ANDROID then
+    elseif plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ESPEAK
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PICO
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.FLITE
+        or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.FESTIVAL then
         table.insert(menu, {
             text_func = function()
                 if plugin:getSetting("tts_mbrola_voice", "") ~= "" then
@@ -811,7 +848,7 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
         or engine.backend == engine.BACKENDS.ANDROID then
         table.insert(available, {
             id = engine.BACKENDS.ANDROID,
-            label = _("Android (system TTS engine)"),
+            label = MenuBuilder.systemTtsAndroidChoiceLabel(plugin),
         })
     end
 

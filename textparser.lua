@@ -170,20 +170,30 @@ function TextParser:parseSentences(text, max_chunk)
     for line in (text .. "\n"):gmatch("([^\n]+)\n") do
         line = line:match("^%s*(.-)%s*$")
         if line and line ~= "" then
-            -- Step 2: split each line on sentence-ending punctuation (.?!)
+            -- Step 2: split each line on sentence-ending punctuation (.?!…)
             -- followed by a space or end-of-string.
             -- NOTE: semicolons (;) and colons (:) are NOT treated as sentence
             -- endings — they are mid-sentence punctuation that should not
             -- interrupt the reading flow.
+            -- The Unicode ellipsis (…) must split too: otherwise "fin… La
+            -- suite" is one utterance and some engines stop at the ellipsis.
+            local ell = "\226\128\166" -- …
             local pos = 1
             local segments_in_line = {}
             while pos <= #line do
-                -- Find .?! that is followed by a space (or is at end of line)
-                local pstart, pend = line:find("[%.%?!]+%s", pos)
-                if not pstart then
-                    -- Check for .?! at very end of line (no trailing space)
-                    pstart, pend = line:find("[%.%?!]+$", pos)
+                -- Find the earliest .?!/… that is followed by a space (or is
+                -- at end of line)
+                local best_s, best_e
+                local function consider(s, e)
+                    if s and (not best_s or s < best_s) then
+                        best_s, best_e = s, e
+                    end
                 end
+                consider(line:find("[%.%?!]+%s", pos))
+                consider(line:find("[%.%?!]+$", pos))
+                consider(line:find(ell .. "%s", pos))
+                consider(line:find(ell .. "$", pos))
+                local pstart, pend = best_s, best_e
                 if pstart then
                     -- Include the punctuation but not the trailing space
                     local seg_end = pend

@@ -11,6 +11,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.SystemClock;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.UtteranceProgressListener;
 import android.speech.tts.Voice;
@@ -90,6 +91,18 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     /** Result of the most recent setVoice() (TextToSpeech result code). */
     private volatile int lastVoiceResult = 0;
 
+    /** Utterance id of the last dispatched synthesis. Stale onDone/onError
+     *  from a cancelled request (page turn, stop) must not mark the next
+     *  sentence ready or failed. */
+    private volatile String currentSynthId = "";
+    /** True after the TTS service process dies (force-stop / task killer).
+     *  Further binder calls would hang or throw; Lua should stop rather
+     *  than skip. */
+    private volatile boolean engineUnavailable = false;
+    /** True while this helper holds audio focus.  abandonAudioFocus() is a
+     *  no-op otherwise; stopPipeline() used to re-abandon on every poll. */
+    private volatile boolean hasAudioFocus = false;
+
     /** When true, pipeline playback uses the persistent PCM streamer instead
      *  of a per-sentence MediaPlayer (workaround for HALs that tear down
      *  short MediaPlayer clips mid-sentence, issue #44 Bigme HiBreak/MTK).
@@ -121,7 +134,15 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
 
                 @Override
                 public void onDone(String utteranceId) {
-                    synthStatus = 1;
+                    // Only the utterance this helper last dispatched may mark
+                    // synthStatus: a stale onDone from a cancelled synthesis
+                    // (page turn, stop) must not mark the next sentence ready.
+                    if (utteranceId != null && utteranceId.equals(currentSynthId)) {
+                        synthStatus = 1;
+                    }
+                    if (utteranceId == null || !utteranceId.startsWith("pipeline_")) {
+                        return;
+                    }
                     // Pipeline mode: auto-start playback when synthesis finishes.
                     // This callback runs on a TTS engine thread; never do
                     // media work here, just hand the file to the worker.
@@ -151,13 +172,19 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 }
 
                 @Override
-                public void onError(String utteranceId) {
-                    synthStatus = 2;
-                    if (pipelineActive) {
-                        pipelineStatus = 3;
-                        pipelineActive = false;
-                        pendingPlayFile = null;
+                public void onError(String utteranceId, int errorCode) {
+                    if (errorCode == TextToSpeech.ERROR_SERVICE) {
+                        // Engine process died (task killer / force-stop).
+                        // Further binder calls would hang or throw.
+                        engineUnavailable = true;
                     }
+                    applyUtteranceError(utteranceId);
+                }
+
+                @Override
+                @SuppressWarnings("deprecation")
+                public void onError(String utteranceId) {
+                    applyUtteranceError(utteranceId);
                 }
             });
             // Identify the active engine on the worker thread: getDefaultEngine()
@@ -174,6 +201,27 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                     refreshVoicesLocked();
                 }
             });
+        }
+    }
+
+    /**
+     * Route an onError to the synthesis that is still current; a cancelled
+     * one must not fail the next sentence.  If MediaPlayer is already
+     * playing the pipeline's WAV, keep it: the clip no longer needs the
+     * engine.
+     */
+    private void applyUtteranceError(String utteranceId) {
+        if (utteranceId == null || !utteranceId.equals(currentSynthId)) {
+            return;
+        }
+        synthStatus = 2;
+        if (pipelineActive && pipelineStatus == 1) {
+            return;
+        }
+        if (pipelineActive) {
+            pipelineStatus = 3;
+            pipelineActive = false;
+            pendingPlayFile = null;
         }
     }
 
@@ -296,10 +344,15 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         if (tts == null || initStatus != TextToSpeech.SUCCESS) {
             return -1;
         }
+        final String uttId = "audiobook_" + System.nanoTime();
+        currentSynthId = uttId;
         synthStatus = 0;
         worker.post(new Runnable() {
             @Override
             public void run() {
+                if (!uttId.equals(currentSynthId)) {
+                    return;  // superseded by a newer dispatch
+                }
                 File file = new File(filePath);
                 File parent = file.getParentFile();
                 if (parent != null && !parent.exists()) {
@@ -309,13 +362,14 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                     // Unique utterance ID per call so the engine treats each
                     // request as distinct (some engines ignore onDone for
                     // reused IDs).
-                    String uttId = "audiobook_" + System.currentTimeMillis();
                     int result = tts.synthesizeToFile(text, new Bundle(), file, uttId);
-                    if (result != TextToSpeech.SUCCESS) {
+                    if (result != TextToSpeech.SUCCESS && uttId.equals(currentSynthId)) {
                         synthStatus = 2;
                     }
                 } catch (Exception e) {
-                    synthStatus = 2;
+                    if (uttId.equals(currentSynthId)) {
+                        synthStatus = 2;
+                    }
                 }
             }
         });
@@ -454,22 +508,25 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     private void requestAudioFocus(AudioAttributes attrs) {
         if (audioManager == null) return;
         try {
+            int result;
             if (Build.VERSION.SDK_INT >= 26) {
                 AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                     .setAudioAttributes(attrs != null ? attrs : speechAttributes())
                     .build();
                 audioFocusRequest = req;
-                audioManager.requestAudioFocus(req);
+                result = audioManager.requestAudioFocus(req);
             } else {
-                audioManager.requestAudioFocus(null,
+                result = audioManager.requestAudioFocus(null,
                     AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
             }
+            hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
         } catch (Exception ignored) {}
     }
 
     @SuppressWarnings("deprecation")
     private void abandonAudioFocus() {
-        if (audioManager == null) return;
+        if (audioManager == null || !hasAudioFocus) return;
+        hasAudioFocus = false;
         try {
             if (Build.VERSION.SDK_INT >= 26 && audioFocusRequest != null) {
                 audioManager.abandonAudioFocusRequest((AudioFocusRequest) audioFocusRequest);
@@ -500,22 +557,30 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         pipelineDurationMs = 0;
         pendingPlayFile = filePath;
         pipelineFile = filePath;
+        final String uttId = "pipeline_" + System.nanoTime();
+        currentSynthId = uttId;
         synthStatus = 0;
 
         worker.post(new Runnable() {
             @Override
             public void run() {
                 if (gen != pipelineGeneration) return;  // superseded by stop/newer
+                if (engineUnavailable || tts == null) {
+                    pipelineStatus = 3;
+                    pipelineActive = false;
+                    pendingPlayFile = null;
+                    pipelineFile = null;
+                    return;
+                }
                 // Engine-side stop of whatever the previous pipeline was
                 // doing, then dispatch this synthesis.
-                try { if (tts != null) tts.stop(); } catch (Exception ignored) {}
+                try { tts.stop(); } catch (Exception ignored) {}
 
                 File file = new File(filePath);
                 File parent = file.getParentFile();
                 if (parent != null && !parent.exists()) parent.mkdirs();
 
                 try {
-                    String uttId = "pipeline_" + System.currentTimeMillis();
                     int result = tts.synthesizeToFile(text, new Bundle(), file, uttId);
                     if (result != TextToSpeech.SUCCESS && gen == pipelineGeneration) {
                         pipelineStatus = 3;
@@ -524,6 +589,8 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                         pipelineFile = null;
                     }
                 } catch (Exception e) {
+                    // DeadObjectException: the TTS process was killed.
+                    engineUnavailable = true;
                     if (gen == pipelineGeneration) {
                         pipelineStatus = 3;
                         pipelineActive = false;
@@ -575,6 +642,15 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
      *  by isPlaying() on the JNI calling thread; keeps that path free of
      *  locks and binder calls (issue #44). */
     private volatile boolean playbackActive = false;
+    /** Wall-clock anchors for OEM false-completion handling: elapsedRealtime
+     *  when the clip started, ms spent paused, and the pause start. */
+    private volatile long playbackStartedAtElapsed = 0;
+    private volatile long playbackPausedAccumMs = 0;
+    private volatile long playbackPauseBeganAt = 0;
+    /** Duration of the current clip as reported after prepare(). */
+    private volatile int fileDurationMs = 0;
+    /** Ignore onCompletion until this elapsedRealtime (OEM glitch window). */
+    private volatile long ignorePlaybackDoneUntilMs = 0;
 
     /**
      * Play a WAV file through the speech audio output.
@@ -621,6 +697,9 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         stopPlaybackInternal();
         playbackDone = false;
         playbackActive = false;
+        playbackStartedAtElapsed = 0;
+        playbackPausedAccumMs = 0;
+        playbackPauseBeganAt = 0;
         if (attrs == null) attrs = speechAttributes();
         requestAudioFocus(attrs);
         synchronized (mpLock) {
@@ -629,13 +708,26 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 mediaPlayer.setAudioAttributes(attrs);
                 mediaPlayer.setDataSource(path);
                 mediaPlayer.setOnCompletionListener(mp -> {
-                    playbackDone = true;
-                    playbackActive = false;
-                    if (pipelineActive) {
-                        pipelineStatus = 2;
-                        pipelineActive = false;
-                    }
-                    abandonAudioFocus();
+                    // Decide on the worker thread under mpLock: the callback
+                    // thread must not race a stop/start, and some OEM players
+                    // (Boox) fire onCompletion ~400 ms in while the clip is
+                    // still audible.
+                    worker.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            synchronized (mpLock) {
+                                if (mediaPlayer != mp) return;
+                                if (resumeIfFalseCompletion(mp)) return;
+                                playbackDone = true;
+                                playbackActive = false;
+                            }
+                            if (pipelineActive) {
+                                pipelineStatus = 2;
+                                pipelineActive = false;
+                            }
+                            abandonAudioFocus();
+                        }
+                    });
                 });
                 mediaPlayer.setOnErrorListener((mp, what, extra) -> {
                     playbackDone = true;
@@ -648,9 +740,17 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                     return true;
                 });
                 mediaPlayer.prepare();
+                try {
+                    mediaPlayer.setVolume(1.0f, 1.0f);
+                } catch (Exception ignored) {}
                 mediaPlayer.start();
                 playbackActive = true;
-                return mediaPlayer.getDuration();
+                playbackDone = false;
+                fileDurationMs = mediaPlayer.getDuration();
+                playbackStartedAtElapsed = SystemClock.elapsedRealtime();
+                // Absorb an immediate OEM onCompletion after prepare/start.
+                ignorePlaybackDoneUntilMs = SystemClock.elapsedRealtime() + 450;
+                return fileDurationMs;
             } catch (Exception e) {
                 playbackDone = true;
                 playbackActive = false;
@@ -666,6 +766,48 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                 return -1;
             }
         }
+    }
+
+    /**
+     * Some OEM MediaPlayers (Boox) fire onCompletion within ~400 ms and
+     * report getCurrentPosition() already at duration.  Never restart the
+     * clip from the beginning (that looped sentences audibly); leave the
+     * "still playing" flags set so Lua finishes the sentence on wall-clock.
+     * Must run on the worker, holding mpLock.
+     */
+    private boolean resumeIfFalseCompletion(MediaPlayer mp) {
+        if (mp == null) return false;
+        if (SystemClock.elapsedRealtime() < ignorePlaybackDoneUntilMs) {
+            playbackActive = true;
+            playbackDone = false;
+            return true;
+        }
+        int dur = fileDurationMs;
+        try {
+            int d = mp.getDuration();
+            if (d > 0) dur = d;
+        } catch (Exception ignored) {}
+        int expectedWall = (dur > 0) ? dur : 0;
+        long wall = playbackWallMs();
+        if (expectedWall <= 0 || wall >= expectedWall - 250
+                || wall >= (long) (expectedWall * 0.90)) {
+            return false;
+        }
+        playbackActive = true;
+        playbackDone = false;
+        return true;
+    }
+
+    /** Wall-clock ms since the current clip started, pauses excluded. */
+    private long playbackWallMs() {
+        long now = SystemClock.elapsedRealtime();
+        long paused = playbackPausedAccumMs;
+        if (playbackPauseBeganAt > 0) {
+            paused += now - playbackPauseBeganAt;
+        }
+        if (playbackStartedAtElapsed <= 0) return 0;
+        long wall = now - playbackStartedAtElapsed - paused;
+        return wall < 0 ? 0 : wall;
     }
 
     /**
@@ -752,6 +894,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                         if (mediaPlayer != null && playbackActive) {
                             mediaPlayer.pause();
                             playbackActive = false;
+                            playbackPauseBeganAt = SystemClock.elapsedRealtime();
                         }
                     } catch (IllegalStateException ignored) {}
                 }
@@ -774,6 +917,11 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                         if (mediaPlayer != null && !playbackActive) {
                             mediaPlayer.start();
                             playbackActive = true;
+                            if (playbackPauseBeganAt > 0) {
+                                playbackPausedAccumMs += SystemClock.elapsedRealtime()
+                                        - playbackPauseBeganAt;
+                                playbackPauseBeganAt = 0;
+                            }
                         }
                     } catch (IllegalStateException ignored) {}
                 }
@@ -809,6 +957,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         @Override
         public void onPcmSentenceDone() {
             playbackDone = true;
+            playbackActive = false;
             if (pipelineActive) {
                 pipelineStatus = 2;
                 pipelineActive = false;
@@ -818,6 +967,7 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
         @Override
         public void onPcmSentenceError() {
             playbackDone = true;
+            playbackActive = false;
             if (pipelineActive) {
                 pipelineStatus = 3;
                 pipelineActive = false;
@@ -844,6 +994,19 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
      */
     private int startPcmPlayback(String path) {
         try {
+            // Drop a leftover MediaPlayer so it cannot steal the mixer from
+            // the PCM track (Boox HALs expose one output at a time).
+            synchronized (mpLock) {
+                if (mediaPlayer != null) {
+                    mediaPlayer.setOnCompletionListener(null);
+                    mediaPlayer.setOnErrorListener(null);
+                    try {
+                        if (mediaPlayer.isPlaying()) mediaPlayer.stop();
+                    } catch (Exception ignored) {}
+                    try { mediaPlayer.release(); } catch (Exception ignored) {}
+                    mediaPlayer = null;
+                }
+            }
             PcmStreamer s = pcm;
             if (s == null) {
                 s = new PcmStreamer(pcmListener, speechAttributes());
@@ -853,14 +1016,17 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
             WavData w = parseWav(path);
             if (w == null) {
                 playbackDone = true;
+                playbackActive = false;
                 return -1;
             }
             requestAudioFocus(speechAttributes());
             playbackDone = false;
+            playbackActive = true;
             s.startSentence(w);
             return w.durationMs;
         } catch (Exception e) {
             playbackDone = true;
+            playbackActive = false;
             return -1;
         }
     }

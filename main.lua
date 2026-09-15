@@ -347,6 +347,13 @@ function Audiobook:_initSubmodules()
                 if self.tts_engine and self.tts_engine:_piperAggressiveSplit() then
                     return TextParser.AGGRESSIVE_CHUNK_CHARS
                 end
+                -- Android system TTS: do not split on ; : — that sent
+                -- mid-clause fragments to the engine and broke highlighting.
+                local b = self.tts_engine and self.tts_engine.backend
+                local B = self.tts_engine and self.tts_engine.BACKENDS
+                if B and b == B.ANDROID then
+                    return 10000
+                end
                 return nil  -- default cap
             end
             self.highlight_manager = HighlightManager:new{
@@ -798,6 +805,16 @@ function Audiobook:addToMainMenu(menu_items)
                             self:toggleSetting("keep_playing_on_lid_close", false)
                         end,
                         help_text = _("When enabled, closing the case/cover will not stop audio playback. When disabled (default), playback pauses on lid close and resumes when reopened. Disabling prevents device crashes caused by audio processes running during hardware suspend."),
+                    },
+                    {
+                        text = _("Pause reading when a menu opens"),
+                        checked_func = function()
+                            return self:getSetting("pause_on_menu", true)
+                        end,
+                        callback = function()
+                            self:toggleSetting("pause_on_menu", true)
+                        end,
+                        help_text = _("When enabled (default), read-aloud pauses while a KOReader menu or dialog is open and resumes when it closes. When disabled, narration keeps playing while you browse menus; only the sentence highlighting pauses."),
                     },
                     {
                         text = _("Hide control bar while playing (experimental)"),
@@ -1276,27 +1293,43 @@ function Audiobook:startReadAlong(text, start_pos)
     
     logger.dbg("Audiobook: Starting read-along with text length:", #page_text)
     
-    -- If start position provided, extract text from that point
+    -- If start position provided, start at that sentence (not the page top).
+    local keep_text = false
     if start_pos and start_pos > 1 then
-        -- Find the beginning of the sentence containing this word
+        -- Prefer the parser's sentence boundaries over a raw punctuation
+        -- scan: abbreviations ("M.", "Fig. 3") fooled the scan.
         local sentence_start = start_pos
-        for i = start_pos, 1, -1 do
-            local char = page_text:sub(i, i)
-            if char:match("[%.%?!]") then
-                sentence_start = i + 1
-                break
+        local parser = self.text_parser
+        if parser and parser.parseSentences then
+            local sents = parser:parseSentences(page_text)
+            for _, sent in ipairs(sents or {}) do
+                local a, b = sent.start_pos or 0, sent.end_pos or 0
+                if a > 0 and start_pos >= a and start_pos <= b then
+                    sentence_start = a
+                    break
+                end
             end
-            if i == 1 then
-                sentence_start = 1
+        else
+            for i = start_pos, 1, -1 do
+                local char = page_text:sub(i, i)
+                if char:match("[%.%?!]") then
+                    sentence_start = i + 1
+                    break
+                end
+                if i == 1 then
+                    sentence_start = 1
+                end
             end
         end
-        
+
         -- Trim leading whitespace
-        while sentence_start <= #page_text and page_text:sub(sentence_start, sentence_start):match("%s") do
+        while sentence_start <= #page_text
+                and page_text:sub(sentence_start, sentence_start):match("%s") do
             sentence_start = sentence_start + 1
         end
-        
+
         page_text = page_text:sub(sentence_start)
+        keep_text = true
         logger.dbg("Audiobook: Starting from position", sentence_start)
     end
     
@@ -1376,7 +1409,7 @@ function Audiobook:startReadAlong(text, start_pos)
                         self.media_sync:stop(nil, { drop_chrome = true })
                     end)
                 end
-                self.sync_controller:start(page_text)
+                self.sync_controller:start(page_text, { keep_text = keep_text })
             end,
         })
         return
@@ -1394,7 +1427,7 @@ function Audiobook:startReadAlong(text, start_pos)
         end)
     end
 
-    self.sync_controller:start(page_text)
+    self.sync_controller:start(page_text, { keep_text = keep_text })
 end
 
 -- ---------------------------------------------------------------------------
@@ -2789,12 +2822,14 @@ function Audiobook:getSleepTimerRemaining()
 end
 
 --- Copy selection fields before ReaderHighlight:onClose() unlinks the table.
+--- Positions are frozen as xpointer strings: the live pos table is unlinked
+--- on close, and a stale table reference is unusable in the deferred start.
 function Audiobook:_snapshotSelectedText(selected_text)
     if not selected_text then return nil end
     return {
         text = selected_text.text,
-        pos0 = selected_text.pos0,
-        pos1 = selected_text.pos1,
+        pos0 = self:_xpointerString(selected_text.pos0) or selected_text.pos0,
+        pos1 = self:_xpointerString(selected_text.pos1) or selected_text.pos1,
     }
 end
 
@@ -3543,6 +3578,59 @@ function Audiobook:getCurrentPageText()
     return nil
 end
 
+--- Peek the next view's text without leaving a visible page turn.
+--- Rolling: gotoPos(+screen), getTextFromPositions, restore.
+--- Paging: getTextBoxes(page+1).
+function Audiobook:peekNextPageText()
+    if not self.ui or not self.ui.document then return nil end
+    local document = self.ui.document
+    local Screen = Device.screen
+    self._peeking_adjacent_page = true
+    local text
+    local ok, err = pcall(function()
+        if self.ui.rolling then
+            local saved_pos = document:getCurrentPos()
+            local next_pos = saved_pos + Screen:getHeight()
+            document:gotoPos(next_pos)
+            local ok_res, res = pcall(document.getTextFromPositions, document,
+                {x = 0, y = 0},
+                {x = Screen:getWidth(), y = Screen:getHeight()},
+                true)
+            document:gotoPos(saved_pos)
+            if ok_res and res and res.text and res.text ~= "" then
+                text = res.text
+            end
+        elseif self.ui.paging then
+            local page = self.ui:getCurrentPage()
+            if page then
+                local ok_boxes, page_boxes = pcall(document.getTextBoxes, document, page + 1)
+                if ok_boxes and page_boxes and page_boxes[1] then
+                    local lines = {}
+                    for _, line in ipairs(page_boxes) do
+                        local words = {}
+                        for _, wb in ipairs(line) do
+                            if wb.word and wb.word ~= "" then
+                                table.insert(words, wb.word)
+                            end
+                        end
+                        if #words > 0 then
+                            table.insert(lines, table.concat(words, " "))
+                        end
+                    end
+                    local joined = table.concat(lines, "\n")
+                    if joined ~= "" then text = joined end
+                end
+            end
+        end
+    end)
+    self._peeking_adjacent_page = false
+    if not ok then
+        logger.warn("Audiobook: peekNextPageText failed:", err)
+        return nil
+    end
+    return text
+end
+
 -- Event handlers
 function Audiobook:onAudiobookToggle()
     if not self._init_ok then self:_showInitError(); return true end
@@ -3641,21 +3729,61 @@ function Audiobook:onMediaPrev()
     return true
 end
 
--- NOTE: onPageUpdate intentionally removed.
--- Our SyncController manages page flow via advanceToNextPage().
--- Having onPageUpdate here caused an infinite restart loop:
--- highlight → screen refresh → PageUpdate → updateText → stop audio → restart → highlight → ...
-
--- When the user manually turns a page while an aligned audiobook is playing,
--- optionally seek narration to the new page.
--- onPosUpdate is intentionally not hooked here; onPageUpdate already covers
--- page changes, and reacting to every position update caused an infinite
--- restart loop (highlight -> refresh -> PosUpdate -> seek -> highlight ...).
+-- Page / view changes: SMIL overlay follow, and drop TTS underlines so
+-- screen-coordinate boxes are not stamped onto the next page.  Do not
+-- restart TTS here — that loop is why these used to be no-ops:
+-- highlight → refresh → PageUpdate → updateText → stop audio → restart.
 function Audiobook:onPosUpdate(pos, refresh_type)
+    -- Rolling EPUBs often move the view without a page-number change.
+    -- Screen-coordinate TTS underlines would otherwise stay glued in place.
+    if self._peeking_adjacent_page then return end
+    if type(pos) ~= "number" then return end
+    local prev = self._tts_hl_pos
+    self._tts_hl_pos = pos
+    if not prev then return end
+    local thresh = 200
+    if Device and Device.screen then
+        thresh = math.max(80, math.floor(Device.screen:getHeight() / 4))
+    end
+    if math.abs(pos - prev) >= thresh then
+        self:_dropTtsHighlightOnPageChange()
+    end
 end
 
 function Audiobook:onPageUpdate(cur_page, prev_page)
+    if self._peeking_adjacent_page then return end
     self:_handlePageTurnFollow()
+    -- TTS overlay boxes are screen coordinates.  A page turn must drop them
+    -- or the underline is stamped at the old x,y on the new page.  Do not
+    -- restart TTS here (that loop is why this used to be overlay-only).
+    local prev = self._tts_hl_page
+    if cur_page ~= nil then
+        self._tts_hl_page = cur_page
+    end
+    if prev ~= nil and cur_page ~= nil and prev ~= cur_page then
+        self:_dropTtsHighlightOnPageChange()
+    elseif prev_page ~= nil and cur_page ~= nil and prev_page ~= cur_page then
+        self:_dropTtsHighlightOnPageChange()
+    end
+end
+
+function Audiobook:_dropTtsHighlightOnPageChange()
+    local sc = self.sync_controller
+    if not sc or not sc.STATE then return end
+    if sc.state == sc.STATE.STOPPED or sc.state == sc.STATE.LOADING then
+        return
+    end
+    if not (sc.isPlaying and (sc:isPlaying() or sc:isPaused())) then
+        return
+    end
+    local hm = self.highlight_manager
+    if not hm then return end
+    -- Auto-advance already highlighted the new page; a delayed PageUpdate
+    -- must not wipe that underline.
+    if hm._boxesMatchCurrentView and hm:_boxesMatchCurrentView() then
+        return
+    end
+    pcall(function() hm:clearHighlights() end)
 end
 
 function Audiobook:_currentAudioSentenceVisible()
@@ -3831,12 +3959,20 @@ function Audiobook:_findCurrentPageSmilEntry()
     return nil
 end
 
--- Auto-pause TTS when any KOReader menu or popup opens.
+-- Auto-pause TTS when any KOReader menu or popup opens (setting
+-- "pause_on_menu", default on: while you browse a menu you are not
+-- following the audio). With the setting off, TTS keeps playing under
+-- menus and only the highlight work pauses (see SyncController).
 -- NOTE: ShowConfigMenu event is consumed by ReaderConfig before reaching us,
 -- so onShowConfigMenu may never fire. The PlaybackBar handles its own
 -- visibility via paintTo (checks for overlay widgets in the stack).
+function Audiobook:_pauseOnMenu()
+    return self:getSetting("pause_on_menu", true)
+end
+
 function Audiobook:onShowReaderMenu()
     if not self._init_ok then return end
+    if not self:_pauseOnMenu() then return end
     if self.sync_controller and self.sync_controller:isPlaying() then
         self._paused_by_menu = true
         self.sync_controller:pause()
@@ -3856,6 +3992,7 @@ end
 -- Also pause for the config/bottom menu
 function Audiobook:onShowConfigMenu()
     if not self._init_ok then return end
+    if not self:_pauseOnMenu() then return end
     if self.sync_controller and self.sync_controller:isPlaying() then
         self._paused_by_menu = true
         self.sync_controller:pause()
@@ -3954,16 +4091,178 @@ function Audiobook:_shouldLockKoreaderMargins()
         and self:getSetting("keep_media_overlay_bar", false)
 end
 
-function Audiobook:_defaultOverlayBottomUnscaled()
+function Audiobook:_audiobookMiniBarPixelHeight()
+    local ms = self.media_sync
+    if ms and ms.playback_bar and ms._miniBarPixelHeight then
+        return ms:_miniBarPixelHeight()
+    end
+    local sc = self.sync_controller
+    local bar = sc and sc.playback_bar
+    local bar_h = bar and tonumber(bar._mini_height)
+    if bar_h and bar_h > 0 then return bar_h end
     local screen = Device and Device.screen
-    if not screen then
-        return 46
+    if screen then return screen:scaleBySize(44) end
+    return 44
+end
+
+function Audiobook:_audiobookChromeExtraUnscaled()
+    local ms = self.media_sync
+    if ms and ms._overlayBarExtraUnscaled then
+        return ms:_overlayBarExtraUnscaled(self:_audiobookMiniBarPixelHeight())
     end
-    local bar_h = screen:scaleBySize(44)
-    if screen.unscaleBySize then
-        return screen:unscaleBySize(bar_h) + 2
+    return self:_defaultOverlayBottomUnscaled() - 2
+end
+
+function Audiobook:_defaultOverlayBottomUnscaled()
+    local extra = 44
+    local ms = self.media_sync
+    if ms and ms._overlayBarExtraUnscaled then
+        extra = ms:_overlayBarExtraUnscaled(self:_audiobookMiniBarPixelHeight())
+    else
+        local screen = Device and Device.screen
+        if screen then
+            local bar_h = screen:scaleBySize(44)
+            if screen.unscaleBySize then
+                extra = screen:unscaleBySize(bar_h)
+            end
+        end
     end
-    return 46
+    return extra + 2
+end
+
+--- One bottom inset shared by TTS and Storyteller. Prefer the value already
+--- written into the book sidecar so switching modes cannot change layout.
+function Audiobook:_audiobookChromeInsetUnscaled()
+    local ds = self.ui and self.ui.doc_settings
+    local saved = ds and tonumber(ds:readSetting("audiobook_overlay_bottom"))
+    if saved and saved > 0 then return saved end
+    return self:_defaultOverlayBottomUnscaled()
+end
+
+function Audiobook:_currentUnscaledBottomMargin()
+    local tp = self.ui and self.ui.typeset
+    if tp and tp.unscaled_margins and tp.unscaled_margins[4] ~= nil then
+        return tonumber(tp.unscaled_margins[4])
+    end
+    local ds = self.ui and self.ui.doc_settings
+    if ds then
+        local copt = tonumber(ds:readSetting("copt_b_page_margin"))
+        if copt then return copt end
+    end
+    local cfg = self.ui and self.ui.document and self.ui.document.configurable
+    return cfg and tonumber(cfg.b_page_margin) or nil
+end
+
+--- Persist / reuse the chrome inset. Returns true only when CRE live margins
+--- were changed (caller may wait for reflow). TTS and Storyteller both call
+--- this so a mode switch never restacks bar height on an already-locked page.
+function Audiobook:_ensureAudiobookChromeMargins()
+    if not (self.ui and self.ui.rolling) then return false end
+    local needed = self:_audiobookChromeInsetUnscaled()
+    if not needed or needed <= 0 then return false end
+    local current = tonumber(self:_currentUnscaledBottomMargin()) or 0
+    local already = self._audiobook_chrome_margins_applied
+        or math.abs(current - needed) <= 1
+
+    local ds = self.ui.doc_settings
+    local locked = ds and ds:readSetting("audiobook_overlay_margin_locked")
+    local saved = ds and tonumber(ds:readSetting("audiobook_overlay_bottom"))
+    local smil = false
+    pcall(function() smil = self:_hasMediaOverlays() end)
+    -- Storyteller (and any book that already typeset with the chrome inset)
+    -- must not call SetPageMargins. TTS-only books without a sidecar inset
+    -- still reserve once in the session.
+    local use_locked_inset = self:_shouldLockKoreaderMargins()
+        and (already or locked or (saved and saved > 0) or smil)
+
+    if use_locked_inset then
+        if ds and not already and (smil or locked or (saved and saved > 0)) then
+            local orig = ds:readSetting("audiobook_overlay_orig_bottom")
+            if orig == nil and math.abs(current - needed) > 1 then
+                ds:saveSetting("audiobook_overlay_orig_bottom", current)
+            end
+            ds:saveSetting("audiobook_overlay_margin_locked", true)
+            if self.media_sync and self.media_sync._persistBottomMargin then
+                self.media_sync:_persistBottomMargin(needed, true)
+            end
+            dlog("overlay-margin", "ensure-persist", "needed", needed, "was", current)
+        end
+        self._audiobook_chrome_margins_applied = true
+        return false
+    end
+
+    if already then
+        self._audiobook_chrome_margins_applied = true
+        return false
+    end
+
+    return self:_applyAudiobookChromeMarginsLive()
+end
+
+function Audiobook:_applyAudiobookChromeMarginsLive()
+    local ui = self.ui
+    local tp = ui and ui.typeset
+    if not (tp and tp.unscaled_margins and ui.document and ui.document.setPageMargins) then
+        return false
+    end
+    local Event = require("ui/event")
+    local screen = Device.screen
+    local m = tp.unscaled_margins
+    local bar_h = self:_audiobookMiniBarPixelHeight()
+    local ms = self.media_sync
+    local bottom = screen:scaleBySize(m[4]) + bar_h
+    local reclaim = ms and ms._footerReclaimsHeight and ms:_footerReclaimsHeight()
+    local above = ms and ms._miniBarAboveFooter and ms:_miniBarAboveFooter()
+    if not reclaim or above then
+        local fh = 0
+        if ms and ms._readerFooterHeight then
+            fh = ms:_readerFooterHeight() or 0
+        end
+        bottom = bottom + fh
+    end
+    local ok = pcall(ui.document.setPageMargins, ui.document,
+        screen:scaleBySize(m[1]), screen:scaleBySize(m[2]),
+        screen:scaleBySize(m[3]), bottom)
+    if ok then
+        self._audiobook_chrome_margins_applied = true
+        ui:handleEvent(Event:new("UpdatePos"))
+        dlog("overlay-margin", "live-set", "bottom_px", bottom, "bar_h", bar_h)
+        return true
+    end
+    return false
+end
+
+function Audiobook:_releaseAudiobookChromeMargins()
+    -- Locked inset stays for TTS and Storyteller; restoring 15 px is the reflow.
+    if self:_shouldLockKoreaderMargins() then return end
+    if not self._audiobook_chrome_margins_applied then
+        local ds = self.ui and self.ui.doc_settings
+        if not (ds and ds:readSetting("audiobook_overlay_margin_locked")) then
+            return
+        end
+    end
+    self._audiobook_chrome_margins_applied = false
+    local ui = self.ui
+    if not ui then return end
+    local ds = ui.doc_settings
+    local orig = ds and ds:readSetting("audiobook_overlay_orig_bottom")
+    if orig ~= nil and self.media_sync and self.media_sync._persistBottomMargin then
+        self.media_sync:_persistBottomMargin(orig)
+        if ds then
+            ds:delSetting("audiobook_overlay_margin_locked")
+            ds:delSetting("audiobook_overlay_orig_bottom")
+            ds:delSetting("audiobook_overlay_bottom")
+            pcall(function() ds:flush() end)
+        end
+        dlog("overlay-margin", "restored-settings", orig)
+        return
+    end
+    local tp = ui.typeset
+    if tp and tp.unscaled_margins then
+        local Event = require("ui/event")
+        ui:handleEvent(Event:new("SetPageMargins", tp.unscaled_margins))
+        dlog("overlay-margin", "restored-live")
+    end
 end
 
 function Audiobook:_docWantsLockedOverlayMargins(config, document)
@@ -3982,6 +4281,9 @@ function Audiobook:_docWantsLockedOverlayMargins(config, document)
     if path then
         local pos = self:_getSavedAlignedPosition(path)
         if pos then return true end
+        -- Storyteller books get the inset from the first open (still gated
+        -- on the user's lock setting above).
+        if self:_documentHasMediaOverlays(path) then return true end
     end
     return false
 end
@@ -4059,6 +4361,7 @@ function Audiobook:onCloseDocument()
     -- to persist across book changes. The recorder still stops on suspend,
     -- sleep-cover close, or explicit Stop.
     self:stopReadAlong({ drop_chrome = true })
+    self._audiobook_chrome_margins_applied = false
 end
 
 -- Safety net: if UIManager tears down the widget tree (exit, doc switch)
@@ -4069,6 +4372,7 @@ function Audiobook:onCloseWidget()
     -- widget teardown can happen when switching documents, and we want the
     -- recording to continue.
     self:stopReadAlong({ drop_chrome = true })
+    self._audiobook_chrome_margins_applied = false
     if self._init_ok then
         self:_removeSleepCoverOverride()
     end
