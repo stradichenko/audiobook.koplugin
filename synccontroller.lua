@@ -520,6 +520,7 @@ function SyncController:_beginReading(text, created_bar, keep_text)
         self._piper_abandoned = true
         logger.warn("SyncController: espeak-only mode enabled via settings")
         pcall(function() self.tts_engine._piper:shutdown() end)
+        self:_setPiperQueueAbandoned(true)
     end
     self.current_word_index = 0
     self.current_sentence_index = 0
@@ -2765,6 +2766,7 @@ function SyncController:_checkPiperRtfEscalation()
             string.format("%.2f", rtf), "— espeak session fallback")
         self._piper_abandoned = true
         pcall(function() pq:shutdown() end)
+        self:_setPiperQueueAbandoned(true)
         UIManager:show(InfoMessage:new{
             text = _("This device is too slow for Piper voices.\nSwitching to espeak for this session.\nPiper will be tried again the next time you start playback."),
             timeout = 8,
@@ -2783,6 +2785,16 @@ espeak-only mode.  Session-scoped only: Piper is tried again on the next
 playback session, and the user's engine setting is never modified.
 Called from espeak fallback success paths in readNextSentence().
 --]]
+--- Mirror the session-level Piper abandon onto the prefetch queue so it
+--- stops launching servers and queueing batches (the queue object itself
+--- has no session knowledge).  Cleared from stop() so the next playback
+--- start tries Piper again.
+function SyncController:_setPiperQueueAbandoned(flag)
+    if self.tts_engine and self.tts_engine._piper then
+        pcall(function() self.tts_engine._piper:setAbandoned(flag) end)
+    end
+end
+
 function SyncController:_checkPiperAbandon()
     if self._piper_abandoned then return end
     if not self.tts_engine or not self.tts_engine._piper then return end
@@ -2797,7 +2809,7 @@ function SyncController:_checkPiperAbandon()
         reason = T(_("it still had not produced any audio after %1 espeak sentences"),
             tostring(self._espeak_fallback_count))
     elseif self.tts_engine._piper:getRtfSampleCount() == 0
-            and UIManager:getTime() - self._piper_first_fallback_at
+            and time.to_s(UIManager:getTime() - self._piper_first_fallback_at)
                 >= PIPER_ZERO_DELIVERY_ABANDON_S then
         reason = T(_("it still had not produced any audio after %1 minutes of espeak fallback"),
             tostring(math.floor(PIPER_ZERO_DELIVERY_ABANDON_S / 60)))
@@ -2807,6 +2819,7 @@ function SyncController:_checkPiperAbandon()
     self._piper_abandoned = true
     logger.warn("SyncController: Abandoning Piper:", reason, "-- killing servers")
     pcall(function() self.tts_engine._piper:shutdown() end)
+    self:_setPiperQueueAbandoned(true)
 
     -- Show a non-blocking warning so the user understands what happened
     local InfoMessage = require("ui/widget/infomessage")
@@ -2855,6 +2868,7 @@ function SyncController:stop()
     self._highest_dispatched_idx = nil
     self._piper_warmed_up = false
     self._piper_abandoned = false
+    self:_setPiperQueueAbandoned(false)
     self._espeak_fallback_count = 0
     self._piper_first_fallback_at = nil
     self._piper_degrade_stage = 0

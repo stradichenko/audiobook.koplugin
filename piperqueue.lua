@@ -457,6 +457,7 @@ Start persistent Piper servers (--json-input).
 Model loads once; sentences are sent as JSON lines via FIFO.
 --]]
 function PiperQueue:startServers()
+    if self._abandoned then return end
     if self._servers_running or self._servers_starting then return end
 
     self._server_start_attempts = (self._server_start_attempts or 0) + 1
@@ -722,7 +723,17 @@ end
 Add a sentence to the prefetch queue.
 @param text string
 --]]
+--- Disable the queue for the rest of the session (SyncController's Piper
+--- abandon and RTF escalation set this; stop() clears it so the next
+--- playback start tries Piper again).  While set, no server is launched
+--- and no sentence is queued, so espeak fallbacks never churn server
+--- processes on slow devices.
+function PiperQueue:setAbandoned(flag)
+    self._abandoned = flag and true or nil
+end
+
 function PiperQueue:enqueue(text)
+    if self._abandoned then return end
     if not text or text == "" then return end
     if self._queue[text] then return end  -- already queued
 
@@ -752,6 +763,7 @@ end
 Launch the next queued batch via persistent server (or per-process fallback).
 --]]
 function PiperQueue:launchNext()
+    if self._abandoned then return end
     local engine = self.engine
 
     -- Start servers if needed
