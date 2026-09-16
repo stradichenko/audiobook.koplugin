@@ -273,6 +273,45 @@ Build the base Piper command (no I/O flags).
 --]]
 function PiperQueue:buildBaseCommand()
     local engine = self.engine
+    -- sanoTTS engine: same FIFO/JSON protocol, different binary and args.
+    if engine.backend == engine.BACKENDS.SANOTTS and engine.sanotts_server then
+        local exec_prefix = ""
+        local plugin_dir = engine.plugin_dir
+            or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin"
+        local espeak_lib = plugin_dir .. "/espeak-ng/lib"
+        local ld_linux = espeak_lib .. "/ld-linux-armhf.so.3"
+        local ld_f = io.open(ld_linux, "r")
+        if ld_f then
+            ld_f:close()
+            local lib_path = espeak_lib .. ":/usr/lib:/lib"
+            exec_prefix = string.format('"%s" --library-path "%s" ',
+                ld_linux, lib_path)
+        else
+            exec_prefix = string.format('LD_LIBRARY_PATH="%s:/usr/lib:/lib" ',
+                espeak_lib)
+        end
+        local espeak_bin = engine.espeak_bin
+            or (plugin_dir .. "/espeak-ng/bin/espeak-ng")
+        local espeak_data = engine.espeak_data_path
+            or (plugin_dir .. "/espeak-ng/share")
+        -- The bundled espeak-ng binary is a glibc ARM executable whose
+        -- interpreter (/lib/ld-linux-armhf.so.3) does not exist on the Kobo
+        -- rootfs: it must be exec'd through the bundled loader, exactly like
+        -- piper itself is.
+        local espeak_lib = plugin_dir .. "/espeak-ng/lib"
+        local loader = espeak_lib .. "/ld-linux-armhf.so.3"
+        local loader_f = io.open(loader, "r")
+        local loader_flag = ""
+        if loader_f then
+            loader_f:close()
+            loader_flag = string.format(' --loader "%s" --loader-libdir "%s"',
+                loader, espeak_lib)
+        end
+        return string.format(
+            'nice -n 19 %s%s --model "%s" --espeak-bin "%s" --espeak-data "%s"%s',
+            exec_prefix, engine.sanotts_server, engine.sanotts_voice_dir,
+            espeak_bin, espeak_data, loader_flag)
+    end
     local piper_bin = engine.piper_cmd or engine.backend_cmd or "piper"
     local model_flag = ""
     local model_path = self:_resolvePiperModel()
@@ -353,12 +392,23 @@ function PiperQueue:buildCommand(text, audio_file)
     local text_file = "/tmp/audiobook_piper_in_"
         .. os.time() .. "_" .. engine.file_counter .. ".txt"
     local tf = io.open(text_file, "w")
-    if tf then
-        tf:write(self:_cleanText(text) .. "\n")
-        tf:close()
+    local cmd
+    if engine.backend == engine.BACKENDS.SANOTTS then
+        -- snt_server reads one JSON line per utterance from stdin and
+        -- writes the WAV at the path given inside the line.
+        if tf then
+            tf:write(self:_buildJsonLine(text, audio_file))
+            tf:close()
+        end
+        cmd = string.format('%s < "%s" 2>&1', base, text_file)
+    else
+        if tf then
+            tf:write(self:_cleanText(text) .. "\n")
+            tf:close()
+        end
+        cmd = string.format('%s --output_file "%s" < "%s" 2>&1',
+            base, audio_file, text_file)
     end
-    local cmd = string.format('%s --output_file "%s" < "%s" 2>&1',
-        base, audio_file, text_file)
     return cmd, text_file
 end
 
@@ -417,17 +467,21 @@ function PiperQueue:startServers()
 
     -- Low-memory guard: Piper neural TTS loads a ~100MB ONNX model into RAM.
     -- On devices with < 80MB free, launching Piper risks OOM-killing KOReader.
+    -- sanoTTS is exempt: its int8 model is 680KB with a ~5MB working set.
+    local engine = self.engine
     local mem_available_kb = 0
-    local mf = io.open("/proc/meminfo", "r")
-    if mf then
-        for line in mf:lines() do
-            local kb = line:match("MemAvailable:%s+(%d+)%s+kB")
-            if kb then
-                mem_available_kb = tonumber(kb) or 0
-                break
+    if engine.backend ~= engine.BACKENDS.SANOTTS then
+        local mf = io.open("/proc/meminfo", "r")
+        if mf then
+            for line in mf:lines() do
+                local kb = line:match("MemAvailable:%s+(%d+)%s+kB")
+                if kb then
+                    mem_available_kb = tonumber(kb) or 0
+                    break
+                end
             end
+            mf:close()
         end
-        mf:close()
     end
     if mem_available_kb > 0 and mem_available_kb < 80 * 1024 then
         local mem_mb = math.floor(mem_available_kb / 1024)
@@ -450,7 +504,7 @@ function PiperQueue:startServers()
     self._server_rr = 0
 
     -- Kill ALL existing piper processes before launching
-    os.execute("killall -9 piper 2>/dev/null")
+    os.execute("killall -9 piper snt_server 2>/dev/null")
     -- Also kill orphan server shell wrappers from a previous crash.
     -- These are /bin/sh processes not caught by killall piper.
     for i = 1, SERVER_COUNT do
@@ -642,7 +696,7 @@ function PiperQueue:stopServers()
         os.execute(string.format('rm -f "%s" "%s.pid" "%s.piper_pid" "%s.sh" "%s.log"',
             fifo, fifo, fifo, fifo, fifo))
     end
-    os.execute("killall -9 piper 2>/dev/null")
+    os.execute("killall -9 piper snt_server 2>/dev/null")
     -- Kill wrapper shells that may be orphaned (reparented to init)
     os.execute("pkill -9 -f 'piper_server_.*\\.sh' 2>/dev/null")
     self._servers = {}
@@ -1232,7 +1286,7 @@ function PiperQueue:killOrphanProcesses()
         -- output pipe is consumed.  No action needed.
         logger.dbg("PiperQueue: Servers active, skipping killall")
     else
-        os.execute("killall -9 piper 2>/dev/null")
+        os.execute("killall -9 piper snt_server 2>/dev/null")
         -- Also kill server wrapper shells that might be orphaned
         os.execute("pkill -9 -f 'piper_server_.*\\.sh' 2>/dev/null")
         logger.dbg("PiperQueue: Killed all piper processes + wrapper shells")

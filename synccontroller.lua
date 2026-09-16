@@ -844,7 +844,7 @@ function SyncController:readNextSentence()
     -- synthesize() would set _piper_synthesizing=true which blocks the
     -- entire prefetch queue during the initial ~11s synthesis — wasting
     -- the time that could be spent prefetching sentence 2+.
-    if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+    if self.tts_engine and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS) then
         logger.warn("SyncController: Queueing sentence", self.reading_sentence_idx,
             "via Piper prefetch queue (", sentence.text:sub(1,40), ")")
         -- Queue current sentence + lookahead
@@ -889,8 +889,10 @@ function SyncController:readNextSentence()
 
         -- Show notification while waiting for Piper (no espeak fallback or it failed)
         local InfoMessage = require("ui/widget/infomessage")
+        local engine_label = self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS
+            and _("sanoTTS") or _("Piper")
         UIManager:show(InfoMessage:new{
-            text = T(_("Starting %1, please wait…"), _("Piper")),
+            text = T(_("Starting %1, please wait…"), engine_label),
             timeout = 3,
         })
 
@@ -950,7 +952,7 @@ function SyncController:readNextSentence()
         if not synth_success then
             logger.warn("SyncController: Synthesis failed for sentence", controller.reading_sentence_idx)
             -- Piper failure: degrade the voice rather than drop book content
-            if controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER then
+            if controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER or controller.tts_engine.backend == controller.tts_engine.BACKENDS.SANOTTS then
                 controller:_playViaEspeakOrSkip(sentence, "piper synthesize failed")
             elseif controller.tts_engine.backend == controller.tts_engine.BACKENDS.ANDROID then
                 -- Neural Android engines (VoxSherpa/Kokoro) get force-stopped
@@ -1005,6 +1007,7 @@ function SyncController:applySentenceTiming(sentence, timing_data)
         local current_time = 0
         local is_neural = self.tts_engine
             and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+                or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS
                 or self.tts_engine.backend == self.tts_engine.BACKENDS.ANDROID)
         for _, word in ipairs(sentence.words) do
             local duration
@@ -1106,7 +1109,7 @@ function SyncController:beginSentencePlayback(sentence)
         -- Read pause settings (seconds → milliseconds)
         -- For Piper, use the neural-specific gap settings; for espeak, use the legacy ones.
         local is_piper_backend = self.tts_engine
-            and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+            and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS)
         local sent_pause_s, para_pause_s
         if is_piper_backend then
             sent_pause_s = (self.plugin and self.plugin:getSetting("piper_sentence_gap", 0.3)) or 0.3
@@ -1137,7 +1140,7 @@ function SyncController:beginSentencePlayback(sentence)
             -- trailing-gap code after the loop handles the final padding.
             local pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
             if not pf_file then
-                if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER then
+                if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS then
                     logger.warn("SyncController: Concat: Piper sentence", idx, "not ready yet, stopping concat")
                     break
                 end
@@ -1362,7 +1365,7 @@ function SyncController:beginSentencePlayback(sentence)
             -- minimal UIManager delay so the next sentence starts right
             -- after the padded silence finishes playing.
             local is_neural = controller.tts_engine
-                and controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER
+                and (controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER or controller.tts_engine.backend == controller.tts_engine.BACKENDS.SANOTTS)
             local delay = 0.2
             if is_neural then
                 -- Gap always padded into audio for Piper — minimal scheduling delay
@@ -1435,7 +1438,7 @@ function SyncController:beginSentencePlayback(sentence)
             self._concat_wav_files = concat_wav_files
             -- For Piper: schedule prefetch for sentences BEYOND the concat
             -- batch so they'll be ready when this concat stream finishes.
-            if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+            if self.tts_engine and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS)
                     and not self._piper_abandoned then
                 local last_concat_idx = self.reading_sentence_idx + #concat_sentences
                 for offset = 1, PIPER_LOOKAHEAD do
@@ -1453,7 +1456,7 @@ function SyncController:beginSentencePlayback(sentence)
             -- Single sentence — prefetch upcoming ones.
             -- For Piper (~4-5× real-time on ARM), queue 20 sentences so
             -- both servers always have batches waiting.
-            if self.tts_engine and self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER
+            if self.tts_engine and (self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS)
                     and not self._piper_abandoned then
                 for offset = 1, PIPER_LOOKAHEAD do
                     self:_prefetchNextSentence(self.reading_sentence_idx + offset)
@@ -1584,7 +1587,7 @@ function SyncController:_prefetchNextPage()
             end
             if parsed and parsed.sentences and #parsed.sentences > 0 then
                 local is_piper = controller.tts_engine
-                    and controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER
+                    and (controller.tts_engine.backend == controller.tts_engine.BACKENDS.PIPER or controller.tts_engine.backend == controller.tts_engine.BACKENDS.SANOTTS)
                 if is_piper then
                     -- Queue the first 6 next-page sentences (2 batches
                     -- of 3) into the Piper prefetch system.  We don't
@@ -2712,7 +2715,7 @@ modified, and Piper is tried again on the next playback session.
 function SyncController:_checkPiperRtfEscalation()
     if self._piper_abandoned then return end
     if not self.tts_engine or not self.tts_engine._piper then return end
-    if self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER then return end
+    if self.tts_engine.backend ~= self.tts_engine.BACKENDS.PIPER and self.tts_engine.backend ~= self.tts_engine.BACKENDS.SANOTTS then return end
     local pq = self.tts_engine._piper
     local rtf = pq:getRtf()
     if not rtf or rtf < PIPER_RTF_DEGRADE_THRESHOLD then return end
@@ -2878,7 +2881,7 @@ function SyncController:stop()
     self._spoken_norm = nil
     self._empty_skip_advances = nil
     self._page_turn_gen = (self._page_turn_gen or 0) + 1
-    self._disarmTtsWaitUi()
+    self:_disarmTtsWaitUi()
     self._tts_session_warm = false
     self._tts_heard_audio = false
     self._android_tts_fail_count = 0

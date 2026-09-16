@@ -6,6 +6,7 @@
 #
 # Options:
 #   --with-piper         Also bundle Piper TTS neural engine (~24 MB)
+#   --with-sanotts       Also bundle sanoTTS int8 neural engine (~700 KB, on by default; --no-sanotts to skip)
 #   --piper-voice VOICE  Download a specific Piper voice (default: en_US-danny-low)
 #                        Use "low" quality for smaller size (~15 MB), "medium" for better quality (~60 MB)
 set -euo pipefail
@@ -18,11 +19,20 @@ PIPER_DEST="$PLUGIN_DEST/piper"
 
 # Parse arguments
 WITH_PIPER=false
+WITH_SANOTTS=true
 PIPER_VOICE="en_US-danny-low"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --with-piper)
             WITH_PIPER=true
+            shift
+            ;;
+        --with-sanotts)
+            WITH_SANOTTS=true
+            shift
+            ;;
+        --no-sanotts)
+            WITH_SANOTTS=false
             shift
             ;;
         --piper-voice)
@@ -174,6 +184,48 @@ if [ -d "$ESPEAK_OUT/share/espeak-ng-data" ]; then
 fi
 
 chmod +x "$ESPEAK_DEST/bin/espeak-ng"
+
+# ── sanoTTS engine (int8 neural TTS, low-resource tier) ──────────────
+# ~700 KB voice + static server. Slots between Piper and espeak-ng in the
+# backend tiers; runs real-time on single-core Kobos with ~5 MB RAM.
+echo ""
+echo "=== Bundling sanoTTS engine ==="
+if [ "$WITH_SANOTTS" = true ]; then
+    SANO_DEST="$PLUGIN_DEST/sanotts"
+    SANO_COMMIT="d2fffbd0890af9ff7bb021f2ccda3b3f2560028a"
+    SANO_TAR_URL="https://github.com/ampixa/sanoTTS/archive/${SANO_COMMIT}.tar.gz"
+
+    # Build the static armv7hf server with the pinned sanoTTS mcu core.
+    SANO_CORE_DIR="$SCRIPT_DIR/sanotts/mcu"
+    if [ ! -f "$SANO_CORE_DIR/src/snt_tts.c" ]; then
+        echo "Fetching sanoTTS mcu core (MIT) at pinned commit..."
+        SANO_TGZ=$(mktemp /tmp/sanotts-mcu-XXXX.tar.gz)
+        curl -sL --max-time 120 -o "$SANO_TGZ" "$SANO_TAR_URL"
+        rm -rf "$SANO_CORE_DIR"
+        tar xzf "$SANO_TGZ" -C "$SCRIPT_DIR/sanotts" --strip-components=1 "sanoTTS-${SANO_COMMIT}/mcu"
+        rm -f "$SANO_TGZ"
+    fi
+
+    echo "Cross-compiling snt_server (static musl, armv7hf)..."
+    SANO_OUT=$(nix shell nixpkgs#pkgsCross.armv7l-hf-multiplatform.pkgsStatic.stdenv -c bash -c '
+        cd "'"$SCRIPT_DIR"'/sanotts" || exit 1
+        export NIX_CFLAGS_COMPILE="$NIX_CFLAGS_COMPILE -O2 -std=c99 -I$PWD/mcu/include -I$PWD/mcu/src -DFSD_FAST_MATH"
+        $CC -static -o snt_server snt_server.c mcu/src/snt_tts.c mcu/src/snt_kernels_ref.c mcu/ports/host/snt_port_host.c -lm || exit 1
+        mkdir -p "$PWD/out"
+        cp snt_server "$PWD/out/"
+    ' && echo OK)
+    if echo "$SANO_OUT" | grep -q OK && [ -f "$SCRIPT_DIR/sanotts/out/snt_server" ]; then
+        mkdir -p "$SANO_DEST/voice"
+        cp "$SCRIPT_DIR/sanotts/out/snt_server" "$SANO_DEST/snt_server"
+        cp "$SCRIPT_DIR/sanotts/voice/front_q8.bin" "$SANO_DEST/voice/front_q8.bin"
+        cp "$SCRIPT_DIR/sanotts/voice/model_q8.bin" "$SANO_DEST/voice/model_q8.bin"
+        echo "Bundled sanoTTS engine + voice (~700 KB)"
+    else
+        echo "WARNING: sanoTTS server build failed; skipping sanoTTS backend"
+    fi
+else
+    echo "Skipping sanoTTS (--no-sanotts)"
+fi
 
 # ── MBROLA support (bundled with espeak-ng when mbrolaSupport=true) ───
 echo ""

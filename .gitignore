@@ -43,3 +43,8 @@ tools/_msgids.json
 tools/_mt_cache.json
 tools/*.pyc
 
+
+# sanoTTS build artifacts
+sanotts/out/
+sanotts/mcu/
+sanotts/snt_server

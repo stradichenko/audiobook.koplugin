@@ -64,6 +64,7 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
             local labels = {
                 espeak = _("espeak-ng"),
                 piper = _("Piper (neural)"),
+                sanotts = _("sanoTTS (neural)"),
                 pico = _("Pico TTS"),
                 flite = _("Flite"),
                 festival = _("Festival"),
@@ -865,6 +866,14 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
         table.insert(available, {
             id = engine.BACKENDS.PIPER,
             label = _("Piper (neural, natural-sounding)"),
+        })
+    end
+
+    -- sanoTTS: bundled int8 neural engine (~700KB voice, 512MB-friendly)
+    if engine.sanotts_server then
+        table.insert(available, {
+            id = engine.BACKENDS.SANOTTS,
+            label = _("sanoTTS (neural, lightweight)"),
         })
     end
 

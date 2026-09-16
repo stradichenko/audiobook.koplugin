@@ -59,6 +59,7 @@ local TTSEngine = {
         FESTIVAL = "festival",
         ANDROID = "android",
         PIPER = "piper",
+        SANOTTS = "sanotts",
         KINDLE_NATIVE = "kindle-native",
         NATIVE = "platform-native",
     },
@@ -303,9 +304,38 @@ function TTSEngine:detectBackend()
             self._wav_play_lib = plugin_dir .. "/wav-play/lib"
             logger.dbg("TTSEngine: Found bundled wav-play at", wav_play_bin)
         end
-        -- Pick default backend: espeak-ng first (lighter), then Piper
+        -- Check for bundled sanoTTS engine (int8 neural TTS, ~700KB voice).
+        -- Same FIFO/JSON protocol as Piper; slots between Piper and espeak
+        -- in the quality tiers and runs comfortably on 512MB devices.
+        local sanotts_dir = plugin_dir .. "/sanotts"
+        local sanotts_server = sanotts_dir .. "/snt_server"
+        local found_sanotts = false
+        if ensureBinary(sanotts_server) then
+            local vfront = io.open(sanotts_dir .. "/voice/front_q8.bin", "r")
+            local vmodel = io.open(sanotts_dir .. "/voice/model_q8.bin", "r")
+            if vfront and vmodel then
+                vfront:close()
+                vmodel:close()
+                found_sanotts = true
+                self.sanotts_dir = sanotts_dir
+                self.sanotts_server = sanotts_server
+                self.sanotts_voice_dir = sanotts_dir .. "/voice"
+                logger.dbg("TTSEngine: Found bundled sanoTTS at", sanotts_server)
+            else
+                logger.warn("TTSEngine: sanoTTS voice files missing under", sanotts_dir .. "/voice")
+            end
+        else
+            logger.warn("TTSEngine: bundled sanoTTS not found at", sanotts_server)
+        end
+        -- Pick default backend: espeak-ng first (lighter, existing default),
+        -- then sanoTTS (neural, ~700KB voice, runs on 512MB devices), then
+        -- Piper (best quality).  The automatic quality-tier selection
+        -- (RTF-based) is handled at playback time; users can override here.
         if found_espeak then
             self.backend = self.BACKENDS.ESPEAK
+            return
+        elseif found_sanotts then
+            self.backend = self.BACKENDS.SANOTTS
             return
         elseif found_piper then
             self.backend = self.BACKENDS.PIPER
@@ -1075,7 +1105,7 @@ function TTSEngine:synthesizeCommand(text, callback)
                 exec_prefix, self.backend_cmd, voice, speed, pitch, amplitude, gap_flag, audio_file, self:escapeText(text)
             )
         end
-    elseif self.backend == self.BACKENDS.PIPER then
+    elseif self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS then
         local text_file
         cmd, text_file = self._piper:buildCommand(text, audio_file)
         self._piper_text_file = text_file
@@ -1115,7 +1145,8 @@ function TTSEngine:synthesizeCommand(text, callback)
     logger.dbg("TTSEngine: Running:", cmd)
     -- Piper TTS is slow (~8-11s per sentence on Kobo ARM).
     -- Run it asynchronously so the UI stays responsive.
-    if self.backend == self.BACKENDS.PIPER then
+    -- sanoTTS is fast (~0.3s) but uses the same async queue machinery.
+    if self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS then
         -- Wrap: run synthesis in background, write a marker file when done.
         -- Capture stderr to a log file so we can detect ONNX Runtime errors
         -- (e.g. "Protobuf parsing failed") and provide better diagnostics.
@@ -1641,6 +1672,7 @@ function TTSEngine:generateTimingEstimates(text)
     local current_time = 0
     local pos = 1
     local is_neural = self.backend == self.BACKENDS.PIPER
+        or self.backend == self.BACKENDS.SANOTTS
         or self.backend == self.BACKENDS.ANDROID
     while pos <= #text do
         -- Skip whitespace
@@ -1837,8 +1869,9 @@ function TTSEngine:prefetch(text, use_espeak)
     if self.backend == self.BACKENDS.ANDROID then
         return false
     end
-    -- Piper: delegate to the async queue-based prefetcher
-    if self.backend == self.BACKENDS.PIPER and not use_espeak then
+    -- Piper/sanoTTS: delegate to the async queue-based prefetcher
+    if (self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS)
+            and not use_espeak then
         self._piper:enqueue(text)
         return true  -- launched (or already in queue)
     end
@@ -6707,7 +6740,7 @@ function TTSEngine:stop()
     end
     
     -- Kill any background Piper synthesis processes immediately
-    if self.backend == self.BACKENDS.PIPER then
+    if self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS then
         self._piper:killOrphanProcesses()
     end
     
@@ -6875,6 +6908,10 @@ function TTSEngine:setBackend(backend)
     -- Restore correct backend_cmd for the selected backend
     if backend == self.BACKENDS.PIPER then
         self.backend_cmd = self.piper_cmd or "piper"
+    elseif backend == self.BACKENDS.SANOTTS then
+        -- snt_server needs no backend_cmd (the queue builds its own command);
+        -- sample rate is fixed at 22050 for the int8 voice.
+        self._piper_sample_rate = 22050
     elseif backend == self.BACKENDS.ESPEAK then
         -- Restore bundled espeak-ng path if available
         local plugin_dir = Utils.normalizeDirPath(self.plugin_dir or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin")
