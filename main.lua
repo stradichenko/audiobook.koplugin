@@ -1383,7 +1383,7 @@ function Audiobook:startReadAlong(text, start_pos)
     -- Early no-audio warning: if the probe found no usable audio player
     -- and there is no BT device connected, warn before synthesis runs.
     if self.tts_engine._no_real_audio_output and not self.tts_engine._cached_player then
-        if Device.isKindle and Device:isKindle() then
+        if Device.isKindle and Device:isKindle() and not Utils.isLegacyKindleModel() then
             -- A speakerless Kindle can only play over Bluetooth, routed through
             -- the Amazon audio framework (audiomgrd) or the native Ivona voice.
             -- When no path is found, "Start anyway" would synthesize into a dead
@@ -1459,9 +1459,18 @@ end
 
 --- On Kindle there is no speaker/ALSA: audio only plays over Bluetooth A2DP.
 --- Returns true if playback can proceed; otherwise prompts and returns false.
---- Non-Kindle devices always pass (their audio paths differ).
+--- Non-Kindle devices always pass (their audio paths differ).  The 2007-2011
+--- speaker Kindles are the exception: they have a real ALSA codec and no
+--- Bluetooth at all, so they pass as soon as an ALSA card is visible.
 function Audiobook:_audioOutputReady()
     if not (Device.isKindle and Device:isKindle()) then return true end
+    if Utils.isLegacyKindleModel() then
+        if Utils.probeKindleAlsaCard() then
+            return true
+        end
+        -- No ALSA card: fall through so the BT probe produces its usual
+        -- message rather than silently blocking with no explanation.
+    end
     local connected = false
     local h = io.popen("lipc-get-prop com.lab126.audiomgrd audioOutputConnected 2>/dev/null")
     if h then

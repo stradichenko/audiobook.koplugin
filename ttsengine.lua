@@ -282,6 +282,27 @@ function TTSEngine:detectBackend()
         else
             logger.warn("TTSEngine: bundled espeak-ng not found at", bundled_bin)
         end
+        -- Legacy speaker Kindles (2007-2011): the bundled armhf espeak-ng
+        -- runs through the bundled glibc 2.42 loader and cannot execute on
+        -- the soft-float 2.6.x firmware there, so prefer the static musl
+        -- espeak-ng-legacy binary.  It shares the bundled voice data via
+        -- ESPEAK_DATA_PATH (same nixpkgs pin, same data format version).
+        if Utils.isLegacyKindleModel() then
+            local legacy_bin = plugin_dir .. "/espeak-ng-legacy/bin/espeak-ng"
+            if ensureBinary(legacy_bin) then
+                found_espeak = true
+                self.backend_cmd = legacy_bin
+                self.espeak_bin = legacy_bin
+                self.espeak_bin_path = nil
+                self.espeak_lib_path = nil
+                self.espeak_linker = nil
+                self.espeak_static = true
+                self.espeak_data_path = bundled_base .. "/share"
+                logger.warn("TTSEngine: legacy speaker Kindle, using static espeak-ng at", legacy_bin)
+            else
+                logger.warn("TTSEngine: espeak-ng-legacy not found at", legacy_bin)
+            end
+        end
         -- Check for bundled Piper TTS binary (rename .bin -> original if needed)
         local piper_dir = plugin_dir .. "/piper"
         local bundled_piper_bin = piper_dir .. "/piper"
@@ -1033,7 +1054,11 @@ function TTSEngine:synthesizeCommand(text, callback)
         -- Use the bundled ld-linux to bypass the ancient system glibc (2.11)
         local exec_prefix = ""
         local esp_data = self:_resolveEspeakDataPath()
-        if self.espeak_linker then
+        if self.espeak_static then
+            -- Static musl binary (legacy speaker Kindles): no loader wrapper
+            -- and no bundled libraries needed, only the voice data path.
+            exec_prefix = string.format("ESPEAK_DATA_PATH=%s ", esp_data)
+        elseif self.espeak_linker then
             local path_prefix = ""
             if self.espeak_bin_path then
                 path_prefix = string.format("PATH=%s:$PATH ", self.espeak_bin_path)
@@ -1787,7 +1812,10 @@ function TTSEngine:espeakSynthesizeFallback(text)
     local audio_file = temp_dir .. "/audiobook_espeak_fb_" .. os.time() .. "_" .. self.file_counter .. ".wav"
     local exec_prefix = ""
     local esp_data = self:_resolveEspeakDataPath()
-    if self.espeak_linker then
+    if self.espeak_static then
+        -- Static musl binary (legacy speaker Kindles): data path only.
+        exec_prefix = string.format("ESPEAK_DATA_PATH=%s ", esp_data)
+    elseif self.espeak_linker then
         local path_prefix = ""
         if self.espeak_bin_path then
             path_prefix = string.format("PATH=%s:$PATH ", self.espeak_bin_path)
@@ -2122,7 +2150,9 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         logger.err("TTSEngine: No audio player found")
         self.player_error = true
         local msg
-        if Device:isKindle() then
+        if Device:isKindle() and Utils.isLegacyKindleModel() then
+            msg = _("No audio output available.\n\nThis Kindle model has a built-in speaker, but no working audio device was found.\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue.")
+        elseif Device:isKindle() then
             msg = _("No audio output available.\n\nKindle has no built-in speaker. Audio needs Bluetooth headphones connected via Kindle Settings.\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue -- it will help identify the correct audio path for this Kindle model.")
         elseif Device:isKobo() then
             msg = _("No audio output available.\n\nKobo has no built-in speaker.\n\nPlease pair Bluetooth headphones:\nSettings → Bluetooth → Pair\n\nThen try again.")
@@ -2219,7 +2249,9 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 logger.warn("TTSEngine: No soundcard and no BT connected - refusing to play")
                 self.is_speaking = false
                 local msg
-                if Device:isKindle() then
+                if Device:isKindle() and Utils.isLegacyKindleModel() then
+                    msg = _("No audio output available.\n\nThis Kindle model has a built-in speaker, but no working audio device was found.\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue.")
+                elseif Device:isKindle() then
                     msg = _("No audio output available.\n\nKindle has no built-in speaker. Please connect Bluetooth headphones via Kindle Settings, then try again.\n\nIf you already have headphones connected, please generate a bug report (Audiobook > Generate bug report) and share it on GitHub — it will help identify the correct audio path for this Kindle model.")
                 else
                     msg = _("No audio output available.\n\nThis device has no built-in speaker. Please connect a Bluetooth audio device first:\n\n1. Go to Audiobook > Bluetooth settings > Bluetooth\n2. Turn Bluetooth on\n3. Scan and pair your headphones/speaker\n4. Then start read-along again.")
@@ -2290,7 +2322,9 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     -- Kindles have no internal speaker; audio only routes through BT
     -- headphones via audiomgrd.  Warn once per session if BT is not
     -- connected and there are no ALSA soundcards (no built-in speaker).
-    if Device:isKindle() and not self._kindle_bt_warned then
+    -- 2007-2011 models DO have a speaker; the ALSA probe below already
+    -- covers them, and the legacy aplay route never reaches this warning.
+    if Device:isKindle() and not Utils.isLegacyKindleModel() and not self._kindle_bt_warned then
         local has_soundcard = false
         local sc = io.popen("aplay -l 2>/dev/null")
         if sc then
@@ -4214,6 +4248,20 @@ function TTSEngine:findAudioPlayer()
         self.audio_player_type = "android"
         logger.dbg("TTSEngine: Using Android MediaPlayer for audio")
         return "android"
+    end
+
+    -- 0a) Legacy speaker Kindles (K2/K3/DXG, K4, Touch, PW1): these have a
+    -- built-in speaker on a real ALSA codec and no Bluetooth hardware at
+    -- all, so the BT-only routes below can never apply.  The device aplay
+    -- is present on these firmwares; play the engine's WAV output directly.
+    if Device.isKindle and Device:isKindle() and Utils.isLegacyKindleModel() then
+        local alsa_dev = Utils.probeKindleAlsaCard()
+        if alsa_dev then
+            self.audio_player_type = "aplay"
+            self._no_real_audio_output = false
+            logger.warn("TTSEngine: legacy speaker Kindle, ALSA device", alsa_dev, "- using aplay")
+            return "aplay -q -D " .. alsa_dev
+        end
     end
 
     -- 0b) Kindle native TTS: Amazon's Ivona SDK via tts.orchestrator/playermgr.
@@ -6893,6 +6941,13 @@ function TTSEngine:setBackend(backend)
         logger.warn("TTSEngine: Invalid backend:", backend)
         return
     end
+    -- Legacy speaker Kindles: the bundled Piper is an armhf glibc binary
+    -- that cannot run on the soft-float 2.6.x firmware (and 256 MB cannot
+    -- hold the model anyway).  Keep the session on espeak instead.
+    if backend == self.BACKENDS.PIPER and Utils.isLegacyKindleModel() then
+        logger.warn("TTSEngine: Piper is unavailable on legacy speaker Kindles; staying on espeak-ng")
+        backend = self.BACKENDS.ESPEAK
+    end
     -- Tear down any platform-native daemon when leaving the native backend.
     if self.backend == self.BACKENDS.NATIVE and backend ~= self.BACKENDS.NATIVE then
         self:_stopNativeDaemon()
@@ -6913,13 +6968,36 @@ function TTSEngine:setBackend(backend)
         -- sample rate is fixed at 22050 for the int8 voice.
         self._piper_sample_rate = 22050
     elseif backend == self.BACKENDS.ESPEAK then
-        -- Restore bundled espeak-ng path if available
+        -- Restore bundled espeak-ng path if available (espeak-ng-legacy on
+        -- legacy speaker Kindles), falling back to PATH.  detectBackend has
+        -- already renamed any shipped .bin files by the time this runs.
         local plugin_dir = Utils.normalizeDirPath(self.plugin_dir or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin")
-        local bundled_bin = plugin_dir .. "/espeak-ng/bin/espeak-ng"
-        local f = io.open(bundled_bin, "r")
-        if f then
-            f:close()
-            self.backend_cmd = bundled_bin
+        local espeak_bin
+        if Utils.isLegacyKindleModel() then
+            local legacy_bin = plugin_dir .. "/espeak-ng-legacy/bin/espeak-ng"
+            local lf = io.open(legacy_bin, "r")
+            if lf then
+                lf:close()
+                espeak_bin = legacy_bin
+                self.espeak_bin = legacy_bin
+                self.espeak_bin_path = nil
+                self.espeak_lib_path = nil
+                self.espeak_linker = nil
+                self.espeak_static = true
+                self.espeak_data_path = plugin_dir .. "/espeak-ng/share"
+            end
+        end
+        if not espeak_bin then
+            local bundled_bin = plugin_dir .. "/espeak-ng/bin/espeak-ng"
+            local f = io.open(bundled_bin, "r")
+            if f then
+                f:close()
+                espeak_bin = bundled_bin
+                self.espeak_static = nil
+            end
+        end
+        if espeak_bin then
+            self.backend_cmd = espeak_bin
         else
             self.backend_cmd = "espeak-ng"
         end

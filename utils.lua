@@ -93,6 +93,61 @@ function Utils.normalizeDirPath(path)
     return path
 end
 
+-- Kindle generations with a built-in speaker on a real ALSA codec and no
+-- Bluetooth at all (2007-2011).  KOReader flavors: the first three run the
+-- kindle-legacy build, the last three the "kindle" (kindle5 toolchain,
+-- Cortex-A8 softfp) build.  PW2 (model "KindlePaperWhite2") is the first
+-- speakerless generation, so everything from there on must NOT match.
+Utils.LEGACY_KINDLE_MODELS = {
+    Kindle2 = true,
+    KindleDXG = true,
+    Kindle3 = true,
+    Kindle4 = true,
+    KindleTouch = true,
+    KindlePaperWhite = true,
+}
+
+local _legacy_kindle_model = nil
+
+--- True when the current Kindle is a 2007-2011 speaker model.  Nil or
+--- "unknown" model values conservatively return false; the bug report
+--- captures Device.model so a misdetection can be closed later.
+-- @return boolean
+function Utils.isLegacyKindleModel()
+    if _legacy_kindle_model ~= nil then return _legacy_kindle_model end
+    _legacy_kindle_model = false
+    local ok, Device = pcall(require, "device")
+    if ok and Device and Device.model then
+        _legacy_kindle_model = Utils.LEGACY_KINDLE_MODELS[Device.model] or false
+    end
+    return _legacy_kindle_model
+end
+
+local _kindle_alsa_card = nil
+local _kindle_alsa_probed = false
+
+--- Probe once for a usable ALSA playback device (old Kindles expose their
+--- speaker codec directly; PW2+ report "no soundcards").  Cached for the
+--- session so the probe runs at most once.
+-- @return string|false  ALSA device argument (e.g. "plughw:0,0") or false
+function Utils.probeKindleAlsaCard()
+    if _kindle_alsa_probed then return _kindle_alsa_card end
+    _kindle_alsa_probed = true
+    _kindle_alsa_card = false
+    local h = io.popen("aplay -l 2>/dev/null")
+    if h then
+        local out = h:read("*a") or ""
+        h:close()
+        if not out:find("no soundcards", 1, true) then
+            local card, dev = out:match("card (%d+):.+device (%d+):")
+            if card and dev then
+                _kindle_alsa_card = "plughw:" .. card .. "," .. dev
+            end
+        end
+    end
+    return _kindle_alsa_card
+end
+
 --- Fold a token for alignment: lowercase, drop apostrophes/punctuation, strip
 --- a trailing hyphen (CRe line-break hyphenation). Matching only.
 function Utils.foldWord(w)

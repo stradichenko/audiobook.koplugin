@@ -1732,6 +1732,27 @@ find /usr /system /vendor /mnt /data -maxdepth 4 -name '*audio*.so*' 2>/dev/null
         local native_pw2_path = plugin_dir .. "/kindle/gst-play-native-pw2"
         probeGstPlayVariant(native_pw2_path, "native_pw2", nil)
 
+        -- Legacy decoder diagnostics (2007-2011 speaker Kindles): the static
+        -- musl binaries built for the soft-float 2.6.x firmware, the model
+        -- string itself, and the raw ALSA device list.  On PW2+ these
+        -- binaries are inert and the captures are harmless.
+        info.device_model = Device.model or "unknown"
+        local legacy_ffmpeg = plugin_dir .. "/bin/ffmpeg-legacy"
+        if fileExists(legacy_ffmpeg) then
+            info.legacy_ffmpeg_version = shellCapture(
+                "( '" .. legacy_ffmpeg .. "' -version 2>&1 | head -1 ); echo rc=$?", 4) or "n/a"
+        else
+            info.legacy_ffmpeg_version = "binary_not_found"
+        end
+        local legacy_espeak = plugin_dir .. "/espeak-ng-legacy/bin/espeak-ng"
+        if fileExists(legacy_espeak) then
+            info.legacy_espeak_version = shellCapture(
+                "( ESPEAK_DATA_PATH='" .. plugin_dir .. "/espeak-ng/share' '" .. legacy_espeak .. "' --version 2>&1 | head -1 ); echo rc=$?", 4) or "n/a"
+        else
+            info.legacy_espeak_version = "binary_not_found"
+        end
+        info.aplay_devices = shellCapture("aplay -l 2>&1", 3) or "n/a"
+
         -- KinAMP presence check (useful fallback diagnostic).
         info.kinamp_available = fileExists("/mnt/us/KinAMP/startkinamp_koreader.sh") and "yes" or "no"
 
@@ -1749,17 +1770,29 @@ find /usr /system /vendor /mnt /data -maxdepth 4 -name '*audio*.so*' 2>/dev/null
     -- every element is present but no ALSA card exists (issue #81).
     if info.is_kindle then
         local diag = {}
+        -- 2007-2011 speaker models: real ALSA codec, no Bluetooth.  The
+        -- mixersink/audiomgrd assertions below describe PW2+ hardware only.
+        local legacy_models = {
+            Kindle2 = true, KindleDXG = true, Kindle3 = true,
+            Kindle4 = true, KindleTouch = true, KindlePaperWhite = true,
+        }
+        local legacy = legacy_models[info.device_model or ""] or false
         local no_alsa = info.alsa_cards
             and (info.alsa_cards:find("no soundcards", 1, true)
                 or info.alsa_cards == "none"
                 or info.alsa_cards:find("not available", 1, true))
         local mixer = info.kindle_gst_plugins
             and info.kindle_gst_plugins:find("libgstmixersink", 1, true)
+        if legacy and not no_alsa then
+            table.insert(diag, "This model has a built-in speaker on a real ALSA"
+                .. " card and no Bluetooth; the legacy static ffmpeg and espeak"
+                .. " binaries are the correct audio route here.")
+        end
         if no_alsa then
             table.insert(diag, "No ALSA sound card is visible on this model;"
                 .. " every ALSA route (aplay, alsasink, dmix) cannot work.")
         end
-        if no_alsa and mixer then
+        if no_alsa and mixer and not legacy then
             table.insert(diag, "Audio can only leave the device through"
                 .. " mixersink/audiomgrd.")
         end

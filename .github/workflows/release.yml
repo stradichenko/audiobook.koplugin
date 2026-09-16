@@ -98,6 +98,23 @@ jobs:
           fi
           echo ""
 
+          echo "=== legacy binaries (2011-and-earlier Kindles) ==="
+          if [ -f "$PLUGIN_DIR/bin/ffmpeg-legacy" ] || [ -f "$PLUGIN_DIR/bin/ffmpeg-legacy.bin" ]; then
+              ls -la "$PLUGIN_DIR"/bin/ffmpeg-legacy* 2>/dev/null || true
+              echo "ffmpeg-legacy: OK"
+          else
+              echo "ERROR: bin/ffmpeg-legacy missing"
+              exit 1
+          fi
+          if [ -f "$PLUGIN_DIR/espeak-ng-legacy/bin/espeak-ng" ] || [ -f "$PLUGIN_DIR/espeak-ng-legacy/bin/espeak-ng.bin" ]; then
+              ls -la "$PLUGIN_DIR"/espeak-ng-legacy/bin/ 2>/dev/null || true
+              echo "espeak-ng-legacy: OK"
+          else
+              echo "ERROR: espeak-ng-legacy/bin/espeak-ng missing"
+              exit 1
+          fi
+          echo ""
+
           echo "=== espeak-ng binary + MBROLA ==="
           ls -la kobo-tts-bundle/audiobook.koplugin/espeak-ng/bin/
           echo ""
@@ -150,6 +167,7 @@ jobs:
             - Bundled BlueALSA (BT audio bridge for BlueZ Kobo devices)
             - Bundled kindle-gst-play (GStreamer WAV player for Cat 2 Kindles)
             - Bundled kindle-gst-play-native (KinAMP-parity fallback for audio-less PW4-class Kindles)
+            - Legacy static ffmpeg and espeak-ng for 2011-and-earlier speaker Kindles (Kindle 2/3/DXG/4/Touch/PW1)
             - Bundled wav-play (ALSA player for PocketBook and other devices without aplay)
             - Android TTS helper and MediaSession helpers (pre-built tts_helper.dex, media_session_helper.dex)
 

@@ -14,7 +14,7 @@ mechanism, failure detection, and known limitations per device generation.
 | IPC bus | D-Bus (`com.kobo.mtk.bluedroid`) | D-Bus (`org.bluez`) | LIPC (Lab126 IPC) | JNI / Binder |
 | A2DP negotiation | BlueZ profiles via MTK wrapper | BlueZ profiles | `btfd` internal | OS-managed |
 | Audio sink | `mtkbtmwrpcaudiosink` (GStreamer) | `aplay -D bluealsa` | `aplay` (if ALSA exposed) | Android `MediaPlayer` |
-| Speaker | No | No | No | Yes (usually) |
+| Speaker | No | No | No (PW2 and later); Yes on K2/K3/DXG/K4/Touch/PW1 | Yes (usually) |
 | BT pairing | Plugin UI (D-Bus) | Plugin UI (`bluetoothctl`) | Kindle Settings only | OS Settings only |
 | Failure detection | Socket early-death (<500ms) | Rapid-exit (<200ms) | Rapid-exit (<200ms) | JNI error code |
 | Plugin manages BT power | Yes (D-Bus) | Yes (`bluetoothctl`) | Yes (`lipc-set-prop`) | No |
@@ -242,7 +242,9 @@ devices.
 
 ## 4. Kindle
 
-**Confirmed device:** Kindle Basic 2022 (11th Gen) -- speakerless  
+**Confirmed device:** Kindle Basic 2022 (11th Gen) -- speakerless
+**Legacy generation:** Kindle 2/DXG/3/4/Touch/PW1 (2007-2011) -- built-in
+speaker, real ALSA, no Bluetooth (see the subsection below)
 **Also field-tested:** Kindle Paperwhite 11th gen + Apple AirPods Pro 3 (see
 [AIRPODS_PRO3_KINDLE.md](./AIRPODS_PRO3_KINDLE.md) for playback fixes, pause
 keepalive, and AVRCP stem limitations).
@@ -290,6 +292,12 @@ third-party process.
 5. Nothing found     → set _no_real_audio_output = true
 ```
 
+Steps 1-4 describe post-2012 hardware, where they correctly find nothing:
+on PW2 and later, Amazon exposes no ALSA card at all. On the 2007-2011
+speaker generation the plugin short-circuits earlier: the legacy model
+list plus one cached `aplay -l` probe select the `plughw` aplay route
+before any audiomgrd/BT logic runs (see below).
+
 If a device is found in steps 1-4:
 - **ALSA device:** `aplay -q -D {device}`
 - **PulseAudio sink:** `paplay`
@@ -306,6 +314,41 @@ plugin can only toggle BT power on/off via `lipc-set-prop`.
 -- Pairing attempt returns immediately:
 return false, "Pair through Kindle Settings"
 ```
+
+### Legacy speaker Kindles (2007-2011)
+
+Everything above describes PW2-and-later hardware. The 2007-2011 generation
+is a different world: **Kindle 2, DXG, 3, 4, Touch, and PW1** all have a
+built-in speaker (WM8962-class codec on the Touch) driven by a real ALSA
+card, and they have **no Bluetooth hardware at all**, so every BT route in
+this document is unreachable there. KOReader ships them the `kindle-legacy`
+(K2/DXG/3) or `kindle` / kindle5-toolchain (K4/Touch/PW1) flavor: soft-float
+Cortex-A8, kernel 2.6.x, glibc from that era.
+
+The regular bundled armhf binaries cannot execute on these devices: the
+static `bin/ffmpeg` is hard-float with VFPv4 fused-MAC instructions and a
+static glibc that refuses kernels below 3.2, and the bundled espeak-ng runs
+through the bundled glibc 2.42 loader. The plugin therefore carries two
+additional static musl binaries (soft-float-era compatible, no loader, no
+glibc floor, VFPv3-D16 FPU pin):
+
+- `bin/ffmpeg-legacy`: decoder subset (aac/mp3/flac/vorbis/opus/ac3/alac/wma,
+  mov/mp3/ogg/flac/asf/wav/mkv demuxers) selected first on legacy models and
+  used by the `ffmpeg-pipe` backend (`ffmpeg | aplay`). On premature decoder
+  death the completion watcher retries once with the next candidate binary.
+- `espeak-ng-legacy/bin/espeak-ng`: static espeak-ng that reuses the bundled
+  `espeak-ng/share` voice data via `ESPEAK_DATA_PATH`; the TTS route on these
+  models is the ESPEAK backend played through the device `aplay`.
+
+Detection is `Utils.isLegacyKindleModel()` (KOReader `Device.model` against
+the six-model list) plus one cached `aplay -l` probe
+(`Utils.probeKindleAlsaCard()` → `plughw:N,M`). On legacy models the plugin
+skips the BT-only gates (`_audioOutputReady`, the "no built-in speaker"
+refusals, the BT pre-flight toast) and the TTS audio player resolves to
+`aplay -q -D plughw:N,M`. A one-shot `lipc-set-prop com.lab126.audiomgrd
+setFocus 'Music'` covers fw 5.x mixer routing. Piper is refused on legacy
+models (armhf binary, and 256 MB cannot hold the model); sanoTTS selection
+is untouched.
 
 ### btfd Reverse-Engineering Diagnostics (v0.1.5.25)
 

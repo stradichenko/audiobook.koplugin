@@ -78,6 +78,51 @@ if [ -f "$SCRIPT_DIR/bin/ffmpeg" ]; then
     echo "Bundled bin/ffmpeg"
 fi
 
+# ── Legacy decoder + espeak for 2007-2011 speaker Kindles (refs #85) ──
+# The regular armhf binaries cannot run on the soft-float 2.6.x firmware
+# of the Kindle 2/3/DXG/4/Touch/PW1 generation.  These static musl builds
+# (see cross-build-*-legacy.nix) can.  Prefer the verified vendored
+# binaries; build from source only when they are missing.
+LEGACY_FFMPEG_SRC="$SCRIPT_DIR/bin/ffmpeg-legacy"
+LEGACY_ESPEAK_SRC="$SCRIPT_DIR/espeak-ng-legacy/bin/espeak-ng"
+if [ ! -f "$LEGACY_FFMPEG_SRC" ]; then
+    echo "bin/ffmpeg-legacy missing; building via nix..."
+    LEGACY_FFMPEG_OUT=$(nix-build "$SCRIPT_DIR/cross-build-ffmpeg-legacy.nix" --no-out-link 2>/dev/null || true)
+    if [ -n "$LEGACY_FFMPEG_OUT" ] && [ -f "$LEGACY_FFMPEG_OUT/bin/ffmpeg" ]; then
+        mkdir -p "$SCRIPT_DIR/bin"
+        cp "$LEGACY_FFMPEG_OUT/bin/ffmpeg" "$LEGACY_FFMPEG_SRC"
+        chmod +x "$LEGACY_FFMPEG_SRC"
+    fi
+fi
+if [ -f "$LEGACY_FFMPEG_SRC" ]; then
+    mkdir -p "$PLUGIN_DEST/bin"
+    cp "$LEGACY_FFMPEG_SRC" "$PLUGIN_DEST/bin/"
+    chmod +x "$PLUGIN_DEST/bin/ffmpeg-legacy"
+    echo "Bundled bin/ffmpeg-legacy"
+else
+    echo "WARNING: bin/ffmpeg-legacy unavailable; 2011-and-earlier Kindles keep the ffmpeg-pipe failure path"
+fi
+# NOTE: the legacy espeak-ng MUST come from the same nixpkgs pin as the
+# Kobo espeak-ng build; both read the bundled share/ voice data and the
+# data format version has to match.  Bump both pins together.
+if [ ! -f "$LEGACY_ESPEAK_SRC" ]; then
+    echo "espeak-ng-legacy missing; building via nix..."
+    LEGACY_ESPEAK_OUT=$(NIXPKGS_ALLOW_UNSUPPORTED_SYSTEM=1 nix-build "$SCRIPT_DIR/cross-build-espeak-legacy.nix" --no-out-link 2>/dev/null || true)
+    if [ -n "$LEGACY_ESPEAK_OUT" ] && [ -f "$LEGACY_ESPEAK_OUT/bin/espeak-ng" ]; then
+        mkdir -p "$SCRIPT_DIR/espeak-ng-legacy/bin"
+        cp "$LEGACY_ESPEAK_OUT/bin/espeak-ng" "$LEGACY_ESPEAK_SRC"
+        chmod +x "$LEGACY_ESPEAK_SRC"
+    fi
+fi
+if [ -f "$LEGACY_ESPEAK_SRC" ]; then
+    mkdir -p "$PLUGIN_DEST/espeak-ng-legacy/bin"
+    cp "$LEGACY_ESPEAK_SRC" "$PLUGIN_DEST/espeak-ng-legacy/bin/"
+    chmod +x "$PLUGIN_DEST/espeak-ng-legacy/bin/espeak-ng"
+    echo "Bundled espeak-ng-legacy (uses the bundled espeak-ng/share data)"
+else
+    echo "WARNING: espeak-ng-legacy unavailable; TTS on 2011-and-earlier Kindles falls back to the failure path"
+fi
+
 # Standalone bug report script (for users who cannot access the plugin menu)
 if [ -f "$SCRIPT_DIR/generate-report.sh" ]; then
     cp "$SCRIPT_DIR/generate-report.sh" "$PLUGIN_DEST/"
@@ -458,7 +503,7 @@ du -sh "$PLUGIN_DEST"
 # on first run (see ttsengine.lua detectBackend).
 echo ""
 echo "=== Renaming ELF binaries to .bin (Windows extraction workaround) ==="
-for elf in "$ESPEAK_DEST/bin/espeak-ng" "$PIPER_DEST/piper" "$PIPER_DEST/piper_phonemize" "$PIPER_DEST/espeak-ng" "$BLUEALSA_DEST/bin/bluealsa" "$PLUGIN_DEST/wav-play/wav-play" "$PLUGIN_DEST/bin/ffmpeg"; do
+for elf in "$ESPEAK_DEST/bin/espeak-ng" "$PIPER_DEST/piper" "$PIPER_DEST/piper_phonemize" "$PIPER_DEST/espeak-ng" "$BLUEALSA_DEST/bin/bluealsa" "$PLUGIN_DEST/wav-play/wav-play" "$PLUGIN_DEST/bin/ffmpeg" "$PLUGIN_DEST/bin/ffmpeg-legacy" "$PLUGIN_DEST/espeak-ng-legacy/bin/espeak-ng"; do
     if [ -f "$elf" ]; then
         mv "$elf" "${elf}.bin"
         echo "  $(basename "$elf") -> $(basename "$elf").bin"

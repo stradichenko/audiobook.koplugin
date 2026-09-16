@@ -43,6 +43,8 @@ FR_FIX: dict[str, str] = {
     "Delete from device": "Supprimer de l’appareil",
     "Open audio file...": "Ouvrir un fichier audio…",
     "Generate bug report": "Générer un rapport de bogue",
+    "No audio output available.\n\nThis Kindle model has a built-in speaker, but no working audio device was found.\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue.":
+        "Aucune sortie audio disponible.\n\nCe modèle de Kindle possède un haut-parleur intégré, mais aucun périphérique audio utilisable n’a été trouvé.\n\nVeuillez générer un rapport de bogue (Audiobook > Générer un rapport de bogue) et le partager sur le ticket GitHub.",
     "Check for updates": "Rechercher des mises à jour",
     "About / Debug info": "À propos / Infos de débogage",
     "Auto-advance pages": "Avance automatique des pages",
@@ -212,6 +214,8 @@ ES_FIX: dict[str, str] = {
     "Delete from device": "Eliminar del dispositivo",
     "Open audio file...": "Abrir archivo de audio…",
     "Generate bug report": "Generar informe de error",
+    "No audio output available.\n\nThis Kindle model has a built-in speaker, but no working audio device was found.\n\nPlease generate a bug report (Audiobook > Generate bug report) and share it on the GitHub issue.":
+        "No hay salida de audio disponible.\n\nEste modelo de Kindle tiene altavoz integrado, pero no se encontró ningún dispositivo de audio utilizable.\n\nPor favor, genera un informe de error (Audiobook > Generar informe de error) y compártelo en el issue de GitHub.",
     "Check for updates": "Buscar actualizaciones",
     "About / Debug info": "Acerca de / Información de depuración",
     "Auto-advance pages": "Avance automático de páginas",

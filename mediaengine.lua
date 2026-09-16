@@ -12,6 +12,9 @@ local logger = require("logger")
 local time = require("ui/time")
 local _ = require("audiobook_gettext")
 
+local _plugin_root = (debug.getinfo(1, "S").source or ""):match("^@(.*/)")
+local Utils = dofile(_plugin_root .. "utils.lua")
+
 local ffi = require("ffi")
 pcall(function() ffi.cdef[[ int kill(int pid, int sig); ]] end)
 pcall(function() ffi.cdef[[ int mkfifo(const char *pathname, unsigned int mode); ]] end)
@@ -394,49 +397,71 @@ function MediaEngine:_atempoFilterString(speed)
 end
 
 --[[--
-Probe for ffmpeg in the plugin's bin/ directory or PATH.
-The release zip may ship ELF binaries with a .bin extension so they survive
-Windows zip extractors; rename .bin back to the original name if needed.
-@return string|nil  absolute path to ffmpeg binary, or nil
+Probe for ffmpeg binaries in the plugin's bin/ directory or PATH, in
+preference order.  On 2007-2011 speaker Kindles the bundled armhf ffmpeg
+cannot run (soft-float userland, VFPv3 FPU, kernel 2.6.x), so the static
+musl ffmpeg-legacy binary built for those devices comes first there; on
+every other platform the list is unchanged.  The release zip may ship ELF
+binaries with a .bin extension so they survive Windows zip extractors;
+rename .bin back to the original name if needed.
+@return table  ordered list of usable ffmpeg binary paths (may be empty)
 --]]
-function MediaEngine:_findFfmpeg()
+function MediaEngine:_findFfmpegCandidates()
     -- Bundled ffmpeg is a glibc Linux binary. Spawning it on Android (Bionic)
     -- hard-crashes KOReader — never touch it on this platform.
     if Device.isAndroid and Device:isAndroid() then
-        return nil
+        return {}
     end
-    if self._plugin_dir then
-        local plugin_ffmpeg = self._plugin_dir .. "/bin/ffmpeg"
-        -- Release zip ships ffmpeg as ffmpeg.bin; rename on first use.
-        -- If both files exist (e.g. after a plugin update), replace the old
-        -- ffmpeg with the freshly shipped .bin so updates actually take effect.
-        local bin_path = plugin_ffmpeg .. ".bin"
-        local b = io.open(bin_path, "r")
-        if b then
-            b:close()
-            os.remove(plugin_ffmpeg)
-            local ok, err = os.rename(bin_path, plugin_ffmpeg)
-            if ok then
-                logger.warn("MediaEngine: renamed", bin_path, "to", plugin_ffmpeg)
-            else
-                logger.warn("MediaEngine: failed to rename", bin_path, ":", err)
-                -- Return the .bin path as a fallback so playback can still work.
-                return bin_path
+    local candidates = {}
+    local names = { "ffmpeg" }
+    if Utils.isLegacyKindleModel() then
+        -- Legacy speaker Kindles: the static soft-float-era decoder first,
+        -- the regular bundled binary kept as a fallback candidate.
+        names = { "ffmpeg-legacy", "ffmpeg" }
+    end
+    for _, name in ipairs(names) do
+        if self._plugin_dir then
+            local plugin_ffmpeg = self._plugin_dir .. "/bin/" .. name
+            -- Release zip ships binaries as <name>.bin; rename on first use.
+            -- If both files exist (e.g. after a plugin update), replace the old
+            -- binary with the freshly shipped .bin so updates actually take effect.
+            local bin_path = plugin_ffmpeg .. ".bin"
+            local b = io.open(bin_path, "r")
+            if b then
+                b:close()
+                os.remove(plugin_ffmpeg)
+                local ok, err = os.rename(bin_path, plugin_ffmpeg)
+                if ok then
+                    logger.warn("MediaEngine: renamed", bin_path, "to", plugin_ffmpeg)
+                else
+                    logger.warn("MediaEngine: failed to rename", bin_path, ":", err)
+                    -- Use the .bin path as a fallback so playback can still work.
+                    table.insert(candidates, bin_path)
+                end
             end
-        end
-        local f = io.open(plugin_ffmpeg, "r")
-        if f then
-            f:close()
-            return plugin_ffmpeg
+            local f = io.open(plugin_ffmpeg, "r")
+            if f then
+                f:close()
+                table.insert(candidates, plugin_ffmpeg)
+            end
         end
     end
     local h = io.popen("command -v ffmpeg 2>/dev/null")
     if h then
         local result = h:read("*l")
         h:close()
-        if result and result ~= "" then return result end
+        if result and result ~= "" then table.insert(candidates, result) end
     end
-    return nil
+    return candidates
+end
+
+--[[--
+First usable ffmpeg from the candidate list (see _findFfmpegCandidates).
+@return string|nil  absolute path to ffmpeg binary, or nil
+--]]
+function MediaEngine:_findFfmpeg()
+    local candidates = self:_findFfmpegCandidates()
+    return candidates[1]
 end
 
 function MediaEngine:_getTempDir()
@@ -609,10 +634,14 @@ function MediaEngine:detectBackend()
     -- 4) ffmpeg pipe -- decodes any format ffmpeg supports (m4b, aac, ogg,
     -- flac, etc.) and pipes raw WAV to aplay.  Preferred over gst-play on
     -- devices where gstreamer lacks AAC decoders (common on Kobo).
-    local ffmpeg_cmd = self:_findFfmpeg()
+    local ffmpeg_candidates = self:_findFfmpegCandidates()
+    local ffmpeg_cmd = ffmpeg_candidates[1]
     if ffmpeg_cmd then
         self.backend = self.BACKENDS.FFMPEG_PIPE
         self.backend_cmd = ffmpeg_cmd
+        -- Second candidate is the crash fallback (e.g. ffmpeg-legacy first
+        -- on legacy Kindles, with the regular bundled binary as rescue).
+        self._ffmpeg_alt_cmd = ffmpeg_candidates[2]
         if self:_hasMtkSink() then
             self._use_persistent_pipeline = true
             logger.warn("MediaEngine: selected ffmpeg-pipe backend with persistent pipeline (MTK)")
@@ -1582,7 +1611,15 @@ function MediaEngine:_playFfmpegPipe(gen)
     -- Kill any stale ffmpeg/gst-launch processes before starting.
     -- Previous crashes can leave zombie processes that hold the MTK
     -- Bluetooth socket, causing "Address already in use" errors.
-    os.execute("killall -9 ffmpeg gst-launch-1.0 2>/dev/null")
+    os.execute("killall -9 ffmpeg ffmpeg-legacy gst-launch-1.0 2>/dev/null")
+
+    -- Legacy speaker Kindles route codec output through audiomgrd's mixer on
+    -- fw 5.x; claim Music focus once per session so the mixer stays open.
+    -- Harmless no-op where the service does not exist.
+    if Utils.isLegacyKindleModel() and not self._legacy_focus_set then
+        self._legacy_focus_set = true
+        os.execute("lipc-set-prop com.lab126.audiomgrd setFocus 'Music' 2>/dev/null")
+    end
 
     -- exec=false: `exec a | b` would replace the shell with the last pipeline
     -- stage (gst-launch), losing the PID we capture.
@@ -2673,6 +2710,26 @@ function MediaEngine:_startCompletionWatcher(gen)
                     local complete_cb = self._on_complete
                     self._on_fail = nil
                     self._on_complete = nil
+                    -- ffmpeg-pipe rescue: if the primary decoder binary died
+                    -- (e.g. the wrong build for this CPU/kernel), retry once
+                    -- with the alternate binary from the candidate list
+                    -- before reporting failure.  Session-only flag.
+                    if self.backend == self.BACKENDS.FFMPEG_PIPE
+                        and self._ffmpeg_alt_cmd
+                        and not self._ffmpeg_alt_tried then
+                        self._ffmpeg_alt_tried = true
+                        local failed_cmd = self.backend_cmd
+                        self.backend_cmd = self._ffmpeg_alt_cmd
+                        self._seek_offset = math.max(0, pos)
+                        logger.warn("MediaEngine: ffmpeg", failed_cmd,
+                            "died prematurely; retrying with", self._ffmpeg_alt_cmd,
+                            "at", self._seek_offset)
+                        UIManager:scheduleIn(0.6, function()
+                            if self.play_generation ~= gen then return end
+                            self:play(complete_cb, fail_cb)
+                        end)
+                        return
+                    end
                     -- One automatic restart for Apple headsets / Kindle GST.
                     if not self._a2dp_auto_retry_done
                         and (self:_isAppleAirPodsHeadset()
