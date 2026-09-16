@@ -41,8 +41,13 @@ EOF
 tools/__pycache__/
 tools/_msgids.json
 tools/_mt_cache.json
+tools/_missing.json
 tools/*.pyc
 
+# Local working artifacts
+koreader-src/
+kindle_crash.log
+.claude/
 
 # sanoTTS build artifacts
 sanotts/out/

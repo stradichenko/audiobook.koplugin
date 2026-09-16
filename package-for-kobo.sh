@@ -207,21 +207,16 @@ if [ "$WITH_SANOTTS" = true ]; then
     fi
 
     echo "Cross-compiling snt_server (static musl, armv7hf)..."
-    SANO_OUT=$(nix shell nixpkgs#pkgsCross.armv7l-hf-multiplatform.pkgsStatic.stdenv -c bash -c '
-        cd "'"$SCRIPT_DIR"'/sanotts" || exit 1
-        export NIX_CFLAGS_COMPILE="$NIX_CFLAGS_COMPILE -O2 -std=c99 -I$PWD/mcu/include -I$PWD/mcu/src -DFSD_FAST_MATH"
-        $CC -static -o snt_server snt_server.c mcu/src/snt_tts.c mcu/src/snt_kernels_ref.c mcu/ports/host/snt_port_host.c -lm || exit 1
-        mkdir -p "$PWD/out"
-        cp snt_server "$PWD/out/"
-    ' && echo OK)
-    if echo "$SANO_OUT" | grep -q OK && [ -f "$SCRIPT_DIR/sanotts/out/snt_server" ]; then
+    SANO_OUT=$(nix-build "$SCRIPT_DIR/cross-build-snt-server.nix" --no-out-link)
+    if [ -f "$SANO_OUT/bin/snt_server" ]; then
         mkdir -p "$SANO_DEST/voice"
-        cp "$SCRIPT_DIR/sanotts/out/snt_server" "$SANO_DEST/snt_server"
+        cp "$SANO_OUT/bin/snt_server" "$SANO_DEST/snt_server"
         cp "$SCRIPT_DIR/sanotts/voice/front_q8.bin" "$SANO_DEST/voice/front_q8.bin"
         cp "$SCRIPT_DIR/sanotts/voice/model_q8.bin" "$SANO_DEST/voice/model_q8.bin"
         echo "Bundled sanoTTS engine + voice (~700 KB)"
     else
-        echo "WARNING: sanoTTS server build failed; skipping sanoTTS backend"
+        echo "ERROR: sanoTTS server build produced no binary" >&2
+        exit 1
     fi
 else
     echo "Skipping sanoTTS (--no-sanotts)"

@@ -11,7 +11,7 @@
 ![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Kobo%20%7C%20Kindle%20%7C%20PocketBook%20%7C%20Linux-blue)
 ![Android](https://img.shields.io/badge/Android-supported-brightgreen)
-![TTS](https://img.shields.io/badge/TTS-Piper%20%7C%20espeak--ng%20%7C%20Android-green)
+![TTS](https://img.shields.io/badge/TTS-Piper%20%7C%20sanoTTS%20%7C%20espeak--ng%20%7C%20Android-green)
 
 </h3>
 
@@ -69,7 +69,7 @@ Restart KOReader after copying.
 
 ### 2. Install a TTS engine (if not using the pre-built release)
 
-The pre-built release from step 1 **already includes espeak-ng and Piper** -- no extra install needed on Kobo or Kindle. Skip to step 3.
+The pre-built release from step 1 **already includes espeak-ng, sanoTTS and Piper** -- no extra install needed on Kobo or Kindle. Skip to step 3.
 
 If you cloned the repository instead:
 
@@ -106,7 +106,7 @@ The bundled espeak-ng and Piper binaries are for Linux-based e-readers and will 
 
 Piper sounds much more natural than espeak-ng. It runs fully offline on Kobo's ARM processor (~40 MB for engine + voice model). The [pre-built release](https://github.com/stradichenko/audiobook.koplugin/releases/latest) already includes Piper and a default voice (`en_US-danny-low`). For faster load times on Kobo, `low` quality voices like this one are recommended (see [Choosing a voice](#choosing-a-voice)). To build a bundle yourself, see [Building from source](#building-from-source).
 
-Switch between espeak-ng and Piper any time from **Tools > Audiobook Read-Along > Voice settings**.
+Switch between espeak-ng, sanoTTS and Piper any time from **Tools > Audiobook Read-Along > Voice settings**.
 
 ### Choosing a voice
 
@@ -148,6 +148,14 @@ curl -LO https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/ryan/
 ```
 
 Browse all available voices: [huggingface.co/rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices/tree/main)
+
+## Optional: sanoTTS lightweight neural TTS
+
+[sanoTTS](https://github.com/ampixa/sanoTTS) is a tiny neural engine that slots between Piper and espeak-ng: much more natural than espeak-ng, and far lighter than Piper. The bundled voice is about 700 KB and the engine needs roughly 5 MB of RAM, where Piper wants a ~15-60 MB voice and ~100 MB of RAM. Synthesis runs faster than real time even on single-core e-ink hardware, so sentences keep coming without the gaps Piper needs on slow devices.
+
+The pre-built release bundles sanoTTS with a default English voice. Select it from **Tools > Audiobook Read-Along > Voice settings**. The engine is punctuation-aware: text is split at `. , ? ! : ;` and short silence gaps are inserted at clause boundaries (150 ms after a comma, 350 ms after a sentence end).
+
+> The tiny voice trades some naturalness for its footprint; where Piper runs comfortably it sounds better. sanoTTS is the pick on devices where Piper is too slow or too large.
 
 ## PocketBook audio
 
@@ -235,7 +243,7 @@ audiobook.koplugin/
   main.lua             - entry point, menus, event hooks
   synccontroller.lua   - coordinates audio timing with highlights
   ttsengine.lua        - TTS synthesis, audio playback, backend detection
-  piperqueue.lua       - persistent Piper server management
+  piperqueue.lua       - persistent Piper/sanoTTS server management
   textparser.lua       - sentence/word tokenization with positions
   highlightmanager.lua - screen-coordinate highlight via crengine
   playbackbar.lua      - transport controls widget
@@ -247,6 +255,7 @@ audiobook.koplugin/
   wavutils.lua         - WAV file reading, writing, and manipulation
   androidtts.lua       - Android TTS via JNI (DexClassLoader + TtsHelper)
   utils.lua            - shared helpers
+  sanotts/             - sanoTTS int8 neural engine (C server + voice blobs)
   wav-play.c           - minimal ALSA WAV player for PocketBook (compiled to wav-play/wav-play)
 ```
 
@@ -573,14 +582,17 @@ Preview Piper-family voices (including Miro) at [piper-samples](https://rhasspy.
 
 ## Building from source
 
-The `package-for-kobo.sh` script cross-compiles espeak-ng and wav-play for ARM and bundles the plugin into a ready-to-deploy directory. It targets ARMv7 and works for both Kobo and PocketBook. It requires [Nix](https://nixos.org/download) for the cross-compilation toolchain.
+The `package-for-kobo.sh` script cross-compiles the bundled engines for ARM (espeak-ng, sanoTTS, wav-play, ffmpeg) and bundles the plugin into a ready-to-deploy directory. It targets ARMv7 and works for both Kobo and PocketBook. It requires [Nix](https://nixos.org/download) for the cross-compilation toolchain.
 
 ```bash
-# Plugin + espeak-ng only
+# Plugin + espeak-ng + sanoTTS (sanoTTS is bundled by default)
 bash package-for-kobo.sh
 
-# Plugin + espeak-ng + Piper neural TTS
+# Plugin + espeak-ng + sanoTTS + Piper neural TTS
 bash package-for-kobo.sh --with-piper
+
+# Plugin + espeak-ng only
+bash package-for-kobo.sh --no-sanotts
 
 # Use a specific Piper voice (default: en_US-danny-low)
 bash package-for-kobo.sh --piper-voice en_US-ryan-low
@@ -609,8 +621,6 @@ If you don't want to use the packaging script, you can assemble the Piper runtim
 - Integrate more TTS backends
 - Improve accessibility
 - Support whole audiobook production with hash-based verification
-- Evaluate plugin with other TTS models (e.g., KittenTTS)
-- Test and optimize for ultralow-quality/size voice models
 
 ## License
 
@@ -622,4 +632,5 @@ Copyright 2025-2026 gespitia - AGPL-3.0. See [LICENSE](LICENSE).
 | [espeak-ng](https://github.com/espeak-ng/espeak-ng) | GPL-3.0+ |
 | [Piper](https://github.com/rhasspy/piper) | MIT |
 | [Piper voices](https://huggingface.co/rhasspy/piper-voices) | MIT |
+| [sanoTTS](https://github.com/ampixa/sanoTTS) (runtime + voice blobs) | MIT |
 | glibc (bundled .so) | LGPL-2.1 |

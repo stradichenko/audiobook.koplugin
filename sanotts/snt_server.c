@@ -6,8 +6,14 @@
  * then piper's phoneme_id_map (phoneme_id_map.h) with BOS/PAD/EOS framing,
  * matching piper.phoneme_ids.phonemes_to_ids exactly.
  *
- * Usage: snt_server --model <dir> --espeak-lib <libespeak-ng.so.1>
+ * Usage: snt_server --model <dir> --espeak-bin <espeak-ng-binary>
  *                   --espeak-data <dir> [--voice en-us] [--rate 22050]
+ *                   [--loader <ld-linux>] [--loader-libdir <dir>]
+ *                   [--comma-ms N] [--period-ms N]
+ * The loader args exec the bundled armhf espeak-ng through the bundled
+ * glibc loader on stock Kobo rootfs; the gap args size the silence
+ * inserted after comma/period clauses (defaults 150/350 ms; colon 220,
+ * semicolon 250).
  * Sources: sanoTTS mcu core (MIT), server written for the audiobook.koplugin spike. */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -85,6 +91,8 @@ static int utf8_len(unsigned char b) {
 }
 
 static const char *g_espeak_bin, *g_espeak_data, *g_voice = "en-us";
+static const char *g_loader, *g_libdir;
+static int g_comma_ms = 150, g_period_ms = 350, g_colon_ms = 220, g_semi_ms = 250;
 
 /* Run the bundled espeak-ng binary on a sentence, return its IPA output
  * (malloc'd). The binary reads stdin when no text argument is given. */
@@ -99,7 +107,16 @@ static char *phonemize_via_binary(const char *espeak_bin, const char *espeak_dat
         close(in_pipe[0]); close(in_pipe[1]);
         close(out_pipe[0]); close(out_pipe[1]);
         setenv("ESPEAK_DATA_PATH", espeak_data, 1);
-        execl(espeak_bin, espeak_bin, "-q", "--ipa", "-v", voice, (char *)NULL);
+        if (g_loader) {
+            char lp[1024], dirbuf[512];
+            snprintf(lp, sizeof lp, "%s:%s:/usr/lib:/lib", g_libdir ? g_libdir : "/usr/lib:/lib", g_libdir ? g_libdir : "");
+            snprintf(dirbuf, sizeof dirbuf, "%s", g_libdir ? g_libdir : "");
+            if (g_libdir && g_libdir[0])
+                setenv("LD_LIBRARY_PATH", g_libdir, 1);
+            execl(g_loader, g_loader, "--library-path", g_libdir ? g_libdir : "", espeak_bin, "-q", "--ipa", "-v", voice, (char *)NULL);
+        } else {
+            execl(espeak_bin, espeak_bin, "-q", "--ipa", "-v", voice, (char *)NULL);
+        }
         _exit(127);
     }
     close(in_pipe[0]); close(out_pipe[1]);
@@ -193,6 +210,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--espeak-bin")) g_espeak_bin = argv[i + 1];
         else if (!strcmp(argv[i], "--espeak-data")) g_espeak_data = argv[i + 1];
         else if (!strcmp(argv[i], "--voice")) g_voice = argv[i + 1];
+        else if (!strcmp(argv[i], "--loader")) g_loader = argv[i + 1];
+        else if (!strcmp(argv[i], "--loader-libdir")) g_libdir = argv[i + 1];
+        else if (!strcmp(argv[i], "--comma-ms")) g_comma_ms = atoi(argv[i + 1]);
+        else if (!strcmp(argv[i], "--period-ms")) g_period_ms = atoi(argv[i + 1]);
         else if (!strcmp(argv[i], "--rate")) rate = atoi(argv[i + 1]);
     }
     if (!model || !g_espeak_bin || !g_espeak_data) {
@@ -215,9 +236,44 @@ int main(int argc, char **argv) {
             fflush(stderr);
             continue;
         }
-        int n_ids = text_to_ids(input, ids);
-        if (n_ids <= 3) {
-            fprintf(stderr, "{\"error\": \"no phonemes\"}\n");
+
+        /* split into clauses at punctuation; each clause is phonemized and
+         * synthesized separately, with a silence gap after it sized by the
+         * punctuation that ended it. */
+        char clauses[64][4096];
+        int clause_ms[64];
+        int n_clauses = 0;
+        {
+            char cur[4096]; int cur_n = 0;
+            const char *p = input;
+            while (*p && n_clauses < 64) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '.' || c == ',' || c == '?' || c == '!' || c == ':' || c == ';') {
+                    if (cur_n > 0) {
+                        cur[cur_n] = 0;
+                        memcpy(clauses[n_clauses], cur, (size_t)cur_n + 1);
+                        clause_ms[n_clauses] =
+                            c == ',' ? g_comma_ms :
+                            c == ':' ? g_colon_ms :
+                            c == ';' ? g_semi_ms : g_period_ms;
+                        n_clauses++;
+                        cur_n = 0;
+                    }
+                    p++;
+                    continue;
+                }
+                if (cur_n < 4090) cur[cur_n++] = (char)c;
+                p++;
+            }
+            if (cur_n > 0 && n_clauses < 64) {
+                cur[cur_n] = 0;
+                memcpy(clauses[n_clauses], cur, (size_t)cur_n + 1);
+                clause_ms[n_clauses] = 0; /* final clause: plugin adds its own gap */
+                n_clauses++;
+            }
+        }
+        if (n_clauses == 0) {
+            fprintf(stderr, "{\"error\": \"empty input\"}\n");
             fflush(stderr);
             continue;
         }
@@ -227,9 +283,22 @@ int main(int argc, char **argv) {
         write_header(fh, 0, (uint32_t)rate);
         sink.fh = fh; sink.n = 0;
 
-        snt_config cfg = {front, dec, arena, sizeof arena, NULL};
-        snt_stats st;
-        int rc = snt_synthesize(&cfg, ids, n_ids, wav_cb, &sink, &st);
+        long total_ms = 0;
+        int rc_all = 0;
+        for (int ci = 0; ci < n_clauses; ci++) {
+            int n_ids = text_to_ids(clauses[ci], ids);
+            if (n_ids <= 3) continue;
+            snt_config cfg = {front, dec, arena, sizeof arena, NULL};
+            snt_stats st;
+            int rc = snt_synthesize(&cfg, ids, n_ids, wav_cb, &sink, &st);
+            if (rc != 0) { rc_all = rc; break; }
+            if (ci < n_clauses - 1 && clause_ms[ci] > 0) {
+                int gap = rate * clause_ms[ci] / 1000;
+                static const int16_t zero;
+                for (int s = 0; s < gap; s++) fwrite(&zero, 2, 1, fh);
+                sink.n += gap;
+            }
+        }
 
         long data_bytes = sink.n * 2;
         fseek(fh, 0, SEEK_SET);
@@ -238,7 +307,8 @@ int main(int argc, char **argv) {
 
         printf("%s\n", output);
         fflush(stdout);
-        if (rc != 0) { fprintf(stderr, "{\"error\": \"synth rc %d\"}\n", rc); fflush(stderr); }
+        if (rc_all != 0) { fprintf(stderr, "{\"error\": \"synth rc %d\"}\n", rc_all); fflush(stderr); }
+        (void)total_ms;
     }
     return 0;
 }

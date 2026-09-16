@@ -41,7 +41,13 @@ automatically against the pinned upstream snapshot.)
 
 ## Runtime tuning
 
-- `--pause-boost N` — repeat punctuation tokens N times in the phoneme
-  stream so the model renders longer pauses at `. , ? ! : ;`
-  (N=1 off, 2-3 recommended). The pause ids come from the voice's
-  duration config (`pause_token_ids`).
+- `--comma-ms N`, `--period-ms N` size the silence inserted after clauses
+  ending in `,` (default 150) and in `. ? !` (default 350). The input text is
+  split at `. , ? ! : ;` and each clause is synthesized separately with a
+  gap after it (colon 220 ms, semicolon 250 ms); the plugin adds its own
+  gap after the final clause.
+- `--voice en-us`, `--rate 22050` choose the espeak-ng voice for
+  phonemization and the output sample rate.
+- `--loader <ld-linux>`, `--loader-libdir <dir>` exec the bundled armhf
+  espeak-ng through the bundled glibc loader on stock Kobo rootfs (set
+  automatically by piperqueue).
