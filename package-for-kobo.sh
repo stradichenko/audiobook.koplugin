@@ -254,11 +254,15 @@ if [ "$WITH_SANOTTS" = true ]; then
     echo "Cross-compiling snt_server (static musl, armv7hf)..."
     SANO_OUT=$(nix-build "$SCRIPT_DIR/cross-build-snt-server.nix" --no-out-link)
     if [ -f "$SANO_OUT/bin/snt_server" ]; then
-        mkdir -p "$SANO_DEST/voice"
+        mkdir -p "$SANO_DEST/voice" "$SANO_DEST/voice-amy"
         cp "$SANO_OUT/bin/snt_server" "$SANO_DEST/snt_server"
         cp "$SCRIPT_DIR/sanotts/voice/front_q8.bin" "$SANO_DEST/voice/front_q8.bin"
         cp "$SCRIPT_DIR/sanotts/voice/model_q8.bin" "$SANO_DEST/voice/model_q8.bin"
-        echo "Bundled sanoTTS engine + voice (~700 KB)"
+        cp "$SCRIPT_DIR/sanotts/voice-amy/front_meta_q8.bin" "$SANO_DEST/voice-amy/front_meta_q8.bin"
+        cp "$SCRIPT_DIR/sanotts/voice-amy/front_weights_q8.bin" "$SANO_DEST/voice-amy/front_weights_q8.bin"
+        cp "$SCRIPT_DIR/sanotts/voice-amy/meta_q8.bin" "$SANO_DEST/voice-amy/meta_q8.bin"
+        cp "$SCRIPT_DIR/sanotts/voice-amy/weights_q8.bin" "$SANO_DEST/voice-amy/weights_q8.bin"
+        echo "Bundled sanoTTS engine + voices (kristin 700 KB + amy 1.5 MB)"
     else
         echo "ERROR: sanoTTS server build produced no binary" >&2
         exit 1

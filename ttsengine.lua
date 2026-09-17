@@ -126,6 +126,10 @@ function TTSEngine:new(o)
     -- Piper TTS state
     o.piper_model = o.piper_model or nil  -- path or name of .onnx voice model
     o.piper_speaker = o.piper_speaker or 0  -- speaker id for multi-speaker models
+    -- sanoTTS state: the voice name persists ("amy" | "kristin"); the dirs
+    -- are filled in by detectBackend from whatever blobs shipped.
+    o.sanotts_voice_name = o.sanotts_voice_name or nil
+    o.sanotts_voices = o.sanotts_voices or nil
     -- Prefetch state: holds pre-synthesized audio for the next sentence
     o._prefetch_file = nil
     o._prefetch_timing = nil
@@ -332,18 +336,41 @@ function TTSEngine:detectBackend()
         local sanotts_server = sanotts_dir .. "/snt_server"
         local found_sanotts = false
         if ensureBinary(sanotts_server) then
-            local vfront = io.open(sanotts_dir .. "/voice/front_q8.bin", "r")
-            local vmodel = io.open(sanotts_dir .. "/voice/model_q8.bin", "r")
-            if vfront and vmodel then
-                vfront:close()
-                vmodel:close()
+            -- Voice inventory: amy (piperlite int8, ~1.5 MB across four
+            -- blob files, the quality voice) and kristin (R7 int8, ~700 KB,
+            -- the light voice).  Either alone is enough to offer the
+            -- backend; the active one is the persisted setting when its
+            -- blobs exist, else amy, else kristin.
+            self.sanotts_voices = {}
+            local af = io.open(sanotts_dir .. "/voice-amy/front_meta_q8.bin", "r")
+            local aw = io.open(sanotts_dir .. "/voice-amy/front_weights_q8.bin", "r")
+            local dm = io.open(sanotts_dir .. "/voice-amy/meta_q8.bin", "r")
+            local dw = io.open(sanotts_dir .. "/voice-amy/weights_q8.bin", "r")
+            if af and aw and dm and dw then
+                af:close(); aw:close(); dm:close(); dw:close()
+                self.sanotts_voices.amy = sanotts_dir .. "/voice-amy"
+            end
+            local kf = io.open(sanotts_dir .. "/voice/front_q8.bin", "r")
+            local km = io.open(sanotts_dir .. "/voice/model_q8.bin", "r")
+            if kf and km then
+                kf:close(); km:close()
+                self.sanotts_voices.kristin = sanotts_dir .. "/voice"
+            end
+            local voice_name = self.sanotts_voice_name or "amy"
+            if not self.sanotts_voices[voice_name] then
+                voice_name = self.sanotts_voices.amy and "amy"
+                    or (self.sanotts_voices.kristin and "kristin" or nil)
+            end
+            if voice_name then
                 found_sanotts = true
                 self.sanotts_dir = sanotts_dir
                 self.sanotts_server = sanotts_server
-                self.sanotts_voice_dir = sanotts_dir .. "/voice"
-                logger.dbg("TTSEngine: Found bundled sanoTTS at", sanotts_server)
+                self.sanotts_voice_name = voice_name
+                self.sanotts_voice_dir = self.sanotts_voices[voice_name]
+                logger.dbg("TTSEngine: Found bundled sanoTTS at", sanotts_server,
+                    "voice:", voice_name)
             else
-                logger.warn("TTSEngine: sanoTTS voice files missing under", sanotts_dir .. "/voice")
+                logger.warn("TTSEngine: no sanoTTS voice blobs under", sanotts_dir)
             end
         else
             logger.warn("TTSEngine: bundled sanoTTS not found at", sanotts_server)
@@ -6926,6 +6953,36 @@ end
 
 function TTSEngine:setPiperModel(model) self._piper:setModel(model) end
 function TTSEngine:setPiperSpeaker(id)  self._piper:setSpeaker(id) end
+
+--- Voices bundled under sanotts/ that actually have their blobs present.
+-- @return table ordered { {name, label, dir} , ... }, amy first
+function TTSEngine:listSanottsVoices()
+    local out = {}
+    local v = self.sanotts_voices or {}
+    if v.amy then
+        table.insert(out, { name = "amy", label = "amy (quality, 1.5 MB)", dir = v.amy })
+    end
+    if v.kristin then
+        table.insert(out, { name = "kristin", label = "kristin (light, 0.7 MB)", dir = v.kristin })
+    end
+    return out
+end
+
+--- Switch the active sanoTTS voice and drop any running server so the next
+-- utterance starts a fresh one with the new --model/--engine flags.
+function TTSEngine:setSanottsVoice(name)
+    if not (self.sanotts_voices and self.sanotts_voices[name]) then
+        logger.warn("TTSEngine: sanoTTS voice not available:", name)
+        return
+    end
+    local old = self.sanotts_voice_name
+    self.sanotts_voice_name = name
+    self.sanotts_voice_dir = self.sanotts_voices[name]
+    logger.dbg("TTSEngine: sanoTTS voice set to", name)
+    if old and old ~= name and self._piper then
+        self._piper:stopServers()
+    end
+end
 
 --[[--
 Switch the active TTS backend.

@@ -382,6 +382,16 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 end
             end,
         })
+    elseif plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.SANOTTS then
+        table.insert(menu, {
+            text_func = function()
+                local name = plugin.tts_engine.sanotts_voice_name or "amy"
+                return T(_("sanoTTS voice: %1"), name)
+            end,
+            sub_item_table_func = function()
+                return MenuBuilder.buildSanottsVoiceMenu(plugin)
+            end,
+        })
     elseif plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ESPEAK
         or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PICO
         or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.FLITE
@@ -1000,6 +1010,39 @@ function MenuBuilder.buildPiperVoiceMenu(plugin)
         })
     end
 
+    return menu
+end
+
+--[[
+Build sanoTTS voice selection menu.
+Lists the bundled voices whose blobs actually shipped (amy: piperlite int8
+quality voice; kristin: R7 int8 light voice).  Switching drops the running
+server so the next utterance starts with the new flags.
+--]]
+function MenuBuilder.buildSanottsVoiceMenu(plugin)
+    local menu = {}
+    local voices = plugin.tts_engine:listSanottsVoices()
+
+    if #voices == 0 then
+        table.insert(menu, {
+            text = _("No sanoTTS voices found"),
+            enabled = false,
+        })
+        return menu
+    end
+
+    for _, voice in ipairs(voices) do
+        table.insert(menu, {
+            text = voice.label,
+            checked_func = function()
+                return (plugin.tts_engine.sanotts_voice_name or "amy") == voice.name
+            end,
+            callback = function()
+                plugin.tts_engine:setSanottsVoice(voice.name)
+                plugin:setSetting("sanotts_voice", voice.name)
+            end,
+        })
+    end
     return menu
 end
 

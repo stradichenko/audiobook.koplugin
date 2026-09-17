@@ -151,11 +151,16 @@ Browse all available voices: [huggingface.co/rhasspy/piper-voices](https://huggi
 
 ## Optional: sanoTTS lightweight neural TTS
 
-[sanoTTS](https://github.com/ampixa/sanoTTS) is a tiny neural engine that slots between Piper and espeak-ng: much more natural than espeak-ng, and far lighter than Piper. The bundled voice is about 700 KB and the engine needs roughly 5 MB of RAM, where Piper wants a ~15-60 MB voice and ~100 MB of RAM. Synthesis runs faster than real time even on single-core e-ink hardware, so sentences keep coming without the gaps Piper needs on slow devices.
+[sanoTTS](https://github.com/ampixa/sanoTTS) is a tiny neural engine that slots between Piper and espeak-ng: much more natural than espeak-ng, and far lighter than Piper. The bundled voices are fully int8, roughly 5 MB of RAM, where Piper wants a ~15-60 MB voice and ~100 MB of RAM. Synthesis runs faster than real time even on single-core e-ink hardware, so sentences keep coming without the gaps Piper needs on slow devices.
 
-The pre-built release bundles sanoTTS with a default English voice. Select it from **Tools > Audiobook Read-Along > Voice settings**. The engine is punctuation-aware: text is split at `. , ? ! : ;` and short silence gaps are inserted at clause boundaries (150 ms after a comma, 350 ms after a sentence end).
+The pre-built release bundles two English voices, switchable from **Tools > Audiobook Read-Along > Voice settings > sanoTTS voice**:
 
-> The tiny voice trades some naturalness for its footprint; where Piper runs comfortably it sounds better. sanoTTS is the pick on devices where Piper is too slow or too large.
+- **amy** (default, ~1.5 MB): the fully-int8 piperlite stack, the most natural-sounding of the small voices.
+- **kristin** (light, ~700 KB): the original R7 voice, for the tightest storage and RAM budgets.
+
+The engine is punctuation-aware in two layers: the punctuation mark's own phoneme token is kept in the stream so questions get their rising contour and periods their falling one, and short silence gaps are inserted at clause boundaries (150 ms after a comma, 350 ms after a sentence end).
+
+> sanoTTS trades some naturalness for its footprint; where Piper runs comfortably it sounds better. sanoTTS is the pick on devices where Piper is too slow or too large.
 
 ## PocketBook audio
 

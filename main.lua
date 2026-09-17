@@ -340,6 +340,11 @@ function Audiobook:_initSubmodules()
                 self.tts_engine:setPiperModel(piper_model)
             end
             self.tts_engine:setPiperSpeaker(self:getSetting("piper_speaker", 0))
+            -- sanoTTS voice (amy default); applied only when the blobs exist
+            local sano_voice = self:getSetting("sanotts_voice", "amy")
+            if sano_voice then
+                self.tts_engine:setSanottsVoice(sano_voice)
+            end
             self.tts_engine._gap_test_mode = self:getSetting("gap_test_mode", false)
             -- Aggressive long-sentence splitting for Piper (setting + session
             -- auto-degrade).  Evaluated lazily at every parse() call.
