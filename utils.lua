@@ -182,7 +182,13 @@ function Utils.tokenizeForAlign(s)
                 b = b2
                 pos = b2 + 1
             end
-        elseif raw:find("'", 1, true) and #raw <= 4 then
+        -- Elision markers ("L'", "d'", "qu'") always end WITH the
+        -- apostrophe as the last character. The old check
+        -- (raw:find("'") and #raw <= 4) also matched ordinary short
+        -- contractions ("it's", "I'm", "he's", "I'll") — merging them
+        -- with the next word and inflating the compared word count,
+        -- causing highlight overshoot past the sentence end.    
+        elseif raw:sub(-1) == "'" then
             local a2, b2 = s:find("%S+", pos)
             if a2 then
                 raw = raw .. s:sub(a2, b2)

@@ -377,14 +377,20 @@ end
 -- CRe's `#id` xpointer is the element start; a collapsed xp0==xp1 only
 -- selects a stub word, which then fell through to fuzzy page matching.
 function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
-    local xp0 = self:_resolveFragmentXPointer(doc, fragment_id)
+    local xp0 = self:_resolveFragmentXPointer(doc, fragment_id, sentence and sentence.text_doc)
     if not xp0 then return nil end
 
+    -- Prefer the trusted SMIL sentence text over CRe's own text-at-xpointer
+    -- stub. The stub only returns the first word/node at a collapsed
+    -- xpointer, which silently produces a too-short `want` target for ANY
+    -- sentence where the stub differs from the real text — not just
+    -- one-word ("I") sentences, though those are the most visible case.
     local node_text = ""
-    pcall(function() node_text = doc:getTextFromXPointer(xp0) or "" end)
-    node_text = Utils.normalizeForMatching(node_text)
-    if node_text == "" and sentence and sentence.text then
+    if sentence and sentence.text and sentence.text ~= "" then
         node_text = Utils.normalizeForMatching(sentence.text)
+    else
+        pcall(function() node_text = doc:getTextFromXPointer(xp0) or "" end)
+        node_text = Utils.normalizeForMatching(node_text)
     end
     local want = foldedWords(node_text)
 
@@ -416,7 +422,13 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
         local drawn = ""
         pcall(function() drawn = doc:getTextFromXPointers(xp0, xp_limit) or "" end)
         drawn = Utils.normalizeForMatching(drawn)
-        if drawnBelongsToNode(drawn, node_text) then
+        local dw = foldedWords(drawn)
+        -- Only trust xp_limit on an EXACT word-count match. A partial
+        -- prefix match just means xp_limit undershot (or overshot) —
+        -- accepting it produced wrong boundaries on ordinary sentences,
+        -- not just edge cases. Fall through to the precise word-by-word
+        -- growing loop below instead.
+        if #dw == #want and drawnBelongsToNode(drawn, node_text) then
             return xp0, xp_limit, node_text
         end
     end
@@ -440,12 +452,16 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
             local dw = foldedWords(drawn)
             if #dw > #want then break end
             local n = math.min(#dw, #want)
-            local prefix_ok = n > 0
-            for i = 1, n do
-                if dw[i] ~= want[i] then
-                    prefix_ok = false
-                    break
-                end
+            local prefix_ok = false
+            if n > 0 then
+                -- Compare joined text, not word-by-word: CRe's word-boundary stops
+                -- don't always align 1:1 with tokenizeForAlign's merged tokens
+                -- (dropped-cap names, contractions) — a shorter dw[i] that is a
+                -- genuine prefix of want[i] should not fail immediately, since the
+                -- next CRe word-step may complete it.
+                local dw_joined = table.concat(dw, "", 1, n)
+                local want_joined = table.concat(want, "", 1, n)
+                prefix_ok = dw_joined == want_joined:sub(1, #dw_joined)
             end
             if not prefix_ok then break end
             xp1 = nxt
