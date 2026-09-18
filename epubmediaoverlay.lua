@@ -435,9 +435,20 @@ function EpubMediaOverlay:_extractSentenceTexts(epub_path, html_zip_path)
             if s > i and #stack > 0 then
                 table.insert(stack[#stack].parts, html:sub(i, s - 1))
             end
-            local id = attrs and attrs:match('id%s*=%s*"([^"]+)"')
-            table.insert(stack, { id = id, parts = {} })
-            i = e + 1
+            -- Self-closing spans (e.g. <span epub:type="pagebreak" id="pgN"/>,
+            -- anchor targets <span id="..."/>) have no matching </span>.
+            -- Without this check they get pushed as an opening tag, and the
+            -- NEXT real </span> — belonging to the actual enclosing sentence
+            -- — gets consumed closing this phantom frame instead, corrupting
+            -- or losing that sentence's text. Same idiom already used by
+            -- _extractSentencePaths below (attrs ending in "/").
+            if attrs and attrs:match("/%s*$") then
+                i = e + 1
+            else
+                local id = attrs and attrs:match('id%s*=%s*"([^"]+)"')
+                table.insert(stack, { id = id, parts = {} })
+                i = e + 1
+            end
         elseif cs then
             if cs > i and #stack > 0 then
                 table.insert(stack[#stack].parts, html:sub(i, cs - 1))
