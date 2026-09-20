@@ -378,18 +378,6 @@ function MediaSync:_fragmentInDocument(fragment_id)
     return ok and in_doc
 end
 
--- Check whether a fragment id is resolvable in the currently loaded content
--- document.
-function MediaSync:_fragmentInDocument(fragment_id)
-    local ui = self.plugin and self.plugin.ui
-    if not ui or not ui.document or not fragment_id then return false end
-    local xp = "#" .. fragment_id
-    local ok, in_doc = pcall(function()
-        return ui.document:isXPointerInDocument(xp)
-    end)
-    return ok and in_doc
-end
-
 -- Try to jump to the content document that contains a SMIL fragment by using
 -- the EPUB table of contents.  The SMIL parser already loaded a mapping from
 -- content-document basename to chapter title; we match that title against the
