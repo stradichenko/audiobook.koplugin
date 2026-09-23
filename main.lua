@@ -4570,6 +4570,11 @@ function Audiobook:deletePluginSettings()
     if self.media_engine then
         self.media_engine._playback_speed = 1.0
     end
+    if self.tts_engine then
+        if self.tts_engine.setRate then self.tts_engine:setRate(1.0) end
+        if self.tts_engine.setPitch then self.tts_engine:setPitch(50) end
+        if self.tts_engine.setVolume then self.tts_engine:setVolume(1.0) end
+    end
     self.current_pitch = 1.0
     self.current_volume = 1.0
     self.tts_engine_type = "espeak"
