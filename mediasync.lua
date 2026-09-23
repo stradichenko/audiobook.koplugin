@@ -137,6 +137,14 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
         sentence_text = self:_lookupSentenceText(text_doc, fragment_id)
     end
 
+    -- A raw text_ref can end up as the sentence's "text" when extraction
+    -- found nothing for its id. It is not prose: findText can never match
+    -- it, so searching only burns passes before the caller's page-advance
+    -- fallback turns the page early. Treat it as no text at all.
+    if self:_isRawTextRef(sentence_text) then
+        sentence_text = nil
+    end
+
     local function scroll_to_fragment(target_xp)
         target_xp = target_xp or xp
         if not ui.rolling then return false end
@@ -357,6 +365,14 @@ function MediaSync:_lookupSentenceText(text_doc, fragment_id)
         end
     end
     return nil
+end
+
+--- True when s looks like a raw SMIL text_ref ("Text/part0020.xhtml#s36")
+--- rather than sentence prose: a single token with a file extension and an
+--- #id suffix.
+function MediaSync:_isRawTextRef(s)
+    if not s then return false end
+    return s:match("^%s*%S+%.%w+#[%w%-%._]*%s*$") ~= nil
 end
 
 -- Normalize sentence text before handing it to crengine's findText.  The
