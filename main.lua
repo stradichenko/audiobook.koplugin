@@ -4567,6 +4567,9 @@ function Audiobook:deletePluginSettings()
     G_reader_settings:delSetting("audiobook_settings")
     -- Reset in-memory state to defaults
     self.current_speed = 1.0
+    if self.media_engine then
+        self.media_engine._playback_speed = 1.0
+    end
     self.current_pitch = 1.0
     self.current_volume = 1.0
     self.tts_engine_type = "espeak"

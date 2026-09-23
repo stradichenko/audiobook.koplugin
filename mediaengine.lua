@@ -80,6 +80,12 @@ function MediaEngine:new(o)
     -- filter in the decode pipeline, so it works without depending on
     -- Amazon's (model-specific) LIPC volume property.  1.0 = unchanged.
     o._volume = 1.0
+    -- Restore last-used playback speed (persisted in setSpeed() through the
+    -- plugin's settings, so it survives restarts and applies to the next
+    -- book).
+    o._playback_speed = tonumber(o.plugin
+        and o.plugin.getSetting
+        and o.plugin:getSetting("playback_speed", 1.0)) or 1.0
     return o
 end
 
@@ -3582,6 +3588,14 @@ function MediaEngine:setSpeed(speed)
     if speed > 3.0 then speed = 3.0 end
     local old_speed = self._playback_speed or 1.0
     self._playback_speed = speed
+
+    -- Persist so it survives restarts and applies to the next book.  The
+    -- threshold skips no-op calls (re-applying the same speed after seek)
+    -- so they never hit disk.
+    if self.plugin and self.plugin.setSetting
+            and math.abs(speed - old_speed) >= 0.01 then
+        self.plugin:setSetting("playback_speed", speed)
+    end
 
     if self.backend == self.BACKENDS.ANDROID then
         -- MediaPlayer applies the rate live via PlaybackParams (also stored
