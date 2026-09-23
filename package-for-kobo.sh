@@ -237,7 +237,7 @@ echo ""
 echo "=== Bundling sanoTTS engine ==="
 if [ "$WITH_SANOTTS" = true ]; then
     SANO_DEST="$PLUGIN_DEST/sanotts"
-    SANO_COMMIT="d2fffbd0890af9ff7bb021f2ccda3b3f2560028a"
+    SANO_COMMIT="b2c226d7ee983d1a2ba3bbfcbcbffbc10f584afa"
     SANO_TAR_URL="https://github.com/ampixa/sanoTTS/archive/${SANO_COMMIT}.tar.gz"
 
     # Build the static armv7hf server with the pinned sanoTTS mcu core.
