@@ -120,6 +120,16 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
     if not fragment_id then return false end
 
     local xp = "#" .. fragment_id
+    -- crengine namespaces ids from merged content documents as
+    -- "_doc_fragment_<n>_ <original-id>" — resolving with the raw id
+    -- below (fragment_in_document/cache_current_xpointer/scroll_to_fragment
+    -- all use `xp`) almost never succeeds. Override to the correct form
+    -- when we can compute it; fall back to the raw id otherwise.
+    local hm = self.highlight_manager
+    local crengine_id = hm and hm:_toCrengineId(fragment_id, text_doc)
+    if crengine_id then
+        xp = "#" .. crengine_id
+    end
     local raw_xp = (text_doc and text_doc ~= "" and text_doc .. "#" .. fragment_id) or xp
     local cache_key = text_doc and text_doc ~= "" and raw_xp or xp
 
@@ -357,27 +367,22 @@ function MediaSync:_normalizeSearchText(text)
 end
 
 -- Check whether a fragment id is resolvable in the currently loaded content
--- document.
-function MediaSync:_fragmentInDocument(fragment_id)
+-- document.  When text_doc is given, probe crengine's namespaced id first
+-- (ids from merged content documents carry a "_doc_fragment_<n>_ " prefix)
+-- and fall back to the raw id.
+function MediaSync:_fragmentInDocument(fragment_id, text_doc)
     local ui = self.plugin and self.plugin.ui
     if not ui or not ui.document or not fragment_id then return false end
-    local xp = "#" .. fragment_id
-    local ok, in_doc = pcall(function()
-        return ui.document:isXPointerInDocument(xp)
-    end)
-    return ok and in_doc
-end
-
--- Check whether a fragment id is resolvable in the currently loaded content
--- document.
-function MediaSync:_fragmentInDocument(fragment_id)
-    local ui = self.plugin and self.plugin.ui
-    if not ui or not ui.document or not fragment_id then return false end
-    local xp = "#" .. fragment_id
-    local ok, in_doc = pcall(function()
-        return ui.document:isXPointerInDocument(xp)
-    end)
-    return ok and in_doc
+    local hm = self.highlight_manager
+    local crengine_id = hm and hm:_toCrengineId(fragment_id, text_doc)
+    local ids = crengine_id and { crengine_id, fragment_id } or { fragment_id }
+    for _, id in ipairs(ids) do
+        local ok, in_doc = pcall(function()
+            return ui.document:isXPointerInDocument("#" .. id)
+        end)
+        if ok and in_doc then return true end
+    end
+    return false
 end
 
 -- Try to jump to the content document that contains a SMIL fragment by using
@@ -426,7 +431,7 @@ function MediaSync:_gotoViaToc(text_doc, fragment_id, start_page)
                 local page = entry.page
                 if page and page > 0 then
                     local ok = pcall(function() ui.document:gotoPage(page, true) end)
-                    if ok and self:_fragmentInDocument(fragment_id) then
+                    if ok and self:_fragmentInDocument(fragment_id, text_doc) then
                         logger.warn("MediaSync: TOC page jump succeeded for", fragment_id)
                         return true
                     end
@@ -434,7 +439,7 @@ function MediaSync:_gotoViaToc(text_doc, fragment_id, start_page)
                 local xp = entry.xpointer
                 if xp then
                     local ok = pcall(function() ui.document:gotoXPointer(xp) end)
-                    if ok and self:_fragmentInDocument(fragment_id) then
+                    if ok and self:_fragmentInDocument(fragment_id, text_doc) then
                         logger.warn("MediaSync: TOC xpointer jump succeeded for", fragment_id)
                         return true
                     end
@@ -455,6 +460,13 @@ function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_p
     local ui = self.plugin and self.plugin.ui
     if not ui or not ui.document or not docfrag_n or not fragment_id then return false end
     local doc = ui.document
+    -- crengine namespaces every id from a merged content document as
+    -- "_doc_fragment_<0-based-index>_ <original-id>" (literal space).
+    -- Probing with the raw fragment_id almost never resolves; use the
+    -- namespaced id when we can compute it, falling back to the raw id
+    -- so this degrades gracefully rather than breaking outright.
+    local hm = self.highlight_manager
+    local crengine_id = (hm and hm:_toCrengineId(fragment_id, text_doc)) or fragment_id
     -- Direct-child tag[@id] misses Storyteller spans nested in <h1>/<p>
     -- (Word-exported AlexandriZ HTML). Nested paths first.
     local nested = {
@@ -465,13 +477,13 @@ function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_p
     local bodies = {"body", "body.0"}
     local probes = {}
     for _, body in ipairs(bodies) do
-        table.insert(probes, string.format("/body/DocFragment[%d]/%s/id('%s')", docfrag_n, body, fragment_id))
+        table.insert(probes, string.format("/body/DocFragment[%d]/%s/id('%s')", docfrag_n, body, crengine_id))
         for _, path in ipairs(nested) do
             table.insert(probes, string.format("/body/DocFragment[%d]/%s/%s[@id='%s']",
-                docfrag_n, body, path, fragment_id))
+                docfrag_n, body, path, crengine_id))
         end
         for _, tag in ipairs(tags) do
-            table.insert(probes, string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", docfrag_n, body, tag, fragment_id))
+            table.insert(probes, string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", docfrag_n, body, tag, crengine_id))
         end
     end
     for _, probe in ipairs(probes) do
@@ -487,7 +499,7 @@ function MediaSync:_tryGotoDocFragment(text_doc, fragment_id, docfrag_n, start_p
                 "ok=", tostring(ok_goto),
                 "page_before=", before_page, "page_after=", after_page)
             if ok_goto and after_page then
-                if self:_fragmentInDocument(fragment_id) then
+                if self:_fragmentInDocument(fragment_id, text_doc) then
                     return true, norm
                 end
                 if after_page ~= before_page then
@@ -554,13 +566,18 @@ function MediaSync:_findPageByDocFragmentScan(text_doc, fragment_id)
     local spine = parser and parser._spine_hrefs or {}
     local max_n = math.max(#spine + 20, 100)
 
+    -- Same crengine-namespacing as _tryGotoDocFragment: raw ids almost
+    -- never resolve against the merged DOM.
+    local hm = self.highlight_manager
+    local crengine_id = (hm and hm:_toCrengineId(fragment_id, text_doc)) or fragment_id
+
     local tags = {"span", "p", "div", "h1", "h2", "h3", "h4", "li", "td", "em", "strong", "a"}
 
     for n = 1, max_n do
         -- Build candidate probes for this DocFragment.
-        local probes = { string.format("/body/DocFragment[%d]/body/id('%s')", n, fragment_id) }
+        local probes = { string.format("/body/DocFragment[%d]/body/id('%s')", n, crengine_id) }
         for _, tag in ipairs(tags) do
-            table.insert(probes, string.format("/body/DocFragment[%d]/body/%s[@id='%s']", n, tag, fragment_id))
+            table.insert(probes, string.format("/body/DocFragment[%d]/body/%s[@id='%s']", n, tag, crengine_id))
         end
 
         for _, probe in ipairs(probes) do
@@ -608,7 +625,11 @@ end
 function MediaSync:_cacheResolvedXPointer(text_doc, fragment_id)
     local ui = self.plugin and self.plugin.ui
     if not ui or not ui.document or not fragment_id then return end
-    local xp = "#" .. fragment_id
+    -- Same crengine-namespacing as _gotoSmilFragment: probe the namespaced
+    -- id so the resume/refocus cache actually gets populated.
+    local hm = self.highlight_manager
+    local crengine_id = (hm and hm:_toCrengineId(fragment_id, text_doc)) or fragment_id
+    local xp = "#" .. crengine_id
     local ok, norm = pcall(function()
         return ui.document:getNormalizedXPointer(xp)
     end)
@@ -2034,8 +2055,14 @@ function MediaSync:_fragmentVisiblePrefix(sentence, sent_words)
     local doc = ui and ui.document
     local fid = sentence and sentence.fragment_id
     if not (doc and fid and sent_words and #sent_words > 0) then return nil end
+    -- Same crengine-namespacing fix as HighlightManager:_resolveFragmentXPointer
+    -- — resolving with the raw fragment id here always failed too (this
+    -- corroborating signal was silently contributing nothing). Falls back to
+    -- the raw id when the spine index is unavailable.
+    local hm = self.highlight_manager
+    local crengine_id = (hm and hm:_toCrengineId(fid, sentence and sentence.text_doc)) or fid
     local ok, xp = pcall(function()
-        return doc:getNormalizedXPointer("#" .. fid)
+        return doc:getNormalizedXPointer("#" .. crengine_id)
     end)
     if not (ok and xp and xp ~= false) then return nil end
     local boxes

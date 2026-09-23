@@ -305,44 +305,76 @@ function HighlightManager:_fragmentOnCurrentDoc(sentence)
     return expected ~= nil and expected == n
 end
 
+--- Build crengine's internal namespaced id for a SMIL fragment id.
+-- crengine prefixes every id from a merged content document with
+-- "_doc_fragment_<0-based-index>_ " (note: literal space, not underscore)
+-- to avoid id collisions across chapters (epubfmt.cpp builds the prefix
+-- per spine item, lvtinydom.cpp convertId appends "_" + " " + id).
+-- Confirmed via getHTMLFromXPointer dump: raw SMIL id "part0020.xhtml-s36"
+-- appears in the DOM as "_doc_fragment_20_ part0020.xhtml-s36" (spine
+-- index 21, 1-based, minus 1). Reuses MediaSync:_getExpectedDocFragmentIndex
+-- (spine-position lookup) so the index is not duplicated in two places.
+function HighlightManager:_toCrengineId(fragment_id, text_doc)
+    if not fragment_id then return nil end
+    local ms = self.plugin and self.plugin.media_sync
+    local n = ms and ms:_getExpectedDocFragmentIndex(text_doc)
+    if not n then return nil end
+    return string.format("_doc_fragment_%d_ %s", n - 1, fragment_id)
+end
+
 --- Resolve a SMIL fragment id to a CRe xpointer.
--- `#id` uses crengine's id index, which often omits inline Storyteller
--- spans. Attribute-path probes still match `[@id=...]` on the current
--- DocFragment (e.g. body/h1/span[@id='html28-s0']). Same probe list as
--- MediaSync:_tryGotoDocFragment.
-function HighlightManager:_resolveFragmentXPointer(doc, fragment_id)
+-- crengine namespaces ids from merged content documents as
+-- "_doc_fragment_<n>_ <original-id>" — the raw "#id" almost never matches
+-- that. Try the id-index shorthand against the correctly-namespaced id
+-- first, then the id() function form, then positional tag/nesting probes
+-- as a last resort. Same probe list as MediaSync:_tryGotoDocFragment.
+-- Falls back to the raw id when the spine index is unavailable (unknown
+-- text_doc, no SMIL parser), so lookup never degrades below the old
+-- behavior.
+function HighlightManager:_resolveFragmentXPointer(doc, fragment_id, text_doc)
     if not doc or not fragment_id then return nil end
     local function try_xp(xp)
         local ok, nx = pcall(function() return doc:getNormalizedXPointer(xp) end)
         if ok and nx and nx ~= false then return nx end
         return nil
     end
-    local hit = try_xp("#" .. fragment_id)
-    if hit then return hit end
-    local n = self:_currentDocFragmentIndex(doc)
+
+    local crengine_id = self:_toCrengineId(fragment_id, text_doc) or fragment_id
+
+    local hash_hit = try_xp("#" .. crengine_id)
+    if hash_hit then return hash_hit end
+
+    local ms = self.plugin and self.plugin.media_sync
+    local n = (ms and ms:_getExpectedDocFragmentIndex(text_doc))
+        or self:_currentDocFragmentIndex(doc)
     if not n then return nil end
+
+    local id_fn_hit = try_xp(string.format("/body/DocFragment[%d]/body/id('%s')", n, crengine_id))
+    if id_fn_hit then return id_fn_hit end
+
     local nested = {
         "h1/span", "p/span", "div/span", "div/p/span",
         "h2/span", "h3/span", "blockquote/span",
     }
     local tags = {"span", "p", "div", "h1", "h2", "h3", "h4", "li", "td", "em", "strong", "a"}
     local bodies = {"body", "body.0"}
+    local hit
     for _, body in ipairs(bodies) do
-        hit = try_xp(string.format("/body/DocFragment[%d]/%s/id('%s')", n, body, fragment_id))
+        hit = try_xp(string.format("/body/DocFragment[%d]/%s/id('%s')", n, body, crengine_id))
         if hit then break end
         for _, path in ipairs(nested) do
-            hit = try_xp(string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", n, body, path, fragment_id))
+            hit = try_xp(string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", n, body, path, crengine_id))
             if hit then break end
         end
         if hit then break end
         for _, tag in ipairs(tags) do
-            hit = try_xp(string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", n, body, tag, fragment_id))
+            hit = try_xp(string.format("/body/DocFragment[%d]/%s/%s[@id='%s']", n, body, tag, crengine_id))
             if hit then break end
         end
         if hit then break end
     end
     if hit then
-        dlog("hl-frag-xp", "id", tostring(fragment_id), "n", n)
+        dlog("hl-frag-xp", "id", tostring(fragment_id), "crengine_id", crengine_id, "n", n)
     end
     return hit
 end
@@ -351,14 +383,21 @@ end
 -- CRe's `#id` xpointer is the element start; a collapsed xp0==xp1 only
 -- selects a stub word, which then fell through to fuzzy page matching.
 function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
-    local xp0 = self:_resolveFragmentXPointer(doc, fragment_id)
+    local xp0 = self:_resolveFragmentXPointer(doc, fragment_id, sentence and sentence.text_doc)
     if not xp0 then return nil end
 
+    -- Prefer the trusted SMIL sentence text over CRe's own text-at-xpointer
+    -- stub. getTextFromXPointer is just node->getText8() at the element
+    -- start, which returns only the first word/node at a collapsed xpointer
+    -- and silently produced a too-short `want` target for ANY sentence
+    -- where the stub differs from the real text -- not just one-word ("I")
+    -- sentences, though those are the most visible case.
     local node_text = ""
-    pcall(function() node_text = doc:getTextFromXPointer(xp0) or "" end)
-    node_text = Utils.normalizeForMatching(node_text)
-    if node_text == "" and sentence and sentence.text then
+    if sentence and sentence.text and sentence.text ~= "" then
         node_text = Utils.normalizeForMatching(sentence.text)
+    else
+        pcall(function() node_text = doc:getTextFromXPointer(xp0) or "" end)
+        node_text = Utils.normalizeForMatching(node_text)
     end
     local want = foldedWords(node_text)
 
@@ -375,7 +414,13 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
     local next_id = self:_nextSmilFragmentId(sentence)
     if next_id and doc.getNormalizedXPointer then
         pcall(function()
-            local nxp = doc:getNormalizedXPointer("#" .. next_id)
+            -- The next SMIL fragment may share this sentence's namespace
+            -- (crengine renamed ids), so probe its namespaced form too;
+            -- _nextSmilFragmentId only returns ids in the same text_doc,
+            -- making the current spine index the right one to use.
+            local next_crengine = self:_toCrengineId(next_id, sentence and sentence.text_doc)
+                or next_id
+            local nxp = doc:getNormalizedXPointer("#" .. next_crengine)
             if nxp and nxp ~= false then
                 if doc.getPrevVisibleWordEnd then
                     xp_limit = doc:getPrevVisibleWordEnd(nxp)
@@ -390,12 +435,24 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
         local drawn = ""
         pcall(function() drawn = doc:getTextFromXPointers(xp0, xp_limit) or "" end)
         drawn = Utils.normalizeForMatching(drawn)
-        if drawnBelongsToNode(drawn, node_text) then
+        local dw = foldedWords(drawn)
+        -- Only trust xp_limit on an EXACT word-count match. A partial
+        -- prefix match just means xp_limit undershot (or overshot) —
+        -- accepting it produced wrong boundaries on ordinary sentences,
+        -- not just edge cases. Fall through to the precise word-by-word
+        -- growing loop below instead.
+        if #dw == #want and drawnBelongsToNode(drawn, node_text) then
             return xp0, xp_limit, node_text
         end
     end
 
     local xp1 = xp0
+    -- Compare joined characters, not token counts: crengine's word-boundary
+    -- stops don't align 1:1 with tokenizeForAlign's merged tokens (dropped-cap
+    -- names, contractions, French elisions like "L'homme" that still merge
+    -- here). A token-count bound failed mid-token or stopped one crengine
+    -- word short of the sentence end; character prefixes cannot disagree.
+    local want_joined = table.concat(want, "")
     if doc.getNextVisibleWordEnd then
         local last = xp0
         for _ = 1, 400 do
@@ -411,20 +468,13 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
             local drawn = ""
             pcall(function() drawn = doc:getTextFromXPointers(xp0, nxt) or "" end)
             drawn = Utils.normalizeForMatching(drawn)
-            local dw = foldedWords(drawn)
-            if #dw > #want then break end
-            local n = math.min(#dw, #want)
-            local prefix_ok = n > 0
-            for i = 1, n do
-                if dw[i] ~= want[i] then
-                    prefix_ok = false
-                    break
-                end
-            end
-            if not prefix_ok then break end
+            local dw_joined = table.concat(foldedWords(drawn), "")
+            if dw_joined == "" then break end
+            if #dw_joined > #want_joined then break end
+            if dw_joined ~= want_joined:sub(1, #dw_joined) then break end
             xp1 = nxt
             last = nxt
-            if #dw >= #want then break end
+            if #dw_joined >= #want_joined then break end
         end
     elseif xp_limit then
         xp1 = xp_limit
