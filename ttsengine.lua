@@ -60,6 +60,7 @@ local TTSEngine = {
         ANDROID = "android",
         PIPER = "piper",
         SANOTTS = "sanotts",
+        SANOTTS_JP = "sanotts-jp",
         KINDLE_NATIVE = "kindle-native",
         NATIVE = "platform-native",
     },
@@ -130,6 +131,13 @@ function TTSEngine:new(o)
     -- are filled in by detectBackend from whatever blobs shipped.
     o.sanotts_voice_name = o.sanotts_voice_name or nil
     o.sanotts_voices = o.sanotts_voices or nil
+    -- sanoTTS-jp state (bring-your-own-weights Japanese): the binary ships
+    -- with the plugin; the weights + dictionary blobs are user downloads
+    -- (see downloader:downloadSntJpVoice).  All three must exist for the
+    -- backend to be selectable.
+    o.snt_jp_server = o.snt_jp_server or nil
+    o.snt_jp_weights = o.snt_jp_weights or nil
+    o.snt_jp_dict = o.snt_jp_dict or nil
     -- Prefetch state: holds pre-synthesized audio for the next sentence
     o._prefetch_file = nil
     o._prefetch_timing = nil
@@ -375,6 +383,41 @@ function TTSEngine:detectBackend()
         else
             logger.warn("TTSEngine: bundled sanoTTS not found at", sanotts_server)
         end
+
+        -- sanoTTS-jp (Japanese, bring-your-own-weights): the binary ships
+        -- with the plugin, the weights + dictionary blobs are user downloads
+        -- (downloader:downloadSntJpVoice).  Two-stage detection: the binary
+        -- alone makes the download menu visible; the backend becomes
+        -- selectable only when weights and dictionary exist at their exact
+        -- shipped sizes.  Never a default tier.
+        local jp_dir = plugin_dir .. "/sanotts-jp"
+        local jp_server = jp_dir .. "/snt_jp_server"
+        if ensureBinary(jp_server) then
+            self.snt_jp_server = jp_server
+            local wpath = jp_dir .. "/saanotts-jp-v4-int8.bin"
+            local dpath = jp_dir .. "/k1-dict-438750.bin"
+            local wsize, dsize = 654032, 13702320
+            local wf = io.open(wpath, "r")
+            local df = io.open(dpath, "r")
+            local w_ok = wf ~= nil and wf:seek("end") == wsize
+            local d_ok = df ~= nil and df:seek("end") == dsize
+            if wf then wf:close() end
+            if df then df:close() end
+            if w_ok and d_ok then
+                self.snt_jp_weights = wpath
+                self.snt_jp_dict = dpath
+                logger.dbg("TTSEngine: Found sanoTTS-jp at", jp_server)
+            else
+                self.snt_jp_weights = nil
+                self.snt_jp_dict = nil
+                logger.dbg("TTSEngine: sanoTTS-jp binary present, weights/dictionary not downloaded yet")
+            end
+        else
+            self.snt_jp_server = nil
+            self.snt_jp_weights = nil
+            self.snt_jp_dict = nil
+        end
+
         -- Pick default backend: espeak-ng first (lighter, existing default),
         -- then sanoTTS (neural, ~700KB voice, runs on 512MB devices), then
         -- Piper (best quality).  The automatic quality-tier selection
@@ -1157,7 +1200,8 @@ function TTSEngine:synthesizeCommand(text, callback)
                 exec_prefix, self.backend_cmd, voice, speed, pitch, amplitude, gap_flag, audio_file, self:escapeText(text)
             )
         end
-    elseif self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS then
+    elseif self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS
+        or self.backend == self.BACKENDS.SANOTTS_JP then
         local text_file
         cmd, text_file = self._piper:buildCommand(text, audio_file)
         self._piper_text_file = text_file
@@ -1198,7 +1242,8 @@ function TTSEngine:synthesizeCommand(text, callback)
     -- Piper TTS is slow (~8-11s per sentence on Kobo ARM).
     -- Run it asynchronously so the UI stays responsive.
     -- sanoTTS is fast (~0.3s) but uses the same async queue machinery.
-    if self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS then
+    if self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS
+        or self.backend == self.BACKENDS.SANOTTS_JP then
         -- Wrap: run synthesis in background, write a marker file when done.
         -- Capture stderr to a log file so we can detect ONNX Runtime errors
         -- (e.g. "Protobuf parsing failed") and provide better diagnostics.
@@ -1725,6 +1770,7 @@ function TTSEngine:generateTimingEstimates(text)
     local pos = 1
     local is_neural = self.backend == self.BACKENDS.PIPER
         or self.backend == self.BACKENDS.SANOTTS
+        or self.backend == self.BACKENDS.SANOTTS_JP
         or self.backend == self.BACKENDS.ANDROID
     while pos <= #text do
         -- Skip whitespace
@@ -1925,7 +1971,8 @@ function TTSEngine:prefetch(text, use_espeak)
         return false
     end
     -- Piper/sanoTTS: delegate to the async queue-based prefetcher
-    if (self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS)
+    if (self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS
+            or self.backend == self.BACKENDS.SANOTTS_JP)
             and not use_espeak then
         self._piper:enqueue(text)
         return true  -- launched (or already in queue)
@@ -6815,7 +6862,8 @@ function TTSEngine:stop()
     end
     
     -- Kill any background Piper synthesis processes immediately
-    if self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS then
+    if self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS
+        or self.backend == self.BACKENDS.SANOTTS_JP then
         self._piper:killOrphanProcesses()
     end
     
@@ -6984,6 +7032,30 @@ function TTSEngine:setSanottsVoice(name)
     end
 end
 
+--- sanoTTS-jp readiness, re-checked from disk (menus use this so a download
+-- that lands mid-session is picked up without re-running detectBackend).
+-- @return table {server, weights, dict, complete} of booleans
+function TTSEngine:getSntJpStatus()
+    local st = { server = false, weights = false, dict = false, complete = false }
+    if self.snt_jp_server then
+        local f = io.open(self.snt_jp_server, "r")
+        if f then f:close() st.server = true end
+    end
+    local function size_ok(path, want)
+        local f = io.open(path, "r")
+        if not f then return false end
+        local ok = f:seek("end") == want
+        f:close()
+        return ok
+    end
+    local jp_dir = Utils.normalizeDirPath(self.plugin_dir or
+        "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin") .. "sanotts-jp/"
+    st.weights = size_ok(jp_dir .. "saanotts-jp-v4-int8.bin", 654032)
+    st.dict = size_ok(jp_dir .. "k1-dict-438750.bin", 13702320)
+    st.complete = st.server and st.weights and st.dict
+    return st
+end
+
 --[[--
 Switch the active TTS backend.
 @param backend string One of TTSEngine.BACKENDS values
@@ -7023,6 +7095,10 @@ function TTSEngine:setBackend(backend)
     elseif backend == self.BACKENDS.SANOTTS then
         -- snt_server needs no backend_cmd (the queue builds its own command);
         -- sample rate is fixed at 22050 for the int8 voice.
+        self._piper_sample_rate = 22050
+    elseif backend == self.BACKENDS.SANOTTS_JP then
+        -- snt_jp_server likewise builds its own command; the Japanese core
+        -- is also fixed at 22050.
         self._piper_sample_rate = 22050
     elseif backend == self.BACKENDS.ESPEAK then
         -- Restore bundled espeak-ng path if available (espeak-ng-legacy on

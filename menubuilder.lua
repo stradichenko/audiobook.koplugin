@@ -392,6 +392,17 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 return MenuBuilder.buildSanottsVoiceMenu(plugin)
             end,
         })
+    elseif plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.SANOTTS_JP then
+        table.insert(menu, {
+            text = _("Voice: Japanese (sanoTTS-jp)"),
+            enabled = false,
+            help_text = _(
+                "The rate slider has no effect on this voice: the Japanese "
+                .. "core has no speed control yet. Weights and dictionary are "
+                .. "your own downloads from sanoTTS-jp and carry their own "
+                .. "usage terms."
+            ),
+        })
     elseif plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.ESPEAK
         or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.PICO
         or plugin.tts_engine.backend == plugin.tts_engine.BACKENDS.FLITE
@@ -411,6 +422,31 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 "Base voice and accent variant are ignored when a MBROLA voice is active. "
                 .. "Disable MBROLA to use regular espeak-ng voices."
             ),
+        })
+    end
+
+    -- sanoTTS-jp downloads: visible whenever the Japanese binary shipped
+    -- (which detection reflects), on any backend, so the user can fetch the
+    -- files before switching engines.
+    if plugin.tts_engine.snt_jp_server then
+        table.insert(menu, {
+            text = _("Download sanoTTS-jp files…"),
+            sub_item_table_func = function()
+                local ok, result = pcall(function()
+                    local _dir = debug.getinfo(1, "S").source:match("^@(.*/)[^/]*$") or "./"
+                    local Downloader = dofile(_dir .. "downloader.lua")
+                    return MenuBuilder.buildSntJpDownloadMenu(plugin, Downloader)
+                end)
+                if ok then
+                    return result
+                else
+                    logger.err("MenuBuilder: buildSntJpDownloadMenu crashed:", result)
+                    return {{
+                        text = _("Could not load the download menu."),
+                        enabled = false,
+                    }}
+                end
+            end,
         })
     end
 
@@ -887,6 +923,15 @@ function MenuBuilder.buildEngineSelectMenu(plugin)
         })
     end
 
+    -- sanoTTS-jp: Japanese, bring-your-own-weights.  Selectable only once
+    -- the weights and dictionary are downloaded (getSntJpStatus().complete).
+    if engine:getSntJpStatus().complete then
+        table.insert(available, {
+            id = engine.BACKENDS.SANOTTS_JP,
+            label = _("sanoTTS-jp (Japanese neural)"),
+        })
+    end
+
     -- Other system backends
     if Utils.commandExists("pico2wave") then
         table.insert(available, { id = engine.BACKENDS.PICO, label = _("Pico TTS") })
@@ -1154,6 +1199,77 @@ function MenuBuilder.buildPiperDownloadMenu(plugin, Downloader)
         })
     end
 
+    return menu
+end
+
+--[[
+Build the sanoTTS-jp bring-your-own-weights download menu.
+Two pinned files from the sanoTTS-jp v1.0.0 release (weights 654 KB +
+dictionary 13.1 MB), plus the license files for the user's records.  The
+plugin bundles none of this data; downloading it is what activates the
+Japanese backend.  Downloading deliberately does NOT switch the active
+engine — the user selects sanoTTS-jp under TTS engine when ready.
+--]]
+function MenuBuilder.buildSntJpDownloadMenu(plugin, Downloader)
+    local menu = {}
+    local plugin_dir = plugin.plugin_dir
+        or (plugin.tts_engine.piper_model_dir or ""):match("^(.+)/piper$")
+
+    table.insert(menu, {
+        text = _("Japanese voice for sanoTTS: two files, ~14 MB total, from the sanoTTS-jp v1.0.0 release (MIT). The plugin bundles none of this data."),
+        enabled = false,
+    })
+
+    local files = {
+        { id = "weights", label = _("Voice weights") .. " · 0.6 MB", size = 654032 },
+        { id = "dict", label = _("Japanese dictionary (438k entries)") .. " · 13.1 MB", size = 13702320 },
+    }
+    -- Per-file installed state (checking the weights row must not be
+    -- satisfied by the dictionary row being present).
+    local function fileInstalled(id)
+        local fresh = plugin.tts_engine:getSntJpStatus()
+        if id == "weights" then return fresh.weights end
+        return fresh.dict
+    end
+    for _, f in ipairs(files) do
+        table.insert(menu, {
+            text_func = function()
+                return f.label .. (fileInstalled(f.id) and " ✓" or "")
+            end,
+            enabled_func = function()
+                return not fileInstalled(f.id)
+            end,
+            callback = function()
+                if fileInstalled(f.id) then return end
+                local info = InfoMessage:new{
+                    text = _("Downloading sanoTTS-jp file…"),
+                    timeout = 0,
+                }
+                UIManager:show(info)
+                Downloader:downloadSntJpFile(f.id, plugin_dir,
+                    function() end,
+                    function(ok, err)
+                        UIManager:close(info)
+                        if ok then
+                            UIManager:show(InfoMessage:new{
+                                text = _("Downloaded.\n\nWeights & dictionary © ayutaz/sanoTTS-jp (release v1.0.0). Their usage terms (LICENSE-MODEL.md, NOTICE.md) were saved next to the voice. Select 'sanoTTS-jp (Japanese)' under TTS engine to use it."),
+                                timeout = 8,
+                            })
+                        else
+                            UIManager:show(InfoMessage:new{
+                                text = _("Download failed:\n") .. tostring(err or "unknown"),
+                                timeout = 5,
+                            })
+                        end
+                    end)
+            end,
+        })
+    end
+
+    table.insert(menu, {
+        text = _("When both files are downloaded, select 'sanoTTS-jp (Japanese)' under TTS engine."),
+        enabled = false,
+    })
     return menu
 end
 

@@ -273,6 +273,23 @@ Build the base Piper command (no I/O flags).
 --]]
 function PiperQueue:buildBaseCommand()
     local engine = self.engine
+    -- sanoTTS-jp engine (Japanese, bring-your-own-weights): same FIFO/JSON
+    -- protocol, own static musl binary, no loader prefix and no espeak
+    -- flags.  Weights + dictionary paths are the user's downloads; they are
+    -- quoted because plugin dirs can contain spaces.  The core has no user
+    -- speed knob in v1, so no rate flag is emitted for this backend.
+    if engine.backend == engine.BACKENDS.SANOTTS_JP and engine.snt_jp_server then
+        -- Paths resolve from the state fields, with the deterministic
+        -- download locations as fallback so a mid-session download works
+        -- without re-running detectBackend (which would reset the backend).
+        local jp_dir = (engine.plugin_dir
+            or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin")
+            .. "/sanotts-jp"
+        local w = engine.snt_jp_weights or jp_dir .. "/saanotts-jp-v4-int8.bin"
+        local d = engine.snt_jp_dict or jp_dir .. "/k1-dict-438750.bin"
+        return string.format('nice -n 19 "%s" --weights "%s" --dict "%s"',
+            engine.snt_jp_server, w, d)
+    end
     -- sanoTTS engine: same FIFO/JSON protocol, different binary and args.
     if engine.backend == engine.BACKENDS.SANOTTS and engine.sanotts_server then
         local exec_prefix = ""
@@ -410,9 +427,10 @@ function PiperQueue:buildCommand(text, audio_file)
         .. os.time() .. "_" .. engine.file_counter .. ".txt"
     local tf = io.open(text_file, "w")
     local cmd
-    if engine.backend == engine.BACKENDS.SANOTTS then
-        -- snt_server reads one JSON line per utterance from stdin and
-        -- writes the WAV at the path given inside the line.
+    if engine.backend == engine.BACKENDS.SANOTTS
+        or engine.backend == engine.BACKENDS.SANOTTS_JP then
+        -- snt_server / snt_jp_server read one JSON line per utterance from
+        -- stdin and write the WAV at the path given inside the line.
         if tf then
             tf:write(self:_buildJsonLine(text, audio_file))
             tf:close()
@@ -486,9 +504,12 @@ function PiperQueue:startServers()
     -- Low-memory guard: Piper neural TTS loads a ~100MB ONNX model into RAM.
     -- On devices with < 80MB free, launching Piper risks OOM-killing KOReader.
     -- sanoTTS is exempt: its int8 model is 680KB with a ~5MB working set.
+    -- sanoTTS-jp is exempt too: 654KB weights + a file-backed 13.7MB
+    -- dictionary (page cache, evictable) and a ~10MB working set.
     local engine = self.engine
     local mem_available_kb = 0
-    if engine.backend ~= engine.BACKENDS.SANOTTS then
+    if engine.backend ~= engine.BACKENDS.SANOTTS
+        and engine.backend ~= engine.BACKENDS.SANOTTS_JP then
         local mf = io.open("/proc/meminfo", "r")
         if mf then
             for line in mf:lines() do
@@ -521,8 +542,9 @@ function PiperQueue:startServers()
     self._servers = {}
     self._server_rr = 0
 
-    -- Kill ALL existing piper processes before launching
-    os.execute("killall -9 piper snt_server 2>/dev/null")
+    -- Kill ALL existing piper processes before launching (the list spans
+    -- every backend's server binary; engine switches pass through here).
+    os.execute("killall -9 piper snt_server snt_jp_server 2>/dev/null")
     -- Also kill orphan server shell wrappers from a previous crash.
     -- These are /bin/sh processes not caught by killall piper.
     for i = 1, SERVER_COUNT do
@@ -714,7 +736,7 @@ function PiperQueue:stopServers()
         os.execute(string.format('rm -f "%s" "%s.pid" "%s.piper_pid" "%s.sh" "%s.log"',
             fifo, fifo, fifo, fifo, fifo))
     end
-    os.execute("killall -9 piper snt_server 2>/dev/null")
+    os.execute("killall -9 piper snt_server snt_jp_server 2>/dev/null")
     -- Kill wrapper shells that may be orphaned (reparented to init)
     os.execute("pkill -9 -f 'piper_server_.*\\.sh' 2>/dev/null")
     self._servers = {}

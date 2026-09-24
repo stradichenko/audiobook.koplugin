@@ -162,6 +162,32 @@ The engine is punctuation-aware in two layers: the punctuation mark's own phonem
 
 > sanoTTS trades some naturalness for its footprint; where Piper runs comfortably it sounds better. sanoTTS is the pick on devices where Piper is too slow or too large.
 
+## Optional: Japanese (sanoTTS-jp, bring your own voice)
+
+[sanoTTS-jp](https://github.com/ayutaz/sanoTTS-jp) is an independent Japanese TTS built on the sanoTTS recipe. The plugin ships its **engine** (a small static binary, MIT) but not its **voice data**: the int8 weights (~0.6 MB) and the Japanese pronunciation dictionary (438,750 entries, ~13.1 MB) are yours to bring. That split is deliberate. The voice data carries its own license with usage terms for generated audio, and shipping it would make this plugin the distributor of those terms for audio it cannot police; bringing it yourself keeps the license between you and the voice's author, and keeps the release zip free of model data. Nothing Japanese is bundled and the backend only appears once you fetch the two files.
+
+### The clean way: download in-app
+
+Open **Tools > Audiobook Read-Along > Voice settings > Download sanoTTS-jp files…** and download both entries from the pinned sanoTTS-jp v1.0.0 release:
+
+- **Voice weights** (~0.6 MB int8 blob)
+- **Japanese dictionary** (438,750 entries): kanji-to-reading lookup; smaller accuracy tiers exist upstream but only the full one is supported
+
+Each entry shows a ✓ once it is complete and size-verified, and the license files (`LICENSE-MODEL.md`, `NOTICE.md`) are saved next to the voice for your records. Then select **sanoTTS-jp (Japanese)** under Voice settings > TTS engine.
+
+### The manual way
+
+Download the same two files from the [sanoTTS-jp v1.0.0 release](https://github.com/ayutaz/sanoTTS-jp/releases/tag/v1.0.0) — exact names and sizes matter, they are checked:
+
+- `saanotts-jp-v4-int8.bin` (654,032 bytes)
+- `k1-dict-438750.bin` (13,702,320 bytes)
+
+Drop both into `audiobook.koplugin/sanotts-jp/` next to `snt_jp_server`, restart KOReader, and select the engine.
+
+### What to expect
+
+Kanji and kana text both work; the engine reads Japanese and stays silent on sentences it cannot decode (for example plain English text inside a Japanese book). The rate slider has no effect on this voice yet (the core has no speed control), and the voice is never selected automatically: you opt in by downloading the files and picking the engine.
+
 ## PocketBook audio
 
 On PocketBook, the system ALSA configuration routes all audio through a Loopback card. The `tts_sm` PCM device (defined in `/etc/asound.conf`) chains through `softvol -> dmix -> hw:Loopback,0`. A system process (`alsaloop`) reads from `hw:Loopback,1` and plays to the physical codec (`hw:0`). The plugin bundles a small ALSA player (`wav-play`) that opens `tts_sm` directly, avoiding any dependency on `aplay` or GStreamer. Bluetooth output on PocketBook uses the standard BlueZ + `alsaloop` path managed by the firmware.
@@ -638,4 +664,5 @@ Copyright 2025-2026 gespitia - AGPL-3.0. See [LICENSE](LICENSE).
 | [Piper](https://github.com/rhasspy/piper) | MIT |
 | [Piper voices](https://huggingface.co/rhasspy/piper-voices) | MIT |
 | [sanoTTS](https://github.com/ampixa/sanoTTS) (runtime + voice blobs) | MIT |
+| [sanoTTS-jp](https://github.com/ayutaz/sanoTTS-jp) (runtime binary, vendored core; weights and dictionary are user downloads) | MIT (core + OpenJTalk subset: modified BSD) |
 | glibc (bundled .so) | LGPL-2.1 |

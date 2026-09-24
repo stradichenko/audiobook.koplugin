@@ -504,6 +504,87 @@ function Downloader:hasPiperVoice(voice_id, plugin_dir)
     return false
 end
 
+-- ── sanoTTS-jp (Japanese, bring-your-own-weights) ────────────────────
+-- Pinned to the upstream v1.0.0 release: the weights are v4 (no JSUT
+-- share-alike exposure) and the attribution files are complete there.
+-- The plugin bundles none of this data; downloading activates the backend.
+Downloader.SNTJP_RELEASE_BASE = "https://github.com/ayutaz/sanoTTS-jp/releases/download/v1.0.0"
+Downloader.SNTJP_RAW_BASE = "https://raw.githubusercontent.com/ayutaz/sanoTTS-jp/v1.0.0"
+Downloader.SNTJP_FILES = {
+    weights = { dest = "saanotts-jp-v4-int8.bin", size = 654032,
+                url = Downloader.SNTJP_RELEASE_BASE .. "/saanotts-jp-v4-int8.bin" },
+    dict    = { dest = "k1-dict-438750.bin", size = 13702320,
+                url = Downloader.SNTJP_RELEASE_BASE .. "/k1-dict-438750.bin" },
+    license = { dest = "LICENSE-MODEL.md", size = nil,
+                url = Downloader.SNTJP_RAW_BASE .. "/LICENSE-MODEL.md" },
+    notice  = { dest = "NOTICE.md", size = nil,
+                url = Downloader.SNTJP_RAW_BASE .. "/NOTICE.md" },
+}
+
+function Downloader:getSntJpDir(plugin_dir)
+    local dir = plugin_dir .. "/sanotts-jp"
+    os.execute(string.format('mkdir -p "%s"', dir))
+    return dir
+end
+
+--- Installed check: exists AND exact expected size where the catalog has
+-- one.  Byte size plus the driver's runtime SAAN/K1D1 magic checks are the
+-- integrity gate (no checksum infrastructure exists in this plugin).
+function Downloader:hasSntJpFile(id, plugin_dir)
+    local entry = self.SNTJP_FILES[id]
+    if not entry or not plugin_dir then return false end
+    local f = io.open(self:getSntJpDir(plugin_dir) .. "/" .. entry.dest, "r")
+    if not f then return false end
+    local ok = true
+    if entry.size then
+        ok = f:seek("end") == entry.size
+    end
+    f:close()
+    return ok
+end
+
+--- Both data files present and size-verified: the Japanese backend becomes
+-- selectable.
+function Downloader:hasSntJpVoice(plugin_dir)
+    return self:hasSntJpFile("weights", plugin_dir)
+        and self:hasSntJpFile("dict", plugin_dir)
+end
+
+--[[--
+Download one sanoTTS-jp file.
+@param id string  "weights" | "dict" | "license" | "notice"
+@param plugin_dir string
+@param on_progress function(done_bytes, total_bytes)
+@param on_complete function(success, err_msg)
+--]]
+function Downloader:downloadSntJpFile(id, plugin_dir, on_progress, on_complete)
+    local entry = self.SNTJP_FILES[id]
+    if not entry or not plugin_dir then
+        if on_complete then on_complete(false, _("Unknown file.")) end
+        return
+    end
+    local dest = self:getSntJpDir(plugin_dir) .. "/" .. entry.dest
+    self:download(entry.url, dest, on_progress, function(ok, err)
+        if not ok then
+            if on_complete then on_complete(false, err) end
+            return
+        end
+        if entry.size then
+            local f = io.open(dest, "r")
+            local got = f and f:seek("end") or 0
+            if f then f:close() end
+            if got ~= entry.size then
+                os.remove(dest)
+                if on_complete then
+                    on_complete(false, _("Downloaded file has the wrong size. Please retry."))
+                end
+                return
+            end
+        end
+        if on_complete then on_complete(true, nil) end
+    end)
+end
+
 -- ── Hybrid voice list (cached + online refresh) ──────────────────────
 -- URL of the voices.json on the master branch (raw GitHub content).
 Downloader.VOICES_JSON_URL = "https://raw.githubusercontent.com/stradichenko/audiobook.koplugin/master/voices.json"

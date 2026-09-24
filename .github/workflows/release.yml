@@ -140,6 +140,13 @@ jobs:
           ls -la kobo-tts-bundle/audiobook.koplugin/wav-play/
           ls -la kobo-tts-bundle/audiobook.koplugin/wav-play/lib/ 2>/dev/null || true
           echo ""
+          echo "=== sanoTTS-jp engine (binary only — no model data may ship) ==="
+          ls -la kobo-tts-bundle/audiobook.koplugin/sanotts-jp/
+          if [ -n "$(find kobo-tts-bundle/audiobook.koplugin/sanotts-jp -type f -size +100k 2>/dev/null)" ]; then
+            echo "ERROR: sanoTTS-jp dir contains model data; weights and dictionary must never ship in the zip"
+            exit 1
+          fi
+          echo ""
           echo "=== Total size ==="
           du -sh kobo-tts-bundle/audiobook.koplugin/
 
@@ -169,6 +176,7 @@ jobs:
             - Bundled kindle-gst-play-native (KinAMP-parity fallback for audio-less PW4-class Kindles)
             - Legacy static ffmpeg and espeak-ng for 2011-and-earlier speaker Kindles (Kindle 2/3/DXG/4/Touch/PW1)
             - Bundled wav-play (ALSA player for PocketBook and other devices without aplay)
+            - Bundled sanoTTS-jp Japanese neural engine (binary only; weights + dictionary download in-app, ~14 MB, from sanoTTS-jp v1.0.0)
             - Android TTS helper and MediaSession helpers (pre-built tts_helper.dex, media_session_helper.dex)
 
             ### Install paths

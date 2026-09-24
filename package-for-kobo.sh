@@ -20,6 +20,7 @@ PIPER_DEST="$PLUGIN_DEST/piper"
 # Parse arguments
 WITH_PIPER=false
 WITH_SANOTTS=true
+WITH_SANOTTS_JP=true
 PIPER_VOICE="en_US-danny-low"
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -33,6 +34,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-sanotts)
             WITH_SANOTTS=false
+            shift
+            ;;
+        --with-sanotts-jp)
+            WITH_SANOTTS_JP=true
+            shift
+            ;;
+        --no-sanotts-jp)
+            WITH_SANOTTS_JP=false
             shift
             ;;
         --piper-voice)
@@ -269,6 +278,28 @@ if [ "$WITH_SANOTTS" = true ]; then
     fi
 else
     echo "Skipping sanoTTS (--no-sanotts)"
+fi
+
+# ── sanoTTS-jp engine (Japanese, bring-your-own-weights) ─────────────
+# Ships ONLY the static server binary; the int8 weights (654 KB) and the
+# Japanese pronunciation dictionary (13.1 MB) are downloaded by the user
+# in-app from the pinned sanoTTS-jp release. No model data is ever bundled.
+echo ""
+echo "=== Bundling sanoTTS-jp engine (binary only) ==="
+if [ "$WITH_SANOTTS_JP" = true ]; then
+    JP_DEST="$PLUGIN_DEST/sanotts-jp"
+    echo "Cross-compiling snt_jp_server (static musl, armv7hf)..."
+    JP_OUT=$(nix-build "$SCRIPT_DIR/cross-build-snt-jp-server.nix" --no-out-link)
+    if [ -f "$JP_OUT/bin/snt_jp_server" ]; then
+        mkdir -p "$JP_DEST"
+        cp "$JP_OUT/bin/snt_jp_server" "$JP_DEST/snt_jp_server"
+        echo "Bundled sanoTTS-jp engine (weights + dictionary are user downloads)"
+    else
+        echo "ERROR: sanoTTS-jp server build produced no binary" >&2
+        exit 1
+    fi
+else
+    echo "Skipping sanoTTS-jp (--no-sanotts-jp)"
 fi
 
 # ── MBROLA support (bundled with espeak-ng when mbrolaSupport=true) ───
