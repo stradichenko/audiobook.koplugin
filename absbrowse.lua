@@ -1250,6 +1250,7 @@ function ABSBrowse._downloadItem(plugin, client, item, cache, refresh_callback)
     local item_dir = cache:getItemCacheDir(item.id)
     local audio_dir = cache:getItemAudioDir(item.id)
     local downloaded_paths = {}
+    local audio_durations = {}
     local failed = false
 
     -- Download audio files one by one
@@ -1273,7 +1274,7 @@ function ABSBrowse._downloadItem(plugin, client, item, cache, refresh_callback)
                 end
 
                 -- Add to cache index
-                cache:addItem(item, downloaded_paths, cover_ok and cover_path or nil)
+                cache:addItem(item, downloaded_paths, cover_ok and cover_path or nil, audio_durations)
 
                 -- Keep the busy banner visible briefly so the user sees the
                 -- download is complete before the UI unfreezes.
@@ -1340,6 +1341,14 @@ function ABSBrowse._downloadItem(plugin, client, item, cache, refresh_callback)
         local ok, err = client:downloadFile(file_url, dest_path)
         if ok then
             table.insert(downloaded_paths, dest_path)
+            -- ABS reports audio file durations in milliseconds; keep them
+            -- (seconds) aligned with downloaded_paths for global-position
+            -- mapping across multi-file items.
+            if af.duration then
+                table.insert(audio_durations, af.duration / 1000)
+            else
+                table.insert(audio_durations, nil)
+            end
             logger.warn("ABSBrowse: downloaded", dest_path)
             UIManager:scheduleIn(0.1, function()
                 downloadNext(idx + 1)
@@ -1450,9 +1459,22 @@ function ABSBrowse._playCachedItem(plugin, cache, item_id)
         cover_path = item.cover_path,
     }
 
+    -- Multi-file items play as one continuous playlist: every cached audio
+    -- file in the order the server lists them (the book's own order; do not
+    -- re-sort).  The playback method resolves which part holds the resume
+    -- position.
+    local playlist = nil
+    local audio_paths = cache:getAudioPaths(item_id)
+    if audio_paths and #audio_paths > 1 then
+        playlist = {}
+        for _, p in ipairs(audio_paths) do
+            table.insert(playlist, { name = p:gsub(".*/", ""), path = p })
+        end
+    end
+
     -- Use the plugin's playback method
     if plugin._playAbsItem then
-        plugin:_playAbsItem(item_id, audio_path, metadata)
+        plugin:_playAbsItem(item_id, audio_path, metadata, playlist)
     else
         -- Fallback: play directly
         local cover = item.cover_path

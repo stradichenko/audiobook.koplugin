@@ -82,7 +82,7 @@ Add or update a cached item.
 @param cover_path string|nil  Local path to cover image
 @return boolean
 --]]
-function ABSCache:addItem(item, audio_files, cover_path)
+function ABSCache:addItem(item, audio_files, cover_path, audio_durations)
     if not item or not item.id then
         logger.err("ABSCache: addItem called without valid item")
         return false
@@ -97,6 +97,10 @@ function ABSCache:addItem(item, audio_files, cover_path)
         duration = item.duration or item.media and item.media.duration or 0,
         chapters = item.chapters or item.media and item.media.chapters or {},
         audio_files = audio_files or {},
+        -- Per-file durations in seconds, positionally aligned with
+        -- audio_files (nil where the server did not report one).  Used to
+        -- map a global book position onto the right part file.
+        audio_durations = audio_durations or {},
         cover_path = cover_path,
         downloaded_at = os.time(),
     }

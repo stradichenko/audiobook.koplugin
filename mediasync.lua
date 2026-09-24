@@ -1413,10 +1413,45 @@ function MediaSync:seekToTime(seconds)
     UIManager:setDirty("all", "ui")
 end
 
+--- Resolve a global book time onto the playlist: returns the playlist index
+--- holding that time and the local offset inside it, or nil when the part
+--- durations are unknown.
+function MediaSync:_playlistResolveGlobalTime(t)
+    if not (self.playlist_files and self._playlist_durations
+            and #self._playlist_durations == #self.playlist_files) then
+        return nil
+    end
+    local before = 0
+    for i = 1, #self._playlist_durations do
+        local d = self._playlist_durations[i]
+        if not d then return nil end
+        if t < before + d then
+            return i, math.max(0, t - before)
+        end
+        before = before + d
+    end
+    return nil
+end
+
 function MediaSync:seekToChapter(index)
     if not self.chapters or not self.chapters[index] then return end
     local ch = self.chapters[index]
     logger.warn("MediaSync: seekToChapter", index, ch.title, "@", ch.start_time)
+    -- Global chapter times (multi-file ABS items) resolve onto the part
+    -- holding that time; same-file chapters seek in place, other parts
+    -- switch the playlist file first.
+    if self._chapters_global and self.playlist_files then
+        local file_idx, local_off = self:_playlistResolveGlobalTime(ch.start_time)
+        if file_idx then
+            if file_idx == self.current_playlist_idx then
+                self:seekToTime(local_off)
+            elseif self.plugin and self.plugin._playAudioFile then
+                self.plugin:_playAudioFile(self.playlist_files[file_idx].path,
+                    self.playlist_files, local_off)
+            end
+            return
+        end
+    end
     self:seekToTime(ch.start_time)
 end
 

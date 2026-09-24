@@ -2177,8 +2177,15 @@ function Audiobook:openMusicPlaylist()
     })
 end
 
-function Audiobook:_playAudioFile(file_path, playlist_files)
+function Audiobook:_playAudioFile(file_path, playlist_files, start_position_override)
     if not file_path or not self.media_sync then return end
+
+    -- Explicit position (chapter jump onto another part, mapped resume):
+    -- skip the saved-position prompt entirely.
+    if start_position_override then
+        self:_doPlayAudioFile(file_path, playlist_files, start_position_override)
+        return
+    end
 
     -- EPUB Media Overlay playlist transition: install this file's timing
     -- slice and chapters directly, skipping the resume prompt so chained
@@ -2309,13 +2316,52 @@ function Audiobook:_doPlayAudioFile(file_path, playlist_files, start_position, a
                 cover_path = abs_item_metadata.cover_path
             end
         end
-        -- Store ABS tracking on media_sync
+        -- Store ABS tracking on media_sync.  For a multi-file item the
+        -- synced duration is the whole book, not the single part being
+        -- played.
         self.media_sync._abs_item_id = abs_item_id
-        self.media_sync._abs_duration = duration or abs_item_metadata.duration or 0
+        self._abs_playlist_durations = nil
+        self.media_sync._playlist_durations = nil
+        self.media_sync._chapters_global = false
+        local total_duration = duration
+        if playlist_files and #playlist_files > 1 then
+            local durs = {}
+            local cache_item = nil
+            pcall(function()
+                local ABSCache = dofile(self.path .. "/abscache.lua")
+                local cache = ABSCache:new{ plugin_dir = Utils.normalizeDirPath(self.path) }
+                cache_item = cache:getItem(abs_item_id)
+            end)
+            local sum = 0
+            local complete = true
+            if cache_item and cache_item.audio_durations
+                    and #cache_item.audio_durations == #playlist_files then
+                for i = 1, #playlist_files do
+                    local d = cache_item.audio_durations[i]
+                    durs[i] = d
+                    if d then sum = sum + d else complete = false end
+                end
+            else
+                complete = false
+            end
+            self._abs_playlist_durations = durs
+            self.media_sync._playlist_durations = durs
+            -- ABS metadata chapters are global book times; per-file parser
+            -- output would be local.  Flag them as global only when the
+            -- fallback above actually attached the ABS table.
+            self.media_sync._chapters_global = (chapters == abs_item_metadata.chapters)
+            total_duration = (complete and sum > 0 and sum)
+                or abs_item_metadata.duration
+                or total_duration
+        end
+        self.media_sync._abs_duration = total_duration or abs_item_metadata.duration or 0
     else
         -- Clear ABS tracking for non-ABS playback
         self.media_sync._abs_item_id = nil
         self.media_sync._abs_duration = nil
+        self._abs_playlist_durations = nil
+        self.media_sync._playlist_durations = nil
+        self.media_sync._chapters_global = false
     end
 
     -- For standalone audio without text alignment, we create a single
@@ -3444,7 +3490,7 @@ function Audiobook:stopReadAlong(opts)
                 local dur = self.media_sync._abs_duration or 0
                 self._abs_sync:recordProgress(
                     self.media_sync._abs_item_id,
-                    path, pos, dur, false
+                    path, self:_absGlobalPlaybackPos(pos), dur, false
                 )
                 -- Attempt immediate flush
                 local ABSClient
@@ -4660,7 +4706,75 @@ Handles resume prompt and delegates to _doPlayAudioFile with ABS metadata.
 @param audio_path string  Local audio file path
 @param metadata table  {title, author, narrator, duration, chapters, cover_path}
 --]]
-function Audiobook:_playAbsItem(item_id, audio_path, metadata)
+--- Map a global book position onto a multi-file playlist.
+-- Prefers ABS chapters when they map 1:1 to the part files, then stored
+-- per-file durations; returns the first file at offset 0 when neither can
+-- resolve the position.
+-- @return start_file_path, local_offset_seconds
+function Audiobook:_resolveAbsPlaylistStart(playlist_files, global_pos, metadata, cache_item)
+    if not playlist_files or not playlist_files[1] then
+        return nil, 0
+    end
+    local first = playlist_files[1].path
+    local function file(i) return playlist_files[i] and playlist_files[i].path or first end
+    local n = #playlist_files
+
+    local chapters = metadata and metadata.chapters
+    if chapters and #chapters == n then
+        for i = #chapters, 1, -1 do
+            local ch = chapters[i]
+            local st = ch.start_time or 0
+            if global_pos >= st then
+                return file(i), math.max(0, global_pos - st)
+            end
+        end
+        return first, 0
+    end
+
+    local durs = cache_item and cache_item.audio_durations
+    if durs and #durs == n and durs[1] then
+        local before = 0
+        for i = 1, n do
+            local d = durs[i]
+            if d and global_pos < before + d then
+                return file(i), math.max(0, global_pos - before)
+            end
+            before = before + (d or 0)
+        end
+        -- Past the last known end: clamp into the final file's tail.
+        local last_d = durs[n]
+        if last_d and last_d > 0 then
+            return file(n), math.max(0, last_d - 1)
+        end
+    end
+
+    logger.warn("Audiobook: cannot map global position", global_pos,
+        "onto", n, "part files; starting at the first file")
+    return first, 0
+end
+
+--- Convert a per-file playback position into the item's global book
+-- position (sum of the playlist files before the current one, plus the
+-- local position).  Returns the local position unchanged when no playlist
+-- is active or the durations are unknown.
+function Audiobook:_absGlobalPlaybackPos(local_pos)
+    local ms = self.media_sync
+    if not (ms and ms.playlist_files and ms.current_playlist_idx
+            and ms.current_playlist_idx > 1) then
+        return local_pos
+    end
+    local durs = self._abs_playlist_durations or ms._playlist_durations
+    if not durs then return local_pos end
+    local offset = 0
+    for i = 1, ms.current_playlist_idx - 1 do
+        local d = durs[i]
+        if not d then return local_pos end
+        offset = offset + d
+    end
+    return offset + (local_pos or 0)
+end
+
+function Audiobook:_playAbsItem(item_id, audio_path, metadata, playlist_files)
     if not audio_path or not self.media_sync then
         return
     end
@@ -4706,6 +4820,27 @@ function Audiobook:_playAbsItem(item_id, audio_path, metadata)
     end
 
     if saved_pos and saved_pos > 30 then
+        -- Multi-file item: map the global position onto the part that
+        -- contains it before prompting.
+        local start_file, start_offset = audio_path, saved_pos
+        if playlist_files and #playlist_files > 1 then
+            local cache_item = nil
+            pcall(function()
+                local ABSCache = dofile(self.path .. "/abscache.lua")
+                local cache = ABSCache:new{ plugin_dir = Utils.normalizeDirPath(self.path) }
+                cache_item = cache:getItem(item_id)
+            end)
+            start_file, start_offset = self:_resolveAbsPlaylistStart(
+                playlist_files, saved_pos, metadata, cache_item)
+            -- The mapped part must exist locally; a partial download falls
+            -- back to the requested file.
+            local f = start_file and io.open(start_file, "r")
+            if f then
+                f:close()
+            else
+                start_file, start_offset = audio_path, 0
+            end
+        end
         local ConfirmBox = require("ui/widget/confirmbox")
         local book_title = metadata and metadata.title
             or audio_path:match("([^/]+)%.[^./]+$") or audio_path:match("([^/]+)$") or _("Unknown book")
@@ -4718,6 +4853,15 @@ function Audiobook:_playAbsItem(item_id, audio_path, metadata)
         if chapter_title then
             table.insert(lines, T(_("Chapter: %1"), chapter_title))
         end
+        if playlist_files and #playlist_files > 1 then
+            local part_name = nil
+            for i, pf in ipairs(playlist_files) do
+                if pf.path == start_file then part_name = pf.name end
+            end
+            if part_name then
+                table.insert(lines, T(_("File: %1"), part_name))
+            end
+        end
         table.insert(lines, "")
         table.insert(lines, T(_("Last played: %1"), os.date("%Y-%m-%d %H:%M", saved_time or os.time())))
         UIManager:show(ConfirmBox:new{
@@ -4725,7 +4869,7 @@ function Audiobook:_playAbsItem(item_id, audio_path, metadata)
             ok_text = _("Resume"),
             cancel_text = _("Cancel"),
             ok_callback = function()
-                self:_doPlayAudioFile(audio_path, nil, saved_pos, item_id, metadata)
+                self:_doPlayAudioFile(start_file, playlist_files, start_offset, item_id, metadata)
             end,
             cancel_callback = function() end,
             other_buttons = {{
@@ -4733,7 +4877,9 @@ function Audiobook:_playAbsItem(item_id, audio_path, metadata)
                     text = _("From start"),
                     callback = function()
                         self:_clearPosition(audio_path)
-                        self:_doPlayAudioFile(audio_path, nil, 0, item_id, metadata)
+                        self:_doPlayAudioFile(playlist_files and playlist_files[1]
+                            and playlist_files[1].path or audio_path,
+                            playlist_files, 0, item_id, metadata)
                     end,
                 },
             }},
@@ -4741,7 +4887,8 @@ function Audiobook:_playAbsItem(item_id, audio_path, metadata)
         return
     end
 
-    self:_doPlayAudioFile(audio_path, nil, 0, item_id, metadata)
+    self:_doPlayAudioFile(playlist_files and playlist_files[1]
+        and playlist_files[1].path or audio_path, playlist_files, 0, item_id, metadata)
 end
 
 --[[--
@@ -4772,7 +4919,7 @@ function Audiobook:_startAbsSyncTimer()
                     self:_savePosition(path, pos)
                     self._abs_sync:recordProgress(
                         self.media_sync._abs_item_id,
-                        path, pos,
+                        path, self:_absGlobalPlaybackPos(pos),
                         self.media_sync._abs_duration or 0,
                         false
                     )
