@@ -1859,6 +1859,8 @@ function MediaEngine:_playSystemGstLaunch(gen)
         return nil
     end
     self._system_raw_file = raw_file
+    -- Plain filesrc playback has no filter stage: speed changes cannot apply.
+    self._speed_via_atempo = false
     -- What the user hears lags wall-clock position by the lead-in pad plus
     -- the mixer ring (~0.9 s) and BT chain (~0.3 s); the sync loop
     -- subtracts this so highlights match the audible audio.
@@ -1990,6 +1992,8 @@ function MediaEngine:_playSystemGstLaunchFfmpeg(gen)
     os.remove(progress_file)
     self._progress_file = progress_file
     self._use_progress_position = true
+    -- The ffmpeg decode carries atempo: speed changes restart this pipeline.
+    self._speed_via_atempo = true
 
     -- adelay lead-in absorbs A2DP datapath resume (otherwise swallows start);
     -- apad covers ring/BT buffers at EOS.  AirPods Pro need a longer lead-in
@@ -2439,6 +2443,8 @@ function MediaEngine:_playKindleGstPlay(gen)
     )
     logger.warn("MediaEngine: kindle-gst-play launch gen=", gen,
         "seek_offset=", self._seek_offset or 0)
+    -- The bundled wrapper plays raw PCM only: no filter stage for speed.
+    self._speed_via_atempo = false
 
     return self:_spawnTracked(cmd, gen, { name = "kindle-gst" })
 end
@@ -3624,17 +3630,24 @@ function MediaEngine:setSpeed(speed)
         end
     elseif self.backend == self.BACKENDS.FFMPEG_PIPE
         or self.backend == self.BACKENDS.GST_PLAY
-        or self.backend == self.BACKENDS.GST_PIPELINE then
-        -- ffmpeg-pipe and the persistent MTK pipeline support speed only via
-        -- the atempo filter, so restart at the current position when speed changes.
-        if math.abs(speed - old_speed) >= 0.01 then
-            local pos = self:getPosition() or 0
+        or self.backend == self.BACKENDS.GST_PIPELINE
+        or self.backend == self.BACKENDS.KINDLE_GST_PLAY then
+        -- ffmpeg-pipe, the persistent MTK pipeline, and the Kindle system
+        -- pipelines support speed only via the atempo filter baked into the
+        -- decode command, so restart to apply a change.  Mirror setVolume:
+        -- restart at the AUDIBLE position (the decode position leads the
+        -- listener by position_latency_s) and skip while paused (the resume
+        -- spawn already carries the new speed).  Raw-WAV Kindle playback has
+        -- no filter stage, so there is nothing to restart for.
+        if math.abs(speed - old_speed) >= 0.01 and self._speed_via_atempo ~= false then
+            if self.is_paused then return end
+            local pos = (self:getPosition() or 0) - (self.position_latency_s or 0)
             logger.warn("MediaEngine: restarting pipeline for speed change",
                 old_speed, "->", speed, "at pos", pos)
-            self:seek(pos, "absolute")
+            self:seek(math.max(0, pos), "absolute")
         end
     end
-    -- aplay / wav-play / Kindle do not support speed control
+    -- aplay / wav-play / Kindle LIPC do not support speed control
 end
 
 function MediaEngine:getSpeed()
