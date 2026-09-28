@@ -69,6 +69,8 @@ Downloader.PIPER_VOICES = {
     -- Czech
     { id = "cs_CZ-jirka-low",      name = "Jirka (Czech, low)",            size_mb = 15,  url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/cs/cs_CZ/jirka/low/cs_CZ-jirka-low.onnx" },
     { id = "cs_CZ-jirka-medium",   name = "Jirka (Czech, medium)",         size_mb = 60,  url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/cs/cs_CZ/jirka/medium/cs_CZ-jirka-medium.onnx" },
+    -- Slovak
+    { id = "sk_SK-lili-medium",    name = "Lili (Slovak, medium)",         size_mb = 63,  url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/sk/sk_SK/lili/medium/sk_SK-lili-medium.onnx" },
     -- Ukrainian
     { id = "uk_UA-lada-x_low",     name = "Lada (Ukrainian, x_low)",      size_mb = 5,   url = "https://huggingface.co/rhasspy/piper-voices/resolve/main/uk/uk_UA/lada/x_low/uk_UA-lada-x_low.onnx" },
     -- Hindi

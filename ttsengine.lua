@@ -1457,7 +1457,7 @@ function TTSEngine:_androidBookLanguage()
     local aliases = {
         zh = "zh-CN", ja = "ja-JP", ko = "ko-KR", en = "en-US",
         fr = "fr-FR", de = "de-DE", es = "es-ES", it = "it-IT",
-        pt = "pt-BR", nl = "nl-NL", pl = "pl-PL", cs = "cs-CZ",
+        pt = "pt-BR", nl = "nl-NL", pl = "pl-PL", cs = "cs-CZ", sk = "sk-SK",
         uk = "uk-UA", hi = "hi-IN", ar = "ar-JO", ca = "ca-ES",
         da = "da-DK", fi = "fi-FI", ru = "ru-RU", el = "el-GR",
         no = "no-NO", nb = "no-NO", nn = "no-NO", sv = "sv-SE",

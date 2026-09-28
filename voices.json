@@ -246,6 +246,12 @@
     "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/cs/cs_CZ/jirka/medium/cs_CZ-jirka-medium.onnx"
   },
   {
+    "id": "sk_SK-lili-medium",
+    "name": "Lili (Slovak, medium)",
+    "size_mb": 63,
+    "url": "https://huggingface.co/rhasspy/piper-voices/resolve/main/sk/sk_SK/lili/medium/sk_SK-lili-medium.onnx"
+  },
+  {
     "id": "uk_UA-lada-x_low",
     "name": "Lada (Ukrainian, x_low)",
     "size_mb": 5,
