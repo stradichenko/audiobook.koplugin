@@ -275,6 +275,68 @@ function Utils.splitWords(s)
     return words
 end
 
+--- True when an overlay timing entry can take part in a merged highlight.
+-- Requires the same fields the fragment-id highlight path needs: a resolvable
+-- SMIL fragment, its content document, and real span text. A raw text_ref
+-- (span extraction failed) leaks into `.text` as a path containing "#";
+-- prose never contains that, so it is rejected here.
+local function cueMergeable(e)
+    if not e then return false end
+    if not e.fragment_id or not e.text_doc then return false end
+    if type(e.text) ~= "string" then return false end
+    if Utils.ws(e.text) == "" then return false end
+    if e.text:find("#", 1, true) then return false end
+    return true
+end
+
+--- Partition an overlay timing slice into visual highlight groups.
+-- E-ink cannot repaint for every short SMIL cue, so consecutive short cues
+-- are merged into one highlight unit that stays on screen at least
+-- `threshold_s`. Contiguous index ranges over 1..#timing:
+--   groups:      array of {first=i, last=j} in order
+--   entry_group: map entry index -> 1-based group index
+-- A group extends only while the NEXT cue is short on its own (a long cue
+-- keeps its own visual unit), the span so far is under the threshold (so the
+-- final span reaches it), same content document, and both cues are
+-- mergeable. Non-mergeable entries become singletons and break runs, so a
+-- merged group's text is never empty. Returns nil, nil when there is
+-- nothing to group (empty input).
+-- @param timing table  Timing entries ({start_time, end_time, text, ...})
+-- @param threshold_s number  Minimum on-screen duration of a merged group
+-- @return table|nil, table|nil
+function Utils.buildCueGroups(timing, threshold_s)
+    local n = timing and #timing or 0
+    if n == 0 then return nil, nil end
+
+    local groups, entry_group = {}, {}
+    local i = 1
+    while i <= n do
+        local first, last = i, i
+        if cueMergeable(timing[i]) then
+            local t0 = timing[i].start_time or 0
+            while last < n do
+                local cand = timing[last + 1]
+                if not cueMergeable(cand) then break end
+                if cand.text_doc ~= timing[first].text_doc then break end
+                local cand_dur = (cand.end_time or 0) - (cand.start_time or 0)
+                if cand_dur > threshold_s then break end
+                -- Span BEFORE the candidate: the cue that reaches the
+                -- threshold is the last one absorbed, so a merged group's
+                -- on-screen lifetime never falls short of it.
+                local span = (timing[last].end_time or 0) - t0
+                if span >= threshold_s then break end
+                last = last + 1
+            end
+        end
+        groups[#groups + 1] = { first = first, last = last }
+        for j = first, last do
+            entry_group[j] = #groups
+        end
+        i = last + 1
+    end
+    return groups, entry_group
+end
+
 --- Longest prefix of `words` that appears as a contiguous phrase in `page`.
 function Utils.wordPrefixCount(words, page)
     if not words or #words == 0 or not page or page == "" then return 0 end

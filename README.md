@@ -242,6 +242,7 @@ All settings are under **Tools > Audiobook Read-Along**:
   - **Highlight style** - background (default), invert (best for e-ink), underline, box
   - **Auto-advance pages** - turn pages automatically
   - **Highlight sentences** - draw highlight on the active sentence
+  - **Group short cues (e-ink)** - for Media Overlay read-aloud books, merge consecutive short phrases into one highlight that stays on screen at least half a second, so slow e-ink refreshes do not skip between words; audio is unaffected
 - **Generate bug report** - save a diagnostic report to share when reporting issues
 - **Run device benchmark** - run a TTS performance benchmark on this device
 - **Check for updates** - fetch and install a newer release from GitHub

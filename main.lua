@@ -909,6 +909,17 @@ function Audiobook:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text = _("Group short cues (e-ink)"),
+                        enabled_func = function() return (self.ui and self.ui.document) or false end,
+                        checked_func = function()
+                            return self:getSetting("highlight_group_cues", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("highlight_group_cues", false)
+                        end,
+                        help_text = _("For EPUB Media Overlay read-aloud books: merge consecutive short phrases into one highlight that stays on screen at least half a second, so slow e-ink refreshes are not skipped between words. Audio is unaffected. Takes effect on the next audio part or after restarting read-aloud."),
+                    },
+                    {
                         text = _("Follow narration page (aligned)"),
                         enabled_func = function() return (self.ui and self.ui.document) or false end,
                         checked_func = function()

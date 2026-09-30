@@ -411,7 +411,16 @@ function HighlightManager:_fragmentTextRange(doc, fragment_id, sentence)
     end
 
     local xp_limit = nil
-    local next_id = self:_nextSmilFragmentId(sentence)
+    -- Grouped-cue highlights carry their own range limit: `false` means the
+    -- group ends the slice (deliberately no limit), nil falls back to the
+    -- next SMIL fragment. A plain `or` would turn false into a lookup that
+    -- clamps the merged range at the group's SECOND member.
+    local next_id
+    if sentence.limit_fragment_id ~= nil then
+        next_id = sentence.limit_fragment_id
+    else
+        next_id = self:_nextSmilFragmentId(sentence)
+    end
     if next_id and doc.getNormalizedXPointer then
         pcall(function()
             -- The next SMIL fragment may share this sentence's namespace

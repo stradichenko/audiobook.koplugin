@@ -35,6 +35,10 @@ local MediaSync = {
         PAUSED = "paused",
         LOADING = "loading",
     },
+    -- "Group short cues (e-ink)": minimum on-screen lifetime of a merged
+    -- highlight. E-ink refreshes take ~300-600 ms, so per-word overlay cues
+    -- are skipped by the display; merged groups are built to outlast them.
+    CUE_GROUP_MIN_S = 0.5,
 }
 
 function MediaSync:new(o)
@@ -722,6 +726,10 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
     self._current_word_idx = 0
     self._last_hl_idx = nil
     self._last_page_advance_idx = nil
+    -- Group keys are per-slice (1..N): a stale painted-marker from the
+    -- previous audio part could equal the new slice's first group and
+    -- suppress its first paint via the intra-group skip.
+    self._highlighted_sentence_idx = nil
     self._chain_generation = self._chain_generation + 1
     self._last_progress_pct = -1
     self._last_ui_update_time = nil
@@ -739,6 +747,19 @@ function MediaSync:start(audio_path, timing_data, chapters, cover_path, playlist
 
     -- Build sentence index from timing data
     self:_buildSentenceIndex()
+
+    -- Optional e-ink grouping: merge consecutive short SMIL cues into one
+    -- visual highlight (issue #97). Built AFTER the index so groups see the
+    -- sorted order the binary search uses. Nil when disabled, so every hot
+    -- path keeps its per-entry behavior.
+    self._cue_groups = nil
+    self._entry_cue_group = nil
+    if self.overlay_mode and self.plugin and self.plugin.getSetting
+        and self.plugin:getSetting("highlight_group_cues", false) then
+        self._cue_groups, self._entry_cue_group =
+            Utils.buildCueGroups(timing_data, self.CUE_GROUP_MIN_S)
+        dlog("cue groups", "n", #timing_data, "groups", self._cue_groups and #self._cue_groups or 0)
+    end
 
     -- Load and play audio
     if not self.media_engine:load(audio_path) then
@@ -1878,6 +1899,14 @@ function MediaSync:_updateHighlightAtTime(pos)
         self._current_word_idx = 1
         self._hl_fail_count = 0
         self._hl_retry_at = nil
+        -- E-ink cue grouping (issue #97): narration advancing inside an
+        -- already-painted visual group repaints nothing, jumps nothing, and
+        -- skips page-follow; the next group's entry change re-enters here.
+        if self._entry_cue_group
+            and self._entry_cue_group[sent_idx] ~= nil
+            and self._entry_cue_group[sent_idx] == self._highlighted_sentence_idx then
+            return
+        end
         -- EPUB Media Overlay: keep the book view following the narration.
         -- The SMIL fragment id resolves as a "#id" xpointer in crengine;
         -- turn the page before highlighting so the text-matching
@@ -1901,14 +1930,9 @@ function MediaSync:_updateHighlightAtTime(pos)
         if browsing_away then
             -- Stay on the user's page: do not paint a coincidental phrase.
         elseif self.highlight_manager and (sentence.text or sentence.fragment_id) then
-            -- Build a synthetic sentence object for HighlightManager
-            local sent_obj = {
-                text = sentence.text or "",
-                start_pos = sentence.start_pos or 0,
-                end_pos = sentence.end_pos or #(sentence.text or ""),
-                fragment_id = sentence.fragment_id,
-                text_doc = sentence.text_doc,
-            }
+            -- Synthetic sentence object for HighlightManager; a grouped cue
+            -- describes its whole visual group (text, range limit).
+            local sent_obj = self:_cueSentObj(sent_idx)
             local hl_ok = false
             pcall(function()
                 hl_ok = self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
@@ -1917,7 +1941,7 @@ function MediaSync:_updateHighlightAtTime(pos)
                 self:_cacheResolvedXPointer(sentence.text_doc, sentence.fragment_id)
             end
             if hl_ok then
-                self._highlighted_sentence_idx = sent_idx
+                self._highlighted_sentence_idx = self:_visualGroupOf(sent_idx)
                 self._hl_fail_count = 0
             end
 
@@ -1940,10 +1964,13 @@ function MediaSync:_updateHighlightAtTime(pos)
                             sentence.text_doc, sentence.fragment_id, true, sentence.text)
                         if not jumped then
                             -- Last resort: a single relative page turn, and only
-                            -- when advancing exactly one sentence (not a seek).
-                            if sent_idx == (self._last_hl_idx or 0) + 1
-                                and self._last_page_advance_idx ~= sent_idx then
-                                self._last_page_advance_idx = sent_idx
+                            -- when advancing exactly one visual unit (group or
+                            -- sentence), not a seek. Group-aware so a multi-member
+                            -- group does not permanently break the +1 test.
+                            local vis = ms:_visualGroupOf(sent_idx)
+                            if vis == ms:_visualGroupOf(ms._last_hl_idx or 0) + 1
+                                and ms._last_page_advance_idx ~= vis then
+                                ms._last_page_advance_idx = vis
                                 ui:handleEvent(Event:new("GotoViewRel", 1))
                             end
                         end
@@ -1955,7 +1982,11 @@ function MediaSync:_updateHighlightAtTime(pos)
                                 ms:_clearPageFollowAuto()
                                 return
                             end
-                            if ms._current_sentence_idx ~= target_idx then
+                            -- Group-aware abort: narration moving to another
+                            -- member of the SAME visual group must not cancel
+                            -- the retry for that group's highlight.
+                            if ms:_visualGroupOf(ms._current_sentence_idx)
+                                ~= ms:_visualGroupOf(target_idx) then
                                 ms:_clearPageFollowAuto()
                                 return
                             end
@@ -1966,7 +1997,7 @@ function MediaSync:_updateHighlightAtTime(pos)
                             end)
                             if retry_ok then
                                 ms._last_hl_idx = target_idx
-                                ms._highlighted_sentence_idx = target_idx
+                                ms._highlighted_sentence_idx = ms:_visualGroupOf(target_idx)
                                 ms._hl_fail_count = 0
                                 ms:_cacheResolvedXPointer(
                                     sentence.text_doc, sentence.fragment_id)
@@ -1996,7 +2027,7 @@ function MediaSync:_updateHighlightAtTime(pos)
     -- has settled, so the block above never runs for that first sentence.
     -- Keep retrying until the highlight actually lands.
     if sent_idx == self._current_sentence_idx
-        and self._highlighted_sentence_idx ~= sent_idx then
+        and self:_visualGroupOf(sent_idx) ~= self._highlighted_sentence_idx then
         self:_ensureSentenceHighlighted(sentence, sent_idx)
     end
 
@@ -2044,19 +2075,13 @@ function MediaSync:_ensureSentenceHighlighted(sentence, sent_idx)
     if self._hl_retry_at and now < self._hl_retry_at then return end
     self._hl_retry_at = now + time.s(0.35)
 
-    local sent_obj = {
-        text = sentence.text or "",
-        start_pos = sentence.start_pos or 0,
-        end_pos = sentence.end_pos or #(sentence.text or ""),
-        fragment_id = sentence.fragment_id,
-        text_doc = sentence.text_doc,
-    }
+    local sent_obj = self:_cueSentObj(sent_idx)
     local hl_ok = false
     pcall(function()
         hl_ok = self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
     end)
     if hl_ok then
-        self._highlighted_sentence_idx = sent_idx
+        self._highlighted_sentence_idx = self:_visualGroupOf(sent_idx)
         self._hl_fail_count = 0
         self._hl_retry_at = nil
         if sentence.fragment_id then
@@ -2250,16 +2275,11 @@ function MediaSync:_followSentenceAcrossPages(sentence, pos)
     if self.highlight_manager then
         self.highlight_manager._line_cache = nil
     end
-    -- Re-draw the sentence highlight after the page settles.
+    -- Re-draw the sentence highlight after the page settles. A grouped cue
+    -- repaints its whole visual group, not just the entry at the turn.
     local ms = self
     local sent_idx_at_turn = sent_idx
-    local sent_obj = {
-        text = sentence.text or "",
-        start_pos = sentence.start_pos or 0,
-        end_pos = sentence.end_pos or #(sentence.text or ""),
-        fragment_id = sentence.fragment_id,
-        text_doc = sentence.text_doc,
-    }
+    local sent_obj = self:_cueSentObj(sent_idx_at_turn)
     UIManager:scheduleIn(0.5, function()
         if ms.state ~= ms.STATE.PLAYING then
             ms:_clearPageFollowAuto()
@@ -2271,7 +2291,7 @@ function MediaSync:_followSentenceAcrossPages(sentence, pos)
                 ok_hl = ms.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})
             end)
             if ok_hl then
-                ms._highlighted_sentence_idx = sent_idx_at_turn
+                ms._highlighted_sentence_idx = ms:_visualGroupOf(sent_idx_at_turn)
                 ms._hl_fail_count = 0
             end
         end
@@ -2279,6 +2299,74 @@ function MediaSync:_followSentenceAcrossPages(sentence, pos)
             ms:_clearPageFollowAuto()
         end)
     end)
+end
+
+--- Visual key of a timing entry: its cue-group index when e-ink grouping is
+-- active, the entry index itself otherwise (identity, so every comparison
+-- reduces to today's per-entry behavior).
+function MediaSync:_visualGroupOf(idx)
+    local g = self._entry_cue_group
+    if g and idx then return g[idx] or idx end
+    return idx
+end
+
+--- Synthetic sentence object for the highlighter at entry `idx`.
+-- With grouping active and `idx` inside a multi-member group, the object
+-- describes the WHOLE group: concatenated text, first member's fragment
+-- identity, and `limit_fragment_id` pointing at the entry after the group
+-- (false = none, the slice ends here) so highlightmanager clamps the
+-- painted range at the group's true end instead of the second member.
+-- Without grouping this returns today's exact per-entry fields.
+function MediaSync:_cueSentObj(idx)
+    local data = self.timing_data
+    local entry = data and data[idx]
+    if not entry then return nil end
+
+    local g = self._entry_cue_group
+    local gi = g and g[idx]
+    if not gi or not self._cue_groups or not self._cue_groups[gi] then
+        return {
+            text = entry.text or "",
+            start_pos = entry.start_pos or 0,
+            end_pos = entry.end_pos or #(entry.text or ""),
+            fragment_id = entry.fragment_id,
+            text_doc = entry.text_doc,
+        }
+    end
+
+    local grp = self._cue_groups[gi]
+    if grp.last <= grp.first then
+        return {
+            text = entry.text or "",
+            start_pos = entry.start_pos or 0,
+            end_pos = entry.end_pos or #(entry.text or ""),
+            fragment_id = entry.fragment_id,
+            text_doc = entry.text_doc,
+        }
+    end
+
+    local texts = {}
+    for j = grp.first, grp.last do
+        local t = data[j] and data[j].text
+        if t and t ~= "" then
+            texts[#texts + 1] = t
+        end
+    end
+    local text = table.concat(texts, " ")
+    local next_entry = data[grp.last + 1]
+    local limit = false
+    if next_entry and next_entry.fragment_id
+        and next_entry.text_doc == entry.text_doc then
+        limit = next_entry.fragment_id
+    end
+    return {
+        text = text,
+        start_pos = entry.start_pos or 0,
+        end_pos = #text,
+        fragment_id = entry.fragment_id,
+        text_doc = entry.text_doc,
+        limit_fragment_id = limit,
+    }
 end
 
 function MediaSync:_findSentenceAtTime(pos)
@@ -2743,6 +2831,9 @@ function MediaSync:navigateToSentenceEntry(entry)
 
     self._current_sentence_idx = sent_idx
     self._last_hl_idx = sent_idx
+    -- Entry-level navigation inside an already-painted visual group must
+    -- not suppress the highlight retry if the scheduled paint below fails.
+    self._highlighted_sentence_idx = nil
     logger.warn("MediaSync: navigating to entry", sent_idx, sentence.text_doc, sentence.fragment_id)
 
     if self.plugin and time then
@@ -2762,13 +2853,8 @@ function MediaSync:navigateToSentenceEntry(entry)
     end)
 
     if self.highlight_manager and (sentence.text or sentence.fragment_id) then
-        local sent_obj = {
-            text = sentence.text or "",
-            start_pos = sentence.start_pos or 0,
-            end_pos = sentence.end_pos or #(sentence.text or ""),
-            fragment_id = sentence.fragment_id,
-            text_doc = sentence.text_doc,
-        }
+        -- Paint the entry's whole visual group when e-ink grouping is on.
+        local sent_obj = self:_cueSentObj(sent_idx)
         self.highlight_manager._line_cache = nil
         UIManager:scheduleIn(0.3, function()
             pcall(function()
@@ -2838,15 +2924,10 @@ function MediaSync:refocusToCurrentSentence()
         ms:_clearPageFollowAuto()
     end)
 
-    -- Re-highlight the current sentence after the page settles.
+    -- Re-highlight the current sentence after the page settles. A grouped
+    -- cue repaints its whole visual group.
     if self.highlight_manager and (sentence.text or sentence.fragment_id) then
-        local sent_obj = {
-            text = sentence.text or "",
-            start_pos = sentence.start_pos or 0,
-            end_pos = sentence.end_pos or #(sentence.text or ""),
-            fragment_id = sentence.fragment_id,
-            text_doc = sentence.text_doc,
-        }
+        local sent_obj = self:_cueSentObj(sent_idx)
         UIManager:scheduleIn(0.3, function()
             pcall(function()
                 self.highlight_manager:highlightSentence(sent_obj, {sentences = {sent_obj}})

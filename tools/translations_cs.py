@@ -251,6 +251,8 @@ TRANSLATIONS_CS = {
     "Highlight style: %1": "Styl zvýraznění: %1",
     "Auto-advance pages": "Automaticky otáčet stránky",
     "Highlight sentences": "Zvýrazňovat věty",
+    "Group short cues (e-ink)": "Seskupovat krátké značky (e-ink)",
+    "For EPUB Media Overlay read-aloud books: merge consecutive short phrases into one highlight that stays on screen at least half a second, so slow e-ink refreshes are not skipped between words. Audio is unaffected. Takes effect on the next audio part or after restarting read-aloud.": "Pro knihy EPUB Media Overlay čtené nahlas: sloučí po sobě jdoucí krátké fráze do jednoho zvýraznění, které zůstane na obrazovce nejméně půl sekundy, aby pomalé obnovování e-inku nepřeskakovalo mezi slovy. Zvuk není ovlivněn. Projeví se při další zvukové části nebo po restartu čtení nahlas.",
     "Follow narration page (aligned)": "Sledovat stránku vyprávění (zarovnané)",
     "When enabled (default), the book view auto-turns to keep the current narration sentence on screen while you stay with the read-aloud. Manually turning a page never seeks or restarts audio: highlighting pauses and a “Return to read-aloud” cue appears until you jump back or the narration catches up.": "Je-li zapnuto (výchozí), zobrazení knihy se automaticky otáčí tak, aby aktuální věta vyprávění zůstala na obrazovce, dokud čtení sledujete. Ruční otočení stránky nikdy neposouvá ani nerestartuje zvuk: zvýrazňování se pozastaví a zobrazí se výzva „Zpět ke čtení nahlas“, dokud neskočíte zpět nebo jej vyprávění nedožene.",
     "Keep the audiobook bar": "Ponechat panel audioknihy",
