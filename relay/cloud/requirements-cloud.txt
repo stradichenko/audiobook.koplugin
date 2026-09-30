@@ -1,0 +1,7 @@
+# 云端版依赖（PythonAnywhere / 任意 WSGI 平台）
+# 在 Bash console 里执行：
+#   pip3 install --user -r requirements-cloud.txt
+edge-tts
+flask
+av
+numpy

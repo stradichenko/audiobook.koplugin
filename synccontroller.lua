@@ -463,6 +463,30 @@ function SyncController:_beginReading(text, created_bar, keep_text)
     -- Parse the full text into sentences and words
     self.parsed_data = self.text_parser:parse(text)
 
+    -- A new page invalidates any queued lookahead from the previous page.
+    if self.tts_engine and self.tts_engine._nativePrefetchClear then
+        self.tts_engine:_nativePrefetchClear()
+    end
+
+    -- A new reading session starts here: re-arm the long first-sentence
+    -- overlay grace so the next sentence 1 gets the full startup window.
+    self._read_session_started = nil
+    self._playback_started = nil
+    -- Deterministic first-sentence overlay auto-pause suppression.  The time-based
+    -- grace below is unreliable on cold cloud synthesis (sentence 1 can take 15-30s
+    -- to synthesize, so the grace expires before audio even starts and the startup
+    -- chrome wrongly auto-pauses).  Instead, SUPPRESS overlay auto-pause for the
+    -- entire first sentence's playback; clear it once sentence 2 begins (see
+    -- beginSentencePlayback).  This guarantees the session starts uninterrupted
+    -- regardless of cold-start duration.
+    self._suppress_overlay_pause = true
+    -- Arm a generous overlay grace BEFORE the sync loop begins polling, so the
+    -- transient startup chrome (page transition / CRe reflow / one-off widgets)
+    -- can't trigger a false "extra UI widget on stack" auto-pause on sentence 1.
+    -- beginSentencePlayback tops this up per sentence; 30s comfortably covers a
+    -- slow cloud synthesis of sentence 1 plus the startup window.
+    self._overlay_grace_until = UIManager:getTime() + 30
+
     local skipped_carry = 0
     local skipped_spoken = 0
     if self.parsed_data then
@@ -611,7 +635,7 @@ function SyncController:readNextSentence()
     if self._piper_abandoned and self.tts_engine and self.tts_engine.espeak_bin then
         logger.dbg("SyncController: espeak-only mode, sentence", self.reading_sentence_idx)
         local fb_file = nil
-        if self.tts_engine:usePrefetched(sentence.text) then
+        if self.tts_engine:usePrefetched(sentence.text, self.reading_sentence_idx) then
             -- Prefetched during the previous sentence's playback (issue #49)
             fb_file = self.tts_engine.current_audio_file
         else
@@ -632,7 +656,7 @@ function SyncController:readNextSentence()
         sentence.text:sub(1, 60))
 
     -- Check if we already prefetched this sentence's audio
-    local used_prefetch = self.tts_engine:usePrefetched(sentence.text)
+    local used_prefetch = self.tts_engine:usePrefetched(sentence.text, self.reading_sentence_idx)
     if used_prefetch then
         -- Audio is ready — apply timing and start playback immediately
         logger.warn("SyncController: Using prefetched audio for sentence", self.reading_sentence_idx)
@@ -754,7 +778,7 @@ function SyncController:readNextSentence()
             end
 
             -- Use non-consuming peek so we can delay playback for buffering
-            local pf_file = controller.tts_engine:peekPrefetch(sentence.text)
+            local pf_file = controller.tts_engine:peekPrefetch(sentence.text, controller.reading_sentence_idx)
             if pf_file then
                 -- Target sentence is ready.
                 if not target_ready_at then
@@ -771,7 +795,7 @@ function SyncController:readNextSentence()
 
                 if enough or timed_out then
                     -- Consume the prefetch and start playback
-                    local ok = controller.tts_engine:usePrefetched(sentence.text)
+                    local ok = controller.tts_engine:usePrefetched(sentence.text, controller.reading_sentence_idx)
                     if ok then
                         logger.warn("SyncController: Piper prefetch arrived for sentence",
                             controller.reading_sentence_idx, "after",
@@ -792,7 +816,7 @@ function SyncController:readNextSentence()
                     UIManager:scheduleIn(0.25, waitForPiperPrefetch)
                 else
                     -- Hard timeout: play whatever we have
-                    local ok = controller.tts_engine:usePrefetched(sentence.text)
+                    local ok = controller.tts_engine:usePrefetched(sentence.text, controller.reading_sentence_idx)
                     if ok then
                         controller._piper_warmed_up = true
                         controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
@@ -918,7 +942,7 @@ function SyncController:readNextSentence()
                     return
                 end
             end
-            local ok = controller.tts_engine:usePrefetched(sentence.text)
+            local ok = controller.tts_engine:usePrefetched(sentence.text, controller.reading_sentence_idx)
             if ok then
                 logger.warn("SyncController: Piper queue delivered sentence",
                     controller.reading_sentence_idx, "after", poll_count * 0.25, "s",
@@ -1080,6 +1104,47 @@ function SyncController:beginSentencePlayback(sentence)
     -- reading_sentence_idx in a re-parsed page.
     self._first_play_sentence_text = sentence.text
 
+    -- Kick off synthesis of the NEXT sentence(s) as early as possible so they
+    -- are ready (or nearly so) when this one finishes.  For the cloud-relay
+    -- backend a round-trip is 4-15 s; without this the listener hears that
+    -- silence at every sentence boundary.  We queue a small lookahead (N+1 and
+    -- N+2) so the concat builder has already-synthesized audio to merge into
+    -- one continuous clip, which also halves the number of boundaries.
+    -- Only for the platform-native (cloud) backend — other backends keep their
+    -- existing single-slot / Piper-queue prefetch strategy below.
+    local nb = self.tts_engine and self.tts_engine.backend
+    local NB = self.tts_engine and self.tts_engine.BACKENDS
+    if NB and (nb == NB.NATIVE or nb == NB.KINDLE_NATIVE) then
+        -- The prefetch body is deferred by _prefetchNextSentence so it never
+        -- blocks this frame; the native queue dedups repeat requests.
+        for offset = 1, 2 do
+            self:_prefetchNextSentence(self.reading_sentence_idx + offset)
+        end
+    end
+
+    -- Startup overlay grace: on the FIRST sentence of a session the reader is
+    -- still finishing its transition (file-manager → reader, CRe reflow, the
+    -- one-off "starting" chrome).  For a few seconds the window stack briefly
+    -- holds 2+ non-toast widgets, which made _isOverlayActive() fire a false
+    -- "extra UI widget on stack" auto-pause right after sentence 1 started —
+    -- the user then had to tap once to continue.  Suppress overlay auto-pause
+    -- for this window so the session begins uninterrupted.  The very first
+    -- sentence of a session gets a longer window because its startup chrome
+    -- can linger several seconds; later sentences use a shorter grace.
+    local grace_s = 4
+    if not self._read_session_started then
+        grace_s = 8
+        self._read_session_started = true
+    end
+    -- Once we are past the first sentence, stop suppressing overlay auto-pause:
+    -- the startup chrome is gone and normal pause-on-menu behaviour should resume.
+    if sentence.index and sentence.index >= 2 then
+        self._suppress_overlay_pause = false
+    end
+    if not self._overlay_grace_until or self._overlay_grace_until < UIManager:getTime() then
+        self._overlay_grace_until = UIManager:getTime() + grace_s
+    end
+
     local controller = self
 
     -- Update playback bar
@@ -1096,12 +1161,32 @@ function SyncController:beginSentencePlayback(sentence)
     -- Build concat pipeline with ALL remaining sentences on the page.
     -- Each extra sentence takes ~100-300 ms to synthesize on ARM — far
     -- less than the ~1.5 s BT A2DP re-negotiation gap it eliminates.
+    --
+    -- For the platform-native (cloud) backend the win is much larger: a
+    -- relay round-trip is 4-15 s, so without concat the listener hears that
+    -- silence at EVERY sentence boundary.  Merging the already-prefetched
+    -- next sentence into this clip halves the number of boundaries.  The
+    -- kindle-gst-play player plays a single file, so it merges the prefetch
+    -- WAV into current_audio_file (see TTSEngine:play); gst-bt does the same.
     local concat_files = nil         -- array of {file, duration_ms} for play()
     local concat_sentences = {}      -- sentence objects (N+1, N+2, …)
     local concat_split_points = {}   -- cumulative-ms boundaries for the sync loop
     local concat_wav_files = {}      -- WAV paths to clean up later
-
-    if self.parsed_data and self.tts_engine.audio_player_type == "gst-bt" then
+    local player_type = self.tts_engine and self.tts_engine.audio_player_type
+    -- Concat (multiple sentences merged into ONE WAV for a single gapless
+    -- clip) is only safe on the persistent gst-bt pipeline.  For the
+    -- cloud-relay (NATIVE) backend on kindle-gst-play the prefetch is
+    -- asynchronous and the concat builder's synchronous peekPrefetch() usually
+    -- finds nothing ready; and when it does merge an async-prefetched WAV into
+    -- the current file, the appended PCM is silent / skipped on Kindle
+    -- (MTK/Bluetooth sink buffer issues with the enlarged WAV).  That produced
+    -- "2 sentences per clip but the 2nd is silent" and segment-skips on
+    -- device.  NATIVE instead relies on the prefetch queue to overlap
+    -- synthesis so sentence boundaries are seamless (no 10-16s dead silence)
+    -- while still playing one sentence per clip — correct and robust.
+    -- Revisit 2-3-sentence grouping for NATIVE only with on-device logs.
+    local concat_ok = (player_type == "gst-bt")
+    if self.parsed_data and concat_ok then
         local synth_t0 = UIManager:getTime()
         local first_dur = self.tts_engine:getAudioDurationMs()
         local cumulative_ms = first_dur
@@ -1139,14 +1224,14 @@ function SyncController:beginSentencePlayback(sentence)
             -- This prevents double-padding: if the sentence isn't ready and
             -- we break, we haven't padded the previous sentence.  The
             -- trailing-gap code after the loop handles the final padding.
-            local pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
+            local pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text, idx)
             if not pf_file then
                 if self.tts_engine.backend == self.tts_engine.BACKENDS.PIPER or self.tts_engine.backend == self.tts_engine.BACKENDS.SANOTTS then
                     logger.warn("SyncController: Concat: Piper sentence", idx, "not ready yet, stopping concat")
                     break
                 end
-                self.tts_engine:prefetch(sent.text)
-                pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text)
+                self.tts_engine:prefetch(sent.text, nil, idx)
+                pf_file, pf_timing, pf_dur = self.tts_engine:peekPrefetch(sent.text, idx)
             end
             if not pf_file or pf_dur <= 0 then
                 logger.warn("SyncController: Concat synthesis failed at sentence", idx)
@@ -1217,6 +1302,12 @@ function SyncController:beginSentencePlayback(sentence)
             -- the entry so cleanQueue doesn't double-delete the file.
             -- The file is now owned by concat_wav_files.
             self.tts_engine:consumePiperQueueEntry(sent.text)
+            -- Same for the native (cloud-relay) prefetch queue: the WAV is now
+            -- owned by concat_wav_files / this play group, so drop the queue
+            -- entry without deleting the file.
+            if self.tts_engine._nativePrefetchDetach then
+                self.tts_engine:_nativePrefetchDetach(sent.text)
+            end
 
             -- Protect espeak-ng prefetch file from _cleanPrefetch deletion
             self.tts_engine._prefetch_in_use = true
@@ -1412,6 +1503,22 @@ function SyncController:beginSentencePlayback(sentence)
     )
 
     if play_ok then
+        -- If the player could not merge the extra sentences into the clip
+        -- (format mismatch, disk error), it plays only the first sentence.
+        -- The controller must then NOT advance past the others or they would
+        -- be silently swallowed.  Drop them from this play group so they are
+        -- re-read on the next cycle.
+        if self.tts_engine._concat_merge_failed and #concat_sentences > 0 then
+            logger.warn("SyncController: concat merge failed, re-reading",
+                #concat_sentences, "sentence(s) on the next cycle")
+            for _, f in ipairs(concat_wav_files) do os.remove(f) end
+            concat_sentences = {}
+            concat_split_points = {}
+            concat_wav_files = {}
+            self.tts_engine._concat_merge_failed = nil
+            sentences_in_play = 1
+        end
+
         -- Scale the FIRST sentence's word timings to match the real WAV
         -- duration.  play() scales engine.timing_data but the sync loop
         -- reads sentence.words which still have the raw espeak estimates.
@@ -1534,7 +1641,7 @@ function SyncController:_prefetchNextSentence(explicit_idx)
     -- instead of the dead Piper queue.
     local use_espeak = self._piper_abandoned and true or false
     UIManager:scheduleIn(0.2, function()
-        engine:prefetch(text, use_espeak)
+        engine:prefetch(text, use_espeak, next_idx)
     end)
 end
 
@@ -2120,6 +2227,21 @@ function SyncController:startSentenceSyncLoop(sentence)
         self.sentence_sync_start = UIManager:getTime()
     end
     self._resuming_sync = false
+    -- Re-arm the overlay auto-pause grace at ACTUAL playback start.
+    -- The grace set earlier (in _beginReading / beginSentencePlayback) is
+    -- measured from when synthesis BEGAN.  For the first sentence of a session
+    -- the cloud relay can take 15-30s (cold start), so by the time audio
+    -- actually plays that grace has already expired and the transient startup
+    -- chrome wrongly auto-pauses sentence 1 (forcing a manual tap).  Re-arm
+    -- from playback start so the first sentence is fully covered.
+    do
+        local grace_s = self._playback_started and 4 or 45
+        local new_grace = UIManager:getTime() + grace_s
+        if not self._overlay_grace_until or new_grace > self._overlay_grace_until then
+            self._overlay_grace_until = new_grace
+        end
+        self._playback_started = true
+    end
     -- Generation counter: old sync loops exit when a new one starts
     self.sync_generation = (self.sync_generation or 0) + 1
     local my_generation = self.sync_generation
@@ -2143,7 +2265,15 @@ function SyncController:startSentenceSyncLoop(sentence)
         local pause_on_menu = not self.plugin
             or self.plugin.getSetting == nil
             or self.plugin:getSetting("pause_on_menu", true)
-        if self.playback_bar and self.playback_bar._isOverlayActive and self.playback_bar:_isOverlayActive() then
+        -- Startup grace: ignore transient startup chrome on the first
+        -- sentence of a session (see beginSentencePlayback).  Without this the
+        -- very first sentence auto-paused itself and needed a manual tap.
+        local in_overlay_grace = self._overlay_grace_until
+            and UIManager:getTime() < self._overlay_grace_until
+        if not in_overlay_grace
+                and not self._suppress_overlay_pause
+                and self.playback_bar and self.playback_bar._isOverlayActive
+                and self.playback_bar:_isOverlayActive() then
             if pause_on_menu then
                 if not self._auto_paused_by_overlay then
                     self._auto_paused_by_overlay = true
@@ -2886,6 +3016,10 @@ function SyncController:stop()
     self.reading_page_xpointer = nil
     self._user_paused = false
     self._auto_paused_by_overlay = false
+    self._overlay_grace_until = nil
+    self._read_session_started = nil
+    self._suppress_overlay_pause = nil
+    self._playback_started = nil
     self._latency_locked = false
     self._locked_latency_ms = nil
     self._next_page_text = nil

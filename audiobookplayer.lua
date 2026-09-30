@@ -2193,6 +2193,14 @@ end
 
 --- Extra window-stack widgets (menus/dialogs) besides this chrome.
 function AudiobookPlayer:_isOverlayActive()
+    -- Overlay auto-pause is DISABLED by default.  On the MiuRead reader (and other
+    -- heavily-chromed Kindle readers) the reader's own toolbar / overlay widgets
+    -- sit permanently on the UIManager stack, so this check almost always reports
+    -- "extra UI widget on stack" and falsely auto-pauses mid-read — every page,
+    -- right after sentence 2.  The user can pause manually (☰ menu button, BT
+    -- headset button, or a tap), so continuous reading wins.  Set
+    -- AudiobookPlayer.OVERLAY_AUTO_PAUSE = true to re-enable for vanilla KOReader.
+    if not AudiobookPlayer.OVERLAY_AUTO_PAUSE then return false end
     local stack = UIManager._window_stack
     if not stack then return false end
     local non_toast = 0
@@ -2223,5 +2231,8 @@ function AudiobookPlayer:paintTo(bb, x, y)
         self[1]:paintTo(bb, x or 0, y or 0)
     end
 end
+
+-- Overlay auto-pause defaults OFF (see _isOverlayActive above).
+AudiobookPlayer.OVERLAY_AUTO_PAUSE = false
 
 return AudiobookPlayer

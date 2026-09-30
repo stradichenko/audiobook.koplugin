@@ -371,10 +371,25 @@ function Audiobook:_initSubmodules()
                 end
                 -- Android system TTS: do not split on ; : — that sent
                 -- mid-clause fragments to the engine and broke highlighting.
+                -- Cloud / platform-native helper (Edge-TTS relay): use a LARGE
+                -- but bounded cap. The relay handles a whole sentence well, and
+                -- a large cap keeps the highlight aligned to complete sentences
+                -- instead of mid-clause fragments that wrap across lines. It
+                -- must stay bounded (not 10000): the relay needs a few seconds
+                -- per request and an entire page in one request would time out.
                 local b = self.tts_engine and self.tts_engine.backend
                 local B = self.tts_engine and self.tts_engine.BACKENDS
                 if B and b == B.ANDROID then
                     return 10000
+                end
+                if B and (b == B.NATIVE or b == B.KINDLE_NATIVE) then
+                    -- The parser now splits CJK text at real sentence endings
+                    -- (。！？) first, so most utterances are already short.  This
+                    -- cap only bites on a genuinely long sentence with no
+                    -- end-punctuation; 1000 bytes (~330 CJK chars) keeps such a
+                    -- sentence intact rather than pausing at a comma.  The relay
+                    -- handles 1000 bytes in ~20-25s, inside the 45s helper budget.
+                    return 1000
                 end
                 return nil  -- default cap
             end
@@ -497,6 +512,17 @@ function Audiobook:onDispatcherRegisterActions()
         title = _("Stop Read-Along"),
         reader = true,
     })
+    -- Start read-along from the top of the CURRENT page.  Bindable to any
+    -- gesture (or a hardware key) from KOReader's Gesture Manager so the user
+    -- can begin listening with a single tap/swipe without opening the menu.
+    Dispatcher:registerAction("audiobook_read_from_page", {
+        category = "reading",
+        event = "AudiobookReadFromPage",
+        title = _("Read aloud from current page"),
+        reader = true,
+    })
+    logger.warn("Audiobook cloud-TTS patch: BUILD 20261001c (prefetch ON + clip-validate, "
+        .. "onTap double-tap, overlay auto-pause OFF) loaded — if you see this in crash.log the new files are live")
 end
 
 function Audiobook:_showInitError()
@@ -559,6 +585,7 @@ function Audiobook:addToMainMenu(menu_items)
                     if not self._init_ok then self:_showInitError(); return end
                     self:startReadAlong()
                 end,
+                help_text = _("Starts reading aloud from the top of the current page. On MiuRead the KOReader Gesture Manager is not available, so use this menu entry (or double-tap the page) to start."),
             },
             -- ── Media playback (audio files & EPUB overlays) ──
             {
@@ -826,7 +853,7 @@ function Audiobook:addToMainMenu(menu_items)
                         callback = function()
                             self:toggleSetting("keep_playing_on_lid_close", false)
                         end,
-                        help_text = _("When enabled, closing the case/cover keeps audio playing: the device stays awake while something is playing and suspends on its own within 30 seconds once playback stops or pauses. When disabled (default), playback pauses on lid close and resumes when reopened. Disabling prevents device crashes caused by audio processes running during hardware suspend."),
+                        help_text = _("When enabled, closing the case/cover will not stop audio playback. When disabled (default), playback pauses on lid close and resumes when reopened. Disabling prevents device crashes caused by audio processes running during hardware suspend."),
                     },
                     {
                         text = _("Pause reading when a menu opens"),
@@ -3739,6 +3766,21 @@ function Audiobook:onAudiobookStop()
     return true
 end
 
+--- Dispatcher action: start read-along from the top of the current page.
+--- Unlike AudiobookToggle (which pauses/resumes when already active), this
+--- always (re)starts narration from the current page — matching the
+--- "Start Text-to-Speech from current page" menu entry.
+function Audiobook:onAudiobookReadFromPage()
+    if not self._init_ok then self:_showInitError(); return true end
+    -- Media playback (audio files / overlays) takes precedence and has no
+    -- page text; ignore the gesture in that case.
+    if self.media_sync and self.media_sync.state ~= "stopped" then
+        return true
+    end
+    self:startReadAlong()
+    return true
+end
+
 -- ── BT media button event handlers (AVRCP) ──────────────────────────
 -- These are dispatched by KOReader's input system when the AVRCP evdev
 -- device sends key events (play/pause/next/prev from a BT headset).
@@ -4393,6 +4435,40 @@ end
 --- Pin the overlay mini-bar and restore the last sentence (highlighted,
 --- audio armed, not playing) so Play continues from there.
 function Audiobook:onReaderReady()
+    -- Best-effort double-tap-to-read-along.  MiuRead's reader does NOT surface
+    -- KOReader Dispatcher actions in its Gesture Manager, and its gesture_manager
+    -- API differs from upstream, so the previous registerGesture attempt silently
+    -- no-op'd.  We instead wrap the reader's own onTap handler and detect a rapid
+    -- double-tap by timing -- fully reader-agnostic and pcall-guarded.  We only
+    -- START when not already reading, so an in-progress session's double-tap is
+    -- left to MiuRead (no hijack / no conflict).  The ☰ menu entry remains the
+    -- guaranteed trigger.
+    pcall(function()
+        if self.ui and self.ui.onTap and not self.ui._ab_ontap_wrapped then
+            local orig_onTap = self.ui.onTap
+            self.ui._ab_ontap_wrapped = true
+            self._ab_doubletap_t = 0
+            self.ui.onTap = function(ui, arg, ...)
+                local now = os.clock()
+                local dt = now - (self._ab_doubletap_t or 0)
+                self._ab_doubletap_t = now
+                if dt > 0 and dt < 0.35 then
+                    -- double-tap detected
+                    if self.sync_controller and not self.sync_controller:isPlaying() then
+                        logger.warn("Audiobook cloud-TTS patch: double-tap -> startReadAlong")
+                        self:startReadAlong()
+                        return true
+                    end
+                end
+                return orig_onTap(ui, arg, ...)
+            end
+            logger.warn("Audiobook cloud-TTS patch: double-tap-to-read-along enabled (onTap wrap)")
+        elseif self.ui and self.ui._ab_ontap_wrapped then
+            logger.warn("Audiobook cloud-TTS patch: double-tap already wrapped for this reader")
+        else
+            logger.warn("Audiobook cloud-TTS patch: cannot enable double-tap (no self.ui.onTap)")
+        end
+    end)
     if not self._init_ok or not self.media_sync then return end
     if not self:getSetting("keep_media_overlay_bar", false) then return end
     if not (self.ui and self.ui.rolling and self.ui.document) then return end
@@ -4455,23 +4531,11 @@ function Audiobook:onCloseWidget()
     end
 end
 
--- How often (seconds) the lid-close watchdog re-checks playback while a
--- suspend block is active.  When nothing is audible anymore the device is
--- sent to the normal suspend path within one interval plus a short
--- confirmation delay.
-local LID_SUSPEND_CHECK_INTERVAL = 30
--- A single non-playing observation can be a transient (track advance,
--- sentence gap); the suspend only fires once it persists this long.
-local LID_CONFIRM_INTERVAL = 5
-
 --[[--
 Install custom SleepCoverClosed/Opened handlers.
 When "keep playing on lid close" is enabled AND audio is playing, the
 override prevents the device from entering full hardware suspend so
-audio continues uninterrupted.  A watchdog re-checks playback every
-LID_SUSPEND_CHECK_INTERVAL seconds and runs the original suspend path
-the moment playback stops or pauses, so the device never lies awake
-with nothing audible.  When the setting is off (or audio isn't
+audio continues uninterrupted.  When the setting is off (or audio isn't
 playing), the original KOReader handlers are called normally.
 --]]
 function Audiobook:_installSleepCoverOverride()
@@ -4489,53 +4553,17 @@ function Audiobook:_installSleepCoverOverride()
 
     local plugin = self
 
-    -- Watchdog body: while a lid-close suspend block is active, re-check
-    -- playback and fall back to the original suspend path as soon as
-    -- nothing is playing anymore (BT pause button, sleep timer, playlist
-    -- end, stalled pipeline).  A brief non-playing blip (track advance,
-    -- sentence gap) only suspends if it persists through the confirmation
-    -- re-check.
-    local function lidWatchdogTick()
-        if not plugin._prevented_lid_suspend then return end
-        local still_playing = false
-        if plugin.sync_controller and plugin.sync_controller:isPlaying() then
-            still_playing = true
-        end
-        if plugin.media_sync and plugin.media_sync:isPlaying() then
-            still_playing = true
-        end
-        if still_playing then
-            plugin._lid_watchdog_blip = false
-            UIManager:scheduleIn(LID_SUSPEND_CHECK_INTERVAL, lidWatchdogTick)
-            return
-        end
-        if not plugin._lid_watchdog_blip then
-            plugin._lid_watchdog_blip = true
-            UIManager:scheduleIn(LID_CONFIRM_INTERVAL, lidWatchdogTick)
-            return
-        end
-        plugin._lid_watchdog_blip = false
-        plugin._prevented_lid_suspend = false
-        logger.warn("Audiobook: lid closed but playback stopped, suspending device")
-        if plugin._orig_sleep_cover_closed then
-            plugin._orig_sleep_cover_closed()
-        end
-    end
-    plugin._lid_watchdog_tick = lidWatchdogTick
-
     UIManager.event_handlers.SleepCoverClosed = function()
         -- Stop any active session recording when the cover closes.
         if plugin.session_recorder then
             pcall(function() plugin.session_recorder:stop() end)
         end
-        -- Check if anything is actually playing (TTS or media file).
-        -- A paused session must NOT block suspend: with nothing audible
-        -- the device has no reason to stay awake.
+        -- Check if anything is playing (TTS or media file)
         local is_playing = false
-        if plugin.sync_controller and plugin.sync_controller:isPlaying() then
+        if plugin.sync_controller and (plugin.sync_controller:isPlaying() or plugin.sync_controller:isPaused()) then
             is_playing = true
         end
-        if plugin.media_sync and plugin.media_sync:isPlaying() then
+        if plugin.media_sync and (plugin.media_sync:isPlaying() or plugin.media_sync:isPaused()) then
             is_playing = true
         end
         -- If "keep playing" is on AND we're actively playing, prevent suspend
@@ -4543,16 +4571,8 @@ function Audiobook:_installSleepCoverOverride()
             if Device.is_cover_closed ~= nil then
                 Device.is_cover_closed = true
             end
-            local was_already_prevented = plugin._prevented_lid_suspend
             plugin._prevented_lid_suspend = true
-            if not was_already_prevented then
-                logger.warn("Audiobook: SleepCover closed — keeping audio alive (suspend prevented)")
-            end
-            -- Arm the watchdog so the device suspends shortly after
-            -- playback stops instead of draining the battery awake.
-            plugin._lid_watchdog_blip = false
-            UIManager:unschedule(lidWatchdogTick)
-            UIManager:scheduleIn(LID_SUSPEND_CHECK_INTERVAL, lidWatchdogTick)
+            logger.warn("Audiobook: SleepCover closed — keeping audio alive (suspend prevented)")
             return
         end
         -- Setting off or not playing: use original KOReader behavior
@@ -4568,8 +4588,6 @@ function Audiobook:_installSleepCoverOverride()
         if plugin._prevented_lid_suspend then
             -- We blocked suspend on close, so there's nothing to resume from
             plugin._prevented_lid_suspend = false
-            plugin._lid_watchdog_blip = false
-            UIManager:unschedule(lidWatchdogTick)
             logger.warn("Audiobook: SleepCover opened — no resume needed (suspend was prevented)")
             return
         end
@@ -4589,11 +4607,6 @@ Called on plugin teardown to leave KOReader in a clean state.
 function Audiobook:_removeSleepCoverOverride()
     if not self._orig_sleep_cover_closed then return end
 
-    if self._lid_watchdog_tick then
-        pcall(function() UIManager:unschedule(self._lid_watchdog_tick) end)
-        self._lid_watchdog_tick = nil
-    end
-
     if UIManager.event_handlers then
         UIManager.event_handlers.SleepCoverClosed = self._orig_sleep_cover_closed
         UIManager.event_handlers.SleepCoverOpened = self._orig_sleep_cover_opened
@@ -4601,7 +4614,6 @@ function Audiobook:_removeSleepCoverOverride()
     self._orig_sleep_cover_closed = nil
     self._orig_sleep_cover_opened = nil
     self._prevented_lid_suspend = nil
-    self._lid_watchdog_blip = nil
     logger.dbg("Audiobook: SleepCover override removed")
 end
 

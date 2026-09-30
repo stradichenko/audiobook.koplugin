@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>中继 Relay · 中英双语 README</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    max-width: 920px; margin: 0 auto; padding: 0 22px 60px;
+    line-height: 1.75; color: #1f2328;
+  }
+  @media (prefers-color-scheme: dark) { body { color: #e6edf3; } }
+  .lang-switch {
+    position: sticky; top: 0; z-index: 50;
+    display: flex; gap: 10px; align-items: center;
+    padding: 14px 0; margin-bottom: 8px;
+    background: linear-gradient(to bottom, rgba(255,255,255,.96), rgba(255,255,255,.86));
+    backdrop-filter: blur(6px); border-bottom: 1px solid #d0d7de;
+  }
+  @media (prefers-color-scheme: dark) {
+    .lang-switch { background: linear-gradient(to bottom, rgba(13,17,23,.96), rgba(13,17,23,.82));
+                   border-bottom-color: #30363d; }
+  }
+  .lang-switch .hint { font-size: 13px; opacity: .65; margin-right: auto; }
+  .lang-switch button {
+    font-size: 15px; padding: 8px 18px; cursor: pointer;
+    border: 1px solid #8b949e; border-radius: 9px; background: transparent; color: inherit;
+    transition: all .15s ease;
+  }
+  .lang-switch button:hover { border-color: #2b6cb0; }
+  .lang-switch button.active { background: #2b6cb0; color: #fff; border-color: #2b6cb0; }
+  .lang-zh, .lang-en { display: none; }
+  body.show-zh .lang-zh { display: block; }
+  body.show-en .lang-en { display: block; }
+  h1 { font-size: 1.9em; margin: 18px 0 12px; }
+  h2 { font-size: 1.4em; margin: 34px 0 10px; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; }
+  @media (prefers-color-scheme: dark) { h2 { border-bottom-color: #30363d; } }
+  h3 { font-size: 1.15em; margin: 22px 0 8px; }
+  code { background: rgba(127,127,127,.16); padding: .15em .4em; border-radius: 5px; font-size: .9em; }
+  pre { background: rgba(127,127,127,.12); padding: 14px 16px; border-radius: 10px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 10px; text-align: left; vertical-align: top; }
+  @media (prefers-color-scheme: dark) { th, td { border-color: #30363d; } }
+  th { background: rgba(127,127,127,.14); }
+  blockquote { border-left: 4px solid #2b6cb0; margin: 12px 0; padding: 4px 16px; opacity: .9; }
+  a { color: #2b6cb0; }
+  hr { border: none; border-top: 1px solid #d0d7de; margin: 36px 0; }
+  @media (prefers-color-scheme: dark) { hr { border-top-color: #30363d; } }
+</style>
+</head>
+<body class="show-zh">
+
+  <div class="lang-switch">
+    <span class="hint">语言 / Language</span>
+    <button id="btn-zh" class="active" onclick="setLang('zh')">🇨🇳 中文</button>
+    <button id="btn-en" onclick="setLang('en')">🇬🇧 English</button>
+  </div>
+
+  <!-- ============================ 中文 ============================ -->
+  <div class="lang-zh">
+    <h1>中继（relay）：云端 Render 或本地运行</h1>
+
+    <p><code>tts_cn</code> 插件<strong>自己不合成语音</strong>，它把每句话发给一个「中继」服务；中继用微软 edge-tts 合成中文，转成 Kindle 能直接播放的 WAV（16bit / 16000Hz / 单声道）再返回。本目录就是中继服务的全部代码。</p>
+
+    <p>两种跑法：</p>
+    <ul>
+      <li><strong>本地</strong>：手机 Termux 或任意电脑，走局域网 <code>http://</code>（手机要开着，适合在家）。</li>
+      <li><strong>云端 Render</strong>：部署到公网，走 <code>https://</code>（手机彻底不用参与，适合出门 / 长期稳定）。</li>
+    </ul>
+    <blockquote>部署完成后你会拿到形如 <code>https://tts-relay-xxxx.onrender.com</code> 的公网地址，填进 Kindle 即可。</blockquote>
+
+    <h2>目录里的文件</h2>
+    <table>
+      <tr><th>文件</th><th>用途</th></tr>
+      <tr><td><code>tts_relay_android.py</code></td><td>Flask 中继主程序，<strong>本地 / 云端通用</strong>，直接 <code>python</code> 跑</td></tr>
+      <tr><td><code>relay.sh</code></td><td>Termux 一键控制：<code>setup</code> / <code>start</code> / <code>stop</code> / <code>restart</code> / <code>status</code> / <code>log</code> / <code>test</code></td></tr>
+      <tr><td><code>requirements.txt</code></td><td>依赖（本地 / Render 都用它）</td></tr>
+      <tr><td><code>cloud/render.yaml</code></td><td>Render 部署配置（Python 运行时，自动读）</td></tr>
+      <tr><td><code>cloud/Dockerfile</code></td><td>备选：Docker 方式部署（Railway / 任意支持 Docker 的平台）</td></tr>
+      <tr><td><code>cloud/wsgi.py</code> + <code>cloud/tts_relay_cloud.py</code> + <code>cloud/requirements-cloud.txt</code></td><td>alwaysdata / PythonAnywhere 等纯 HTTP WSGI 平台用</td></tr>
+    </table>
+
+    <h2>一、本地中继（手机 Termux / 任意电脑）</h2>
+
+    <h3>方式 A：手机 Termux（推荐，出门也能用）</h3>
+    <pre><code># 把本目录拷到手机 ~/tts_relay，然后：
+bash relay.sh setup     # pkg 装 python/ffmpeg/termux-tools；pip 装 edge-tts/flask；开唤醒锁
+bash relay.sh start     # 后台常驻（setsid nohup），打印 Kindle 要填的地址</code></pre>
+    <p><code>relay.sh</code> 子命令：<code>setup</code> / <code>start</code> / <code>stop</code> / <code>restart</code> / <code>status</code> / <code>log</code> / <code>test</code>。</p>
+
+    <h3>方式 B：任意电脑 / 服务器（非 Termux）</h3>
+    <pre><code>pip install -r requirements.txt
+python tts_relay_android.py
+# 自定义端口 / 采样率：
+PORT=8080 TTS_WAV_RATE=22050 python tts_relay_android.py</code></pre>
+    <p>控制台（<code>http://手机IP:5000/</code>）和启动日志都会打印 Kindle 要填的地址：</p>
+    <pre><code>http://&lt;手机IP&gt;:5000/tts?voice=zh-CN-XiaoxiaoNeural&amp;text={text}</code></pre>
+
+    <h3>⚠️ 背景保活（Termux 最小化后 Kindle 收不到请求）</h3>
+    <p><strong>现象</strong>：Termux 浮窗时能正常朗读，一最小化 / 切到别的 App，Kindle 端就卡住收不到音频。</p>
+    <p><strong>原因</strong>：Android 后台执行限制（Doze + 电池优化），不是代码 bug——App 进后台后系统挂起它的 CPU/网络。</p>
+    <p>按优先级处理（前两步通常就够）：</p>
+    <ol>
+      <li><strong>关闭 Termux 的电池优化（最关键）</strong>：系统设置 → 应用 → Termux → 电池/省电优化 → 设为「不限制」。小米/三星/OPPO 等还有厂商自带的「神隐模式 / 内存加速 / 自启动管理」，把 Termux 加进白名单。</li>
+      <li><strong>装 Termux:API（F-Droid）</strong> → <code>relay.sh</code> 已自动调用 <code>termux-wake-lock</code> 持 partial wakelock，降低被挂起概率。</li>
+      <li><strong>Termux:Boot</strong> → 开机自启，作为系统拉起的后台进程更抗杀。</li>
+      <li><strong>Termux:Float</strong> → 常驻浮窗，始终前台，最稳但占屏幕。</li>
+      <li><strong>仍不稳定 / 想「最小化就忘掉」</strong> → 做成 <strong>APK 前台服务（带常驻通知）</strong> 才是根治：前台服务系统不敢随意杀，最小化、锁屏都持续收请求（本项目另含 APK 方案，不在本中继仓库内）。</li>
+    </ol>
+    <blockquote>判断标准：能接受「手机留个浮窗 / 关电池优化」→ 用本中继；想彻底无感后台 → 走 APK 前台服务。</blockquote>
+
+    <h2>二、云端 Render（公网 https，手机不用参与）</h2>
+    <p>免费、不用绑卡，部署一次长期可用。Render 免费层会<strong>休眠</strong>，首次访问冷启动几秒，之后正常。</p>
+
+    <h3>0. 注册 Render 账号（首次）</h3>
+    <ol>
+      <li>打开 <a href="https://render.com">https://render.com</a>，点右上角 <strong>Sign Up</strong>。</li>
+      <li>推荐点 <strong>Continue with GitHub</strong>（用 GitHub 登录）：在弹出的 GitHub 授权页点 <strong>Authorize render</strong>，这样后面部署能直接在下拉里选到你的仓库。也可以用 Google 或邮箱注册（邮箱注册需点开验证邮件激活）。</li>
+      <li>登录后进入 <strong>Dashboard</strong>（控制台首页），说明账号已就绪。</li>
+      <li>（可选）<strong>Account → Billing</strong> 确认是免费套餐；Web Service 免费层够用（会休眠，首次访问冷启动几秒）。不绑定支付方式也能部署免费层；若平台要求绑卡做风控校验，按提示绑一张（仅校验、不扣费），或改用下面的 Railway / 纯 HTTP 平台。</li>
+      <li>账号就绪后，继续下面的「1. 准备代码 / 2. 部署」。</li>
+    </ol>
+
+    <h3>1. 准备代码</h3>
+    <p>把本 <code>relay/</code> 目录（至少含 <code>tts_relay_android.py</code>、<code>requirements.txt</code>）推到你的 GitHub 仓库。（仓库里已带 <code>cloud/render.yaml</code>；Render 连上仓库会自动读取。）</p>
+
+    <h3>2. 部署</h3>
+    <ul>
+      <li>Render 控制台 → <strong>New</strong> → <strong>Web Service</strong> → 连该 GitHub 仓库；</li>
+      <li>Render 自动读 <code>cloud/render.yaml</code>：Python 运行时、free 套餐、构建时装 ffmpeg + 依赖、启动 <code>python tts_relay_android.py</code>、健康检查 <code>/healthz</code>；</li>
+      <li>确认 Build / Start 命令后点 <strong>Deploy</strong>；</li>
+      <li>几分钟后得到形如 <strong><code>https://tts-relay-xxxx.onrender.com</code></strong> 的地址——这就是控制台地址，也是 Kindle 要填的地址。</li>
+    </ul>
+    <p><code>render.yaml</code> 关键内容（已内置，无需手改）：</p>
+    <pre><code>services:
+  - type: web
+    name: tts-relay
+    runtime: python
+    plan: free
+    buildCommand: "apt-get update &amp;&amp; apt-get install -y ffmpeg &amp;&amp; pip install -r requirements.txt"
+    startCommand: "python tts_relay_android.py"
+    healthCheckPath: /healthz
+    envVars:
+      - key: TTS_WAV_RATE
+        value: "16000"
+      - key: TTS_RATE
+        value: "+0%"</code></pre>
+    <blockquote>备选 Docker 方式：把 <code>runtime</code> 改成 <code>docker</code>、删 <code>buildCommand</code>/<code>startCommand</code>，Render 会用同目录 <code>Dockerfile</code> 构建（更稳，但免费层镜像构建稍慢）。</blockquote>
+
+    <h3>3. 控制台 / 验证</h3>
+    <p>打开 <code>https://你的域名/</code> 可在线试听、看 Kindle 请求计数（确认连到了云端）。</p>
+
+    <h2>三、Kindle 端怎么填</h2>
+    <p>插件里：<strong>设置 → 在线接口地址</strong>，填下面这种完整 URL（<strong>务必保留 <code>{text}</code> 和 <code>{voice}</code> 占位符</strong>，插件会自动把当前句文本和所选音色替换进去）：</p>
+    <ul>
+      <li>本地：<code>http://&lt;手机IP&gt;:5000/tts?voice=zh-CN-XiaoxiaoNeural&amp;text={text}</code></li>
+      <li>云端：<code>https://tts-relay-xxxx.onrender.com/tts?voice=zh-CN-XiaoxiaoNeural&amp;text={text}</code></li>
+    </ul>
+
+    <h3>请求格式（中继接口）</h3>
+    <pre><code>GET /tts?voice=&lt;音色&gt;&amp;text=&lt;URL 编码的中文&gt;</code></pre>
+    <ul>
+      <li><code>voice</code>：微软音色，如 <code>zh-CN-XiaoxiaoNeural</code>（晓晓）/<code>zh-CN-YunxiNeural</code>（云希）/<code>zh-CN-YunyangNeural</code>（云扬）；</li>
+      <li><code>text</code>：要朗读的中文，按字节 UTF-8 百分比编码（插件里的 <code>urlencode</code> 已处理）；</li>
+      <li><strong>返回</strong>：16bit PCM 单声道 WAV（16000Hz），Kindle 端 ALSA 直写播放。</li>
+    </ul>
+    <blockquote>当前插件版本会从 <code>build_url</code> 强制把 <code>voice</code> 参数替换成设置里选的音色，所以 <code>{voice}</code> 占位符和写死 <code>XiaoxiaoNeural</code> 都能正确生效；<code>{text}</code> 永远是必填占位符。</blockquote>
+
+    <h2>四、其他云端（备选）</h2>
+    <ul>
+      <li><strong>Railway</strong>：与 Render 同思路（用 <code>render.yaml</code>/Dockerfile），生成 <code>https://tts-relay-xxxx.up.railway.app</code>。</li>
+      <li><strong>alwaysdata / PythonAnywhere</strong>：<strong>纯 HTTP</strong> 域名（<code>http://用户名.alwaysdata.net</code>、<code>http://用户名.pythonanywhere.com</code>）。仅当 <strong>Kindle 3 的 TLS 栈坏、<code>https://</code> 一律连不上</strong> 时才需要——用 <code>cloud/wsgi.py</code> 作为 WSGI 入口 + <code>cloud/requirements-cloud.txt</code> 装依赖，控制台填 <code>http://...</code>。</li>
+    </ul>
+
+    <h2>五、排错速查</h2>
+    <table>
+      <tr><th>现象</th><th>排查</th></tr>
+      <tr><td>云端连不上 / 超时</td><td>看 Render 控制台「请求计数」是否在涨；免费层冷启动慢，第一次访问等几秒。睡了的点一下控制台唤醒</td></tr>
+      <tr><td>本地最小化后断</td><td>见上方「Termux 背景保活」5 步</td></tr>
+      <tr><td>Kindle 3 对 <code>https://</code> 域名连不上</td><td>TLS 栈坏 → 换 alwaysdata / PythonAnywhere 纯 HTTP，或本地局域网</td></tr>
+      <tr><td>听到「百分之九 c」之类噪声</td><td>取文混入了孤立坏字节；v1.83+ 插件已 <code>sanitize_utf8</code> 兜底，升级插件即可</td></tr>
+      <tr><td>蓝牙音箱没声（Oasis 等）</td><td>插件默认直写内置声卡，蓝牙连接时本机扬声器被静音；设置里把「音频后端优先级」切到「系统音频(蓝牙)」（v1.85+），或填蓝牙 ALSA 设备名</td></tr>
+    </table>
+
+    <h2>可选：极简单文件版（relay/standalone）</h2>
+    <p>如果你只想先在电脑上跑通、懒得部署上面的完整中继，仓库还附带一个零额外配置的极简单文件中继
+    <a href="./standalone/relay_server.py">relay/standalone/relay_server.py</a>：</p>
+    <pre><code>cd relay/standalone
+pip install -r requirements.txt
+python relay_server.py --host 0.0.0.0 --port 5000
+# 然后 cloud_tts.cfg 填 RELAY_BASE=http://&lt;中继IP&gt;:5000/tts</code></pre>
+    <blockquote>它与上面的 <code>tts_relay_android.py</code> 功能等价（Edge-TTS → WAV），但只有一个文件、无 Web 控制台；适合快速本地验证。</blockquote>
+  </div>
+
+  <!-- ============================ English ============================ -->
+  <div class="lang-en">
+    <h1>Relay: Cloud (Render) or Local</h1>
+
+    <p>The <code>tts_cn</code> plugin does <strong>not</strong> synthesize speech by itself — it sends every sentence to a "relay" service. The relay uses Microsoft Edge-TTS to synthesize Chinese, converts it into WAV (16-bit / 16000 Hz / mono) that the Kindle can play directly, then returns it. This directory contains the complete relay service code.</p>
+
+    <p>Two ways to run it:</p>
+    <ul>
+      <li><strong>Local</strong>: a phone running Termux, or any computer, over the LAN <code>http://</code> (the phone must stay on; good for home use).</li>
+      <li><strong>Cloud (Render)</strong>: deploy to the public internet over <code>https://</code> (no phone involved at all; good for going out / long-term stability).</li>
+    </ul>
+    <blockquote>After deployment you'll get a public address like <code>https://tts-relay-xxxx.onrender.com</code> — fill it into the Kindle.</blockquote>
+
+    <h2>Files in this directory</h2>
+    <table>
+      <tr><th>File</th><th>Purpose</th></tr>
+      <tr><td><code>tts_relay_android.py</code></td><td>Flask relay main program, <strong>works both locally and in the cloud</strong>, run directly with <code>python</code></td></tr>
+      <tr><td><code>relay.sh</code></td><td>Termux one-command control: <code>setup</code> / <code>start</code> / <code>stop</code> / <code>restart</code> / <code>status</code> / <code>log</code> / <code>test</code></td></tr>
+      <tr><td><code>requirements.txt</code></td><td>Dependencies (used by both local and Render)</td></tr>
+      <tr><td><code>cloud/render.yaml</code></td><td>Render deploy config (Python runtime, auto-read)</td></tr>
+      <tr><td><code>cloud/Dockerfile</code></td><td>Alternative: Docker deployment (Railway / any Docker-supporting platform)</td></tr>
+      <tr><td><code>cloud/wsgi.py</code> + <code>cloud/tts_relay_cloud.py</code> + <code>cloud/requirements-cloud.txt</code></td><td>For pure-HTTP WSGI platforms like alwaysdata / PythonAnywhere</td></tr>
+    </table>
+
+    <h2>1. Local Relay (Phone Termux / Any Computer)</h2>
+
+    <h3>Method A: Phone Termux (recommended, works even when out)</h3>
+    <pre><code># Copy this directory to the phone at ~/tts_relay, then:
+bash relay.sh setup     # pkg installs python/ffmpeg/termux-tools; pip installs edge-tts/flask; acquires wake-lock
+bash relay.sh start     # runs in background (setsid nohup), prints the address to fill into the Kindle</code></pre>
+    <p><code>relay.sh</code> sub-commands: <code>setup</code> / <code>start</code> / <code>stop</code> / <code>restart</code> / <code>status</code> / <code>log</code> / <code>test</code>.</p>
+
+    <h3>Method B: Any PC / Server (non-Termux)</h3>
+    <pre><code>pip install -r requirements.txt
+python tts_relay_android.py
+# Custom port / sample rate:
+PORT=8080 TTS_WAV_RATE=22050 python tts_relay_android.py</code></pre>
+    <p>Both the web console (<code>http://phone-IP:5000/</code>) and the startup log print the address to fill into the Kindle:</p>
+    <pre><code>http://&lt;phone-IP&gt;:5000/tts?voice=zh-CN-XiaoxiaoNeural&amp;text={text}</code></pre>
+
+    <h3>⚠️ Background keep-alive (Kindle stops receiving requests after Termux is minimized)</h3>
+    <p><strong>Symptom</strong>: reading works fine while Termux is a floating window, but once it's minimized / you switch to another app, the Kindle stalls and stops receiving audio.</p>
+    <p><strong>Cause</strong>: Android background execution limits (Doze + battery optimization), not a code bug — once the app goes to the background the system suspends its CPU/network.</p>
+    <p>Handle in priority order (the first two steps are usually enough):</p>
+    <ol>
+      <li><strong>Disable Termux battery optimization (most critical)</strong>: System Settings → Apps → Termux → Battery/Saving Optimization → set to "Unrestricted". On Xiaomi/Samsung/OPPO etc. there are also vendor "hidden-mode / memory-acceleration / auto-start managers" — add Termux to their whitelist.</li>
+      <li><strong>Install Termux:API (F-Droid)</strong> → <code>relay.sh</code> already calls <code>termux-wake-lock</code> automatically to hold a partial wakelock, reducing the chance of being suspended.</li>
+      <li><strong>Termux:Boot</strong> → auto-starts on boot; as a system-launched background process it's more resistant to being killed.</li>
+      <li><strong>Termux:Float</strong> → stays as a floating window, always in the foreground; most stable but uses screen space.</li>
+      <li><strong>Still unstable / want to "minimize and forget"</strong> → the real fix is an <strong>APK foreground service (with a persistent notification)</strong>: the system won't casually kill a foreground service, so it keeps receiving requests even when minimized or screen-locked (this project also ships an APK variant, outside this relay repo).</li>
+    </ol>
+    <blockquote>Rule of thumb: if you can accept "leaving a floating window / disabling battery optimization" → use this relay; if you want a fully invisible background → go with the APK foreground service.</blockquote>
+
+    <h2>2. Cloud (Render) (public https, no phone needed)</h2>
+    <p>Free, no card binding required, deploy once and use long-term. Render's free tier will <strong>sleep</strong>; the first visit has a cold-start of a few seconds, then it runs normally.</p>
+
+    <h3>0. Sign up for a Render account (first time)</h3>
+    <ol>
+      <li>Open <a href="https://render.com">https://render.com</a> and click <strong>Sign Up</strong> in the top-right.</li>
+      <li>Recommended: click <strong>Continue with GitHub</strong> (log in with GitHub): on the popup GitHub authorization page click <strong>Authorize render</strong>, so later you can pick your repo directly from the dropdown. You can also sign up with Google or email (email sign-up requires clicking the verification email to activate).</li>
+      <li>After logging in you reach the <strong>Dashboard</strong> (console home) — this means the account is ready.</li>
+      <li>(Optional) <strong>Account → Billing</strong> to confirm the free plan; the Web Service free tier is enough (it sleeps, cold-start a few seconds on first visit). You can deploy the free tier without binding a payment method; if the platform requires a card for risk-control verification, bind one as prompted (verification only, no charge), or switch to Railway / a pure-HTTP platform below.</li>
+      <li>Once the account is ready, continue with "1. Prepare code / 2. Deploy" below.</li>
+    </ol>
+
+    <h3>1. Prepare code</h3>
+    <p>Push this <code>relay/</code> directory (at least <code>tts_relay_android.py</code> and <code>requirements.txt</code>) to your GitHub repo. (The repo already includes <code>cloud/render.yaml</code>; Render reads it automatically when connected.)</p>
+
+    <h3>2. Deploy</h3>
+    <ul>
+      <li>Render console → <strong>New</strong> → <strong>Web Service</strong> → connect that GitHub repo;</li>
+      <li>Render auto-reads <code>cloud/render.yaml</code>: Python runtime, free plan, installs ffmpeg + deps at build, starts <code>python tts_relay_android.py</code>, health check <code>/healthz</code>;</li>
+      <li>Confirm the Build / Start commands, then click <strong>Deploy</strong>;</li>
+      <li>After a few minutes you get an address like <strong><code>https://tts-relay-xxxx.onrender.com</code></strong> — this is both the console address and the address to fill into the Kindle.</li>
+    </ul>
+    <p>Key contents of <code>render.yaml</code> (built-in, no manual edit needed):</p>
+    <pre><code>services:
+  - type: web
+    name: tts-relay
+    runtime: python
+    plan: free
+    buildCommand: "apt-get update &amp;&amp; apt-get install -y ffmpeg &amp;&amp; pip install -r requirements.txt"
+    startCommand: "python tts_relay_android.py"
+    healthCheckPath: /healthz
+    envVars:
+      - key: TTS_WAV_RATE
+        value: "16000"
+      - key: TTS_RATE
+        value: "+0%"</code></pre>
+    <blockquote>Alternative Docker method: change <code>runtime</code> to <code>docker</code> and remove <code>buildCommand</code>/<code>startCommand</code>; Render will build with the same-directory <code>Dockerfile</code> (more stable, but the free-tier image build is a bit slower).</blockquote>
+
+    <h3>3. Console / Verify</h3>
+    <p>Open <code>https://your-domain/</code> to audition online and see the Kindle request counter (confirms it's connected to the cloud).</p>
+
+    <h2>3. Kindle Configuration</h2>
+    <p>In the plugin: <strong>Settings → Online API URL</strong>, fill in a complete URL like below (<strong>keep the <code>{text}</code> and <code>{voice}</code> placeholders</strong>, the plugin will substitute the current sentence text and the selected voice automatically):</p>
+    <ul>
+      <li>Local: <code>http://&lt;phone-IP&gt;:5000/tts?voice=zh-CN-XiaoxiaoNeural&amp;text={text}</code></li>
+      <li>Cloud: <code>https://tts-relay-xxxx.onrender.com/tts?voice=zh-CN-XiaoxiaoNeural&amp;text={text}</code></li>
+    </ul>
+
+    <h3>Request format (relay API)</h3>
+    <pre><code>GET /tts?voice=&lt;voice&gt;&amp;text=&lt;URL-encoded Chinese&gt;</code></pre>
+    <ul>
+      <li><code>voice</code>: a Microsoft voice, e.g. <code>zh-CN-XiaoxiaoNeural</code> (Xiaoxiao) / <code>zh-CN-YunxiNeural</code> (Yunxi) / <code>zh-CN-YunyangNeural</code> (Yunyang);</li>
+      <li><code>text</code>: the Chinese to read aloud, percent-encoded byte-by-byte in UTF-8 (handled by the plugin's <code>urlencode</code>);</li>
+      <li><strong>Returns</strong>: 16-bit PCM mono WAV (16000 Hz), written straight to ALSA on the Kindle side for playback.</li>
+    </ul>
+    <blockquote>The current plugin version forces the <code>voice</code> parameter from <code>build_url</code> to the voice selected in settings, so both the <code>{voice}</code> placeholder and a hard-coded <code>XiaoxiaoNeural</code> work correctly; <code>{text}</code> is always a required placeholder.</blockquote>
+
+    <h2>4. Other Cloud Platforms (alternatives)</h2>
+    <ul>
+      <li><strong>Railway</strong>: same idea as Render (uses <code>render.yaml</code>/Dockerfile), produces <code>https://tts-relay-xxxx.up.railway.app</code>.</li>
+      <li><strong>alwaysdata / PythonAnywhere</strong>: <strong>pure-HTTP</strong> domains (<code>http://username.alwaysdata.net</code>, <code>http://username.pythonanywhere.com</code>). Only needed when <strong>the Kindle 3's TLS stack is broken and <code>https://</code> can't connect at all</strong> — use <code>cloud/wsgi.py</code> as the WSGI entry point + install deps from <code>cloud/requirements-cloud.txt</code>, and fill <code>http://...</code> in the console.</li>
+    </ul>
+
+    <h2>5. Troubleshooting</h2>
+    <table>
+      <tr><th>Symptom</th><th>Fix</th></tr>
+      <tr><td>Cloud unreachable / timeout</td><td>Check whether the Render console "request counter" is rising; the free tier cold-starts slowly, wait a few seconds on first visit. Click the console to wake a sleeping instance</td></tr>
+      <tr><td>Local drops after minimize</td><td>See the "Termux background keep-alive" 5 steps above</td></tr>
+      <tr><td>Kindle 3 can't connect to <code>https://</code></td><td>Broken TLS stack → switch to alwaysdata / PythonAnywhere pure HTTP, or use the local LAN</td></tr>
+      <tr><td>Hearing noise like "percent-nine-c"</td><td>Stray bad bytes slipped into the text; plugin v1.83+ already has <code>sanitize_utf8</code> fallback — just upgrade the plugin</td></tr>
+      <tr><td>No Bluetooth speaker sound (Oasis etc.)</td><td>The plugin writes straight to the built-in sound card by default, muting the local speaker when Bluetooth is connected; in settings switch "Audio backend priority" to "System audio (Bluetooth)" (v1.85+), or fill in the Bluetooth ALSA device name</td></tr>
+    </table>
+
+    <h2>Optional: Minimal single-file relay (relay/standalone)</h2>
+    <p>If you just want to get it running on a PC first without deploying the full relay above, the repo also ships a zero-extra-config minimal single-file relay
+    <a href="./standalone/relay_server.py">relay/standalone/relay_server.py</a>:</p>
+    <pre><code>cd relay/standalone
+pip install -r requirements.txt
+python relay_server.py --host 0.0.0.0 --port 5000
+# Then set RELAY_BASE=http://&lt;relay-IP&gt;:5000/tts in cloud_tts.cfg</code></pre>
+    <blockquote>It is functionally equivalent to <code>tts_relay_android.py</code> above (Edge-TTS → WAV) but is a single file with no web console; good for a quick local check.</blockquote>
+  </div>
+
+  <script>
+    function setLang(lang) {
+      document.body.className = 'show-' + lang;
+      document.getElementById('btn-zh').classList.toggle('active', lang === 'zh');
+      document.getElementById('btn-en').classList.toggle('active', lang === 'en');
+      try { localStorage.setItem('relay-lang', lang); } catch (e) {}
+    }
+    try {
+      var saved = localStorage.getItem('relay-lang');
+      if (saved === 'en') setLang('en');
+    } catch (e) {}
+  </script>
+</body>
+</html>

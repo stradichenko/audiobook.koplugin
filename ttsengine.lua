@@ -220,6 +220,33 @@ Detect available TTS backend.
 --]]
 function TTSEngine:detectBackend()
     local is_android = Device:isAndroid()
+    -- Cloud TTS helper: default the native helper path to the bundled
+    -- cloud_tts_helper.sh (if present) so the "Platform-native helper" engine
+    -- is usable out of the box. This runs before the early returns below so it
+    -- takes effect even on devices that already have espeak/piper installed
+    -- (those branches return before reaching the native backend check).
+    if self.plugin then
+        local configured_path = self.plugin:getSetting("native_helper_path", "") or ""
+        if configured_path == "" then
+            local plugin_dir = Utils.normalizeDirPath(self.plugin_dir or "/mnt/onboard/.adds/koreader/plugins/audiobook.koplugin")
+            local bundled_helper = plugin_dir .. "/cloud_tts_helper.sh"
+            local hf = io.open(bundled_helper, "r")
+            local helper_ok = hf ~= nil
+            if helper_ok then
+                hf:close()
+            else
+                -- io.open can fail on some devices for certain file types;
+                -- fall back to a shell test like the engine does elsewhere.
+                local rc = os.execute("test -f '" .. bundled_helper .. "' 2>/dev/null")
+                helper_ok = rc == 0 or rc == true
+            end
+            if helper_ok then
+                self.plugin:setSetting("native_helper_path", bundled_helper)
+                os.execute("chmod +x '" .. bundled_helper .. "' 2>/dev/null")
+                logger.warn("TTSEngine: defaulted native_helper_path to bundled cloud helper:", bundled_helper)
+            end
+        end
+    end
     --- Check if a file exists, with shell fallback for devices where
     --- io.open may fail on binary files (observed on some Kindle models).
     local function fileAccessible(path)
@@ -813,7 +840,21 @@ function TTSEngine:_synthesizeNativeOneshot(text, audio_file, speed, callback)
 
     local engine = self
     local poll_count = 0
-    local max_polls = 120
+    -- How long to wait for the helper to finish, in 0.5s polls.
+    -- Cloud relay round-trips are commonly 2-15s but can spike (Render cold
+    -- start, long sentence, relay queue).  The helper itself enforces a hard
+    -- TOTAL_BUDGET (cloud_tts.cfg, default 45s) so it always exits before this
+    -- ceiling; we keep a comfortable margin above it so a *successful* helper
+    -- run is never cut off.  Previously 120 (=60s) sat too close to the helper's
+    -- worst case, so slow-but-valid runs were abandoned and the player stalled
+    -- at the same spot where the old %XX garble used to appear.
+    -- Overridable via the "native_poll_max" setting (in polls); default 160 (=80s).
+    local max_polls = 160
+    do
+        local v = self.plugin and self.plugin:getSetting("native_poll_max", "")
+        local n = tonumber(v)
+        if n and n >= 20 then max_polls = math.floor(n) end
+    end
     local function pollNativeDone()
         poll_count = poll_count + 1
         local mf = io.open(done_marker, "r")
@@ -864,6 +905,236 @@ function TTSEngine:_synthesizeNativeOneshot(text, audio_file, speed, callback)
     UIManager:scheduleIn(0.3, pollNativeDone)
     return nil
 end
+
+--[[--
+Platform-native helper prefetch (FIFO queue, lookahead N).
+
+Why: the cloud relay takes 4-15 s per sentence.  Without lookahead the next
+sentence is only synthesized AFTER the current one finishes playing, so the
+listener hears 10-16 s of dead air at every sentence boundary.  This keeps a
+small queue of pre-synthesized sentences so the next one (and, when ready, the
+one after it, merged into a single concat clip) is already on disk.
+
+Each request writes to its own temp file and is installed into the queue from
+the async callback — it never touches current_audio_file (the file being
+played).  That is why the generic prefetch() routes here instead of using its
+synchronous save/restore path.
+
+Queue entries: { text, file, timing, dur, state = "pending"|"ready" }
+--]]
+TTSEngine.NATIVE_PREFETCH_LOOKAHEAD = 2
+-- Master switch for cloud-relay lookahead prefetch.  DISABLED by default: the
+-- 20260930b build re-enabled it (idx-safe) and on-device testing showed the
+-- cloud helper still occasionally returns a 0-byte / missing clip for a
+-- prefetched sentence; using that clip plays silence and the play loop then
+-- advances -> the sentence is SKIPPED.  A validation guard in usePrefetched()
+-- now refuses any prefetch clip that is missing or <=44 bytes (falls back to
+-- on-demand synthesis), but the safest baseline is prefetch OFF: each sentence
+-- is synthesized strictly on demand and can never be skipped.  Flip to true
+-- ONLY after the guard is proven on-device and you accept the (small) risk.
+TTSEngine.NATIVE_PREFETCH_ENABLED = true
+
+function TTSEngine:_nativePrefetchQueue()
+    if not self._native_pf_queue then
+        self._native_pf_queue = {}
+    end
+    return self._native_pf_queue
+end
+
+-- Find a queue entry by text (returns index or nil)
+function TTSEngine:_nativePrefetchFind(text)
+    local q = self:_nativePrefetchQueue()
+    for i, e in ipairs(q) do
+        if e.text == text then return i, e end
+    end
+    return nil, nil
+end
+
+-- Find a queue entry by sentence index (returns index or nil).
+-- Preferred over _nativePrefetchFind for the async cloud backend, where
+-- synthesis finishes out of order and adjacent sentences can share text —
+-- text-matching would consume the wrong clip and skip a sentence.
+function TTSEngine:_nativePrefetchFindIdx(idx)
+    if not idx then return nil, nil end
+    local q = self:_nativePrefetchQueue()
+    for i, e in ipairs(q) do
+        if e.idx == idx then return i, e end
+    end
+    return nil, nil
+end
+
+function TTSEngine:prefetchNative(text, idx)
+    if not self.backend or not text or text == "" then
+        return false
+    end
+    if self.backend ~= self.BACKENDS.NATIVE
+            and self.backend ~= self.BACKENDS.KINDLE_NATIVE then
+        return false
+    end
+    -- Master switch (see NATIVE_PREFETCH_ENABLED above).  Off = no prefetch,
+    -- pure one-sentence-at-a-time playback that can never skip a sentence.
+    if not TTSEngine.NATIVE_PREFETCH_ENABLED then
+        return false
+    end
+    local helper = self.backend_cmd
+    if not helper or helper == "" then
+        return false
+    end
+    -- Daemon/FIFO mode serializes requests over a single FIFO; a concurrent
+    -- prefetch would interleave with the on-demand request.  Only the one-shot
+    -- helper (the default, and what the cloud relay path uses) can prefetch.
+    if self.plugin and self.plugin:getSetting("native_speed_mode", "oneshot") == "daemon" then
+        return false
+    end
+    -- Already queued (pending or ready)?  Nothing to do.
+    if self:_nativePrefetchFind(text) then
+        return true
+    end
+    -- Bound the queue: if full, drop the oldest entry that is not the one we
+    -- are about to need.  (Callers request in order, so the head is oldest.)
+    local q = self:_nativePrefetchQueue()
+    local lookahead = self.NATIVE_PREFETCH_LOOKAHEAD
+    while #q >= lookahead do
+        local victim = table.remove(q, 1)
+        if victim and victim.file then os.remove(victim.file) end
+    end
+    -- If the single-slot prefetch (shared with other backends) holds a stale
+    -- entry, drop it too — peek/use check the queue first.
+    if self._prefetch_file and not self._prefetch_in_use then
+        local _, queued = self:_nativePrefetchFind(self._prefetch_text or "")
+        if not queued then
+            self:_cleanPrefetch()
+        end
+    end
+
+    local temp_dir = "/tmp"
+    self.file_counter = (self.file_counter or 0) + 1
+    local pf_file = temp_dir .. "/audiobook_native_pf_"
+        .. os.time() .. "_" .. self.file_counter .. ".wav"
+    local entry = { text = text, idx = idx, file = pf_file, state = "pending" }
+    table.insert(q, entry)
+
+    local engine = self
+    local ok = self:_synthesizeNative(text, pf_file, function(success, timing)
+        -- Entry may have been evicted while in flight.
+        local _, e = engine:_nativePrefetchFindIdx(idx)
+        if not e then
+            os.remove(pf_file)
+            return
+        end
+        if not success then
+            e.state = "failed"
+            os.remove(pf_file)
+            e.file = nil
+            return
+        end
+        e.file = pf_file
+        e.timing = timing
+        e.state = "ready"
+        e.dur = engine:getWavDurationMs(pf_file)
+        logger.warn("TTSEngine: native prefetch ready for:", text:sub(1, 30),
+            "dur=", e.dur, "ms")
+    end)
+    if ok == false then
+        os.remove(pf_file)
+        self:_nativePrefetchDrop(text)
+        return false
+    end
+    logger.dbg("TTSEngine: native prefetch launched for:", text:sub(1, 30),
+        "queue=", #q)
+    return true
+end
+
+-- Remove (and delete file for) a queue entry by text.
+function TTSEngine:_nativePrefetchDrop(text)
+    local q = self:_nativePrefetchQueue()
+    for i, e in ipairs(q) do
+        if e.text == text then
+            if e.file then os.remove(e.file) end
+            table.remove(q, i)
+            return true
+        end
+    end
+    return false
+end
+
+-- Remove a queue entry WITHOUT deleting its file (ownership transferred to the
+-- caller, e.g. the concat play group).
+function TTSEngine:_nativePrefetchDetach(text)
+    local q = self:_nativePrefetchQueue()
+    for i, e in ipairs(q) do
+        if e.text == text then
+            table.remove(q, i)
+            return true
+        end
+    end
+    return false
+end
+
+-- Discard the whole queue (page turn / stop).  Keeps nothing.
+function TTSEngine:_nativePrefetchClear()
+    local q = self:_nativePrefetchQueue()
+    for _, e in ipairs(q) do
+        if e.file then os.remove(e.file) end
+    end
+    self._native_pf_queue = {}
+end
+
+-- Return a READY queue entry's file/timing/dur without consuming it.
+-- Also drops entries ahead of it that already failed (so the queue head is
+-- always the next usable sentence).
+function TTSEngine:_nativePrefetchReady(text)
+    local q = self:_nativePrefetchQueue()
+    -- Drop leading failed entries.
+    while q[1] and q[1].state == "failed" do
+        table.remove(q, 1)
+    end
+    local _, e = self:_nativePrefetchFind(text)
+    if e and e.state == "ready" and e.file then
+        return e.file, e.timing, e.dur or 0
+    end
+    return nil, nil, 0
+end
+
+function TTSEngine:_nativePrefetchReadyIdx(idx)
+    local q = self:_nativePrefetchQueue()
+    while q[1] and q[1].state == "failed" do
+        table.remove(q, 1)
+    end
+    local _, e = self:_nativePrefetchFindIdx(idx)
+    if e and e.state == "ready" and e.file then
+        return e.file, e.timing, e.dur or 0
+    end
+    return nil, nil, 0
+end
+
+-- Consume a READY queue entry (transfer ownership to the caller).
+function TTSEngine:_nativePrefetchConsume(text)
+    local q = self:_nativePrefetchQueue()
+    for i, e in ipairs(q) do
+        if e.text == text and e.state == "ready" and e.file then
+            table.remove(q, i)
+            return e.file, e.timing, e.dur or 0
+        end
+    end
+    return nil, nil, 0
+end
+
+-- Index-based variants: safe against out-of-order completion and duplicate text.
+function TTSEngine:_nativePrefetchConsumeIdx(idx)
+    local q = self:_nativePrefetchQueue()
+    for i, e in ipairs(q) do
+        if e.idx == idx and e.state == "ready" and e.file then
+            table.remove(q, i)
+            return e.file, e.timing, e.dur or 0
+        end
+    end
+    return nil, nil, 0
+end
+
+--[[--
+Return the configured FIFO path for the native TTS daemon.
+--]]
 
 --[[--
 Return the configured FIFO path for the native TTS daemon.
@@ -1075,9 +1346,38 @@ function TTSEngine:synthesizeCommand(text, callback)
     if self.voice and self.voice:match("^mb%-") then
         max_text_len = 300
     end
+    -- Platform-native helper (cloud relay): the text is handed to the helper
+    -- via a TEMP FILE (--input), not the command line, so the command-line and
+    -- MBROLA limits above do not apply.  A 1000-byte cap here silently dropped
+    -- everything past 1000 bytes AND split a CJK character in half (the byte
+    -- cut was not codepoint-aligned), so a long sentence produced audio for its
+    -- first ~third and the player then stalled.  Allow a much larger ceiling
+    -- for this backend; the parser's max_chunk (seed from main.lua) already
+    -- bounds real sentence sizes well below this.
+    if self.backend == self.BACKENDS.NATIVE or self.backend == self.BACKENDS.KINDLE_NATIVE then
+        max_text_len = 3000
+    end
     if #text > max_text_len then
-        text = text:sub(1, max_text_len)
-        logger.dbg("TTSEngine: Truncated text to", max_text_len, "chars")
+        -- Cut on a UTF-8 codepoint boundary.  Scan from the start keeping only
+        -- WHOLE codepoints, and stop before the one that would push us past
+        -- max_text_len.  This guarantees the result is valid UTF-8 and never
+        -- ends on a bare continuation byte (which the helper's curl would
+        -- percent-escape and the engine would read aloud as "%XX").
+        local cut = 0
+        local i = 1
+        local n = #text
+        while i <= n do
+            local b = text:byte(i)
+            local clen = 1
+            if b >= 0xF0 then clen = 4
+            elseif b >= 0xE0 then clen = 3
+            elseif b >= 0xC0 then clen = 2 end
+            if i + clen - 1 > max_text_len then break end
+            cut = i + clen - 1
+            i = i + clen
+        end
+        text = text:sub(1, cut)
+        logger.dbg("TTSEngine: Truncated text to", cut, "chars")
     end
     -- Preflight: check that /tmp has enough free space.  On Kindle /tmp is
     -- a symlink to /var/tmp; a full /var causes synthesis to silently fail
@@ -1958,7 +2258,7 @@ so when the current sentence finishes we can skip straight to playback.
 @param text string Text of the next sentence
 @return boolean Success
 --]]
-function TTSEngine:prefetch(text, use_espeak)
+function TTSEngine:prefetch(text, use_espeak, idx)
     if not self.backend or not text or text == "" then
         return false
     end
@@ -1969,6 +2269,17 @@ function TTSEngine:prefetch(text, use_espeak)
     -- Android TTS synthesis is fast enough that prefetching isn't needed.
     if self.backend == self.BACKENDS.ANDROID then
         return false
+    end
+    -- Platform-native (cloud) helper: use the dedicated async prefetch path.
+    -- The generic save/restore below cannot be used here because
+    -- _synthesizeNative is asynchronous (background helper + .done poll): it
+    -- returns before current_audio_file is set, so the save/restore would
+    -- capture stale state, and the late callback would still overwrite the
+    -- playing file.  prefetchNative() writes to its own temp file and installs
+    -- the result in the prefetch slot from the callback, which is safe.
+    if self.backend == self.BACKENDS.NATIVE
+            or self.backend == self.BACKENDS.KINDLE_NATIVE then
+        return self:prefetchNative(text, idx)
     end
     -- Piper/sanoTTS: delegate to the async queue-based prefetcher
     if (self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS
@@ -2020,7 +2331,51 @@ Check if prefetched audio matches the given text and swap it in.
 @param text string The sentence text to check
 @return boolean true if prefetch was used
 --]]
-function TTSEngine:usePrefetched(text)
+function TTSEngine:usePrefetched(text, idx)
+    -- Platform-native queue (cloud-relay lookahead).
+    if self.backend == self.BACKENDS.NATIVE
+            or self.backend == self.BACKENDS.KINDLE_NATIVE then
+        -- Prefer an index-based lookup: async cloud synthesis can finish out of
+        -- order and adjacent sentences may share text, so text-matching would
+        -- consume the wrong clip and skip a sentence.  Fall back to text only
+        -- when no idx is supplied.
+        local nf, nt
+        if idx then
+            nf, nt = self:_nativePrefetchConsumeIdx(idx)
+        else
+            nf, nt = self:_nativePrefetchConsume(text)
+        end
+        if nf then
+            -- Guard: the prefetched WAV must actually exist and be a non-trivial
+            -- file.  Async cloud synthesis can fail/timeout and leave a 0-byte or
+            -- missing clip; consuming it would play silence and the play loop would
+            -- then advance -- i.e. SKIP the sentence.  Validate before using.
+            local valid = false
+            local sz = nil
+            local ok, fh = pcall(io.open, nf, "rb")
+            if ok and fh then
+                sz = fh:seek("end")
+                fh:close()
+            end
+            if sz and sz > 44 then
+                valid = true
+            end
+            if not valid then
+                logger.warn("TTSEngine: prefetched clip missing/too small (",
+                    tostring(nf), " sz=", tostring(sz),
+                    ") -- discarding, will synthesize on demand")
+                os.remove(nf)
+                return false
+            end
+            if self.current_audio_file then
+                os.remove(self.current_audio_file)
+            end
+            self.current_audio_file = nf
+            self.timing_data = nt
+            logger.dbg("TTSEngine: Using native-prefetched audio")
+            return true
+        end
+    end
     -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
         if self.current_audio_file then
@@ -2031,6 +2386,7 @@ function TTSEngine:usePrefetched(text)
         self._prefetch_file = nil
         self._prefetch_timing = nil
         self._prefetch_text = nil
+        self._prefetch_want_text = nil
         logger.dbg("TTSEngine: Using prefetched audio")
         return true
     end
@@ -2056,7 +2412,20 @@ _cleanPrefetch() when the file is no longer needed.
 @return table|nil   Timing data
 @return number      Duration in ms
 --]]
-function TTSEngine:peekPrefetch(text)
+function TTSEngine:peekPrefetch(text, idx)
+    -- Platform-native queue takes precedence (cloud-relay lookahead).
+    if self.backend == self.BACKENDS.NATIVE
+            or self.backend == self.BACKENDS.KINDLE_NATIVE then
+        local nf, nt, nd
+        if idx then
+            nf, nt, nd = self:_nativePrefetchReadyIdx(idx)
+        else
+            nf, nt, nd = self:_nativePrefetchReady(text)
+        end
+        if nf then
+            return nf, nt, nd
+        end
+    end
     -- Check single-slot prefetch (espeak-ng)
     if self._prefetch_file and self._prefetch_text == text then
         local dur = self:getWavDurationMs(self._prefetch_file)
@@ -2103,8 +2472,11 @@ function TTSEngine:_cleanPrefetch()
     self._prefetch_timing = nil
     self._prefetch_text = nil
     self._prefetch_in_use = false
-    -- Clean Piper async queue
-    self._piper:cleanQueue()
+    self._prefetch_want_text = nil
+    -- Clean Piper async queue (only present for Piper/sanoTTS backends)
+    if self._piper then
+        self._piper:cleanQueue()
+    end
 end
 -- Persistent BT pipeline retry and error handling.
 -- These limit how often we retry the pipeline, prevent rapid retry loops
@@ -2184,6 +2556,9 @@ Play the synthesized audio.
 --]]
 function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     local t0 = UIManager:getTime()
+    -- Clear the previous cycle's concat-merge failure flag; it is re-set below
+    -- only if a merge actually fails this time.
+    self._concat_merge_failed = nil
     -- Register the TTS audio file with the session recorder, if active.
     if self.plugin and self.plugin.session_recorder and self.current_audio_file then
         local is_real_wav = self.current_audio_file ~= "/tmp/.kindle_native_tts"
@@ -3640,7 +4015,27 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     -- Used on Kindle devices that have GStreamer + mixersink but no wavparse.
     -- The helper reads the WAV header, strips it, and plays raw PCM.
     if self.audio_player_type == "kindle-gst-play" then
-        self._concat_durations = nil
+        -- Multi-sentence concat: this player plays exactly one file, so merge
+        -- the extra (already-synthesized) sentence WAVs into the main file
+        -- first.  For the cloud-relay backend this is what turns "one relay
+        -- round-trip of silence between every sentence" into one continuous
+        -- clip covering 2-3 sentences.  Mirrors the gst-bt branch below.
+        if concat_files and #concat_files > 0 then
+            if self:mergeWavFiles(concat_files) then
+                -- Read the true merged duration from disk; the per-sentence
+                -- estimate may be stale.
+                self._current_audio_duration_ms = self:getWavDurationMs(self.current_audio_file)
+                self._concat_durations = { self._current_audio_duration_ms }
+                logger.warn("TTSEngine: kindle-gst-play merged", 1 + #concat_files,
+                    "sentences, total dur=", self._current_audio_duration_ms, "ms")
+            else
+                logger.warn("TTSEngine: kindle-gst-play merge failed, playing first sentence only")
+                self._concat_durations = nil
+                self._concat_merge_failed = true
+            end
+        else
+            self._concat_durations = nil
+        end
         self._expected_play_duration_ms = self._current_audio_duration_ms
         self.play_generation = (self.play_generation or 0) + 1
         local my_gen = self.play_generation
@@ -4733,7 +5128,7 @@ function TTSEngine:findAudioPlayer()
         -- and audio fell through to a bare aplay with "no soundcards"
         -- (issue #8).
         if not bt:isBluealsaRunning()
-            and bt:hasBluealsaAvailable()
+            and bt:hasBluealsaBundled()
             and bt:getStackType() == "bluez" then
             logger.warn("TTSEngine: BlueALSA bundled but not running, starting it")
             local ba_ok = bt:startBluealsa()
@@ -6968,6 +7363,7 @@ Called by stop() and forceKillAll().
 function TTSEngine:fullCleanup()
     self:cleanup()
     self:_cleanPrefetch()
+    self:_nativePrefetchClear()
 end
 
 --[[--

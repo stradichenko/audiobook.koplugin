@@ -1,0 +1,22 @@
+# Render 部署配置（https://render.com）
+# 方式一：用本文件（Python 运行时，最简单，构建快）
+#   1) 把本目录推到 GitHub
+#   2) Render 控制台 → New → Web Service → 连该 GitHub 仓库
+#   3) Render 会自动读取此文件；确认 Build/Start 命令后点 Deploy
+#   4) 部署完成拿到 https://xxx.onrender.com —— 这就是控制台地址，也是 Kindle 要填的地址
+#
+# 方式二（备选，用 Docker）：把 runtime 改成 docker、删 buildCommand/startCommand，
+#   Render 会自动用同目录 Dockerfile 构建（更稳，但免费层镜像构建稍慢）。
+services:
+  - type: web
+    name: tts-relay
+    runtime: python
+    plan: free
+    buildCommand: "apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt"
+    startCommand: "python tts_relay_android.py"
+    healthCheckPath: /healthz
+    envVars:
+      - key: TTS_WAV_RATE
+        value: "16000"
+      - key: TTS_RATE
+        value: "+0%"
