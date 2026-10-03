@@ -29,6 +29,7 @@ stress_test_*.mp3
 tests/*.epub
 tests/*.mp3
 tests/generate_test_files.py
+tests/generate_cue_groups_fixture.py
 tests/README.md
 
 # Accidental artifacts
