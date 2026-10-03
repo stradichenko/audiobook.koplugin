@@ -2353,18 +2353,25 @@ function MediaSync:_cueSentObj(idx)
         end
     end
     local text = table.concat(texts, " ")
+    -- Anchor the merged range at the group's FIRST member: narration can
+    -- (re)enter the group at any member (loop restarts land mid-group,
+    -- retries fire on mid-group entries), and a mid-group fragment id would
+    -- resolve the range at the wrong word, mismatch against the group text,
+    -- and clear the highlight (observed on device as hl-frag-mismatch
+    -- drawn_w 0 for every mid-group entry).
+    local first = data[grp.first] or entry
     local next_entry = data[grp.last + 1]
     local limit = false
     if next_entry and next_entry.fragment_id
-        and next_entry.text_doc == entry.text_doc then
+        and next_entry.text_doc == first.text_doc then
         limit = next_entry.fragment_id
     end
     return {
         text = text,
-        start_pos = entry.start_pos or 0,
+        start_pos = first.start_pos or 0,
         end_pos = #text,
-        fragment_id = entry.fragment_id,
-        text_doc = entry.text_doc,
+        fragment_id = first.fragment_id,
+        text_doc = first.text_doc,
         limit_fragment_id = limit,
     }
 end
