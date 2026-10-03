@@ -141,6 +141,23 @@ do
 end
 sameGroups(g10, { "1-3", "4-4", "5-5" }, "mixed docs partition covers all entries")
 
+-- 11. Member cap: runs of near-zero-length cues never grow a giant group.
+-- Zero durations keep the span flat, so without a cap all 12 would merge.
+local specs11 = {}
+for _ = 1, 12 do
+    specs11[#specs11 + 1] = { dur = 0 }
+end
+local timing11 = makeSlice(specs11, { start_at = 3 })
+local g11 = Utils.buildCueGroups(timing11, 0.5)
+sameGroups(g11, { "1-8", "9-12" }, "member cap bounds zero-duration runs")
+for _, g in ipairs(g11) do
+    eq(g.last - g.first + 1 <= 8, true, "group within member cap")
+end
+
+-- 12. Default cap equals 8 even when the caller omits the argument.
+local g12 = Utils.buildCueGroups(timing11, 0.5, nil)
+sameGroups(g12, { "1-8", "9-12" }, "default member cap is 8")
+
 if #failures > 0 then
     print("FAIL (" .. #failures .. "/" .. checks .. " checks):")
     for _, f in ipairs(failures) do

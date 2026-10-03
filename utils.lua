@@ -299,14 +299,18 @@ end
 -- keeps its own visual unit), the span so far is under the threshold (so the
 -- final span reaches it), same content document, and both cues are
 -- mergeable. Non-mergeable entries become singletons and break runs, so a
--- merged group's text is never empty. Returns nil, nil when there is
+-- merged group's text is never empty. `max_members` bounds the group size:
+-- books with runs of near-zero-length cues would otherwise absorb dozens of
+-- entries into one giant flash-chunk. Returns nil, nil when there is
 -- nothing to group (empty input).
 -- @param timing table  Timing entries ({start_time, end_time, text, ...})
 -- @param threshold_s number  Minimum on-screen duration of a merged group
+-- @param max_members number  Optional cap on cues per group (default 8)
 -- @return table|nil, table|nil
-function Utils.buildCueGroups(timing, threshold_s)
+function Utils.buildCueGroups(timing, threshold_s, max_members)
     local n = timing and #timing or 0
     if n == 0 then return nil, nil end
+    if not max_members or max_members < 1 then max_members = 8 end
 
     local groups, entry_group = {}, {}
     local i = 1
@@ -315,6 +319,7 @@ function Utils.buildCueGroups(timing, threshold_s)
         if cueMergeable(timing[i]) then
             local t0 = timing[i].start_time or 0
             while last < n do
+                if last - first + 1 >= max_members then break end
                 local cand = timing[last + 1]
                 if not cueMergeable(cand) then break end
                 if cand.text_doc ~= timing[first].text_doc then break end
