@@ -3543,6 +3543,9 @@ function Audiobook:stopReadAlong(opts)
     pcall(function() BtMediaControl.stop() end)
     pcall(function() BtMediaControl.sendPlaybackStatus("stopped") end)
     pcall(function() self.sync_controller:stop() end)
+    -- Full teardown hides the playback bar; mid-book stops keep it
+    -- visible (stopped state) so play can restart from the page.
+    pcall(function() self.sync_controller:hidePlaybackBar() end)
     pcall(function() self.highlight_manager:clearHighlights() end)
     -- Always kill orphan audio processes, even if we think we're not playing.
     -- A stale gst-launch-1.0 holding the BT socket can destabilize the

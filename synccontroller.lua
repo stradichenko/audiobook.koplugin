@@ -588,10 +588,21 @@ function SyncController:readNextSentence()
 
     if self.reading_sentence_idx > self.total_sentences then
         -- All sentences on this page are done
-        logger.warn("SyncController: All", self.total_sentences, "sentences done, auto_advance=", self.plugin and self.plugin:getSetting("auto_advance", true))
-        if self.plugin and self.plugin:getSetting("auto_advance", true) then
+        local auto_advance = self.plugin and self.plugin:getSetting("auto_advance", true)
+        logger.warn("SyncController: All", self.total_sentences, "sentences done, auto_advance=", auto_advance)
+        dlog("end-of-page", "sentences", self.total_sentences, "auto_advance", auto_advance)
+        if auto_advance then
             self:advanceToNextPage()
         else
+            -- Explain the stop: without auto-advance this is by design,
+            -- but a silent stop mid-book reads as a crash to the user
+            -- (issue #96).  The playback bar stays visible; its play
+            -- button restarts from the current page.
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{
+                text = _("Finished reading this page. Turn the page and start read-aloud again, or enable auto-advance in the settings."),
+                timeout = 5,
+            })
             self:stop()
         end
         return
@@ -1752,6 +1763,11 @@ function SyncController:showPlaybackBar()
                 controller:pause()
             elseif controller:isPaused() then
                 controller:resume()
+            else
+                -- Stopped (end of page, or a stop after a failure): the
+                -- bar stays visible, so play restarts from the current
+                -- page instead of doing nothing.
+                controller:restartFromStopped()
             end
         end,
         on_skip_back = function()
@@ -1770,7 +1786,7 @@ function SyncController:showPlaybackBar()
             controller:seekToProgress(pct)
         end,
         on_close = function()
-            controller:stop()
+            controller:stop({ hide_bar = true })
         end,
         on_chapter_list = function()
             controller:showTocPicker()
@@ -2848,14 +2864,21 @@ end
 --[[--
 Stop playback completely.
 --]]
-function SyncController:stop()
+function SyncController:stop(opts)
     -- Log at WARN level with traceback when stopping from an active state
     -- so we can diagnose unexpected stops (e.g. "Chain BLOCKED" on Kindle).
+    -- Mirror the reason into the plugin debug log: bug reports usually
+    -- attach debug.log rather than KOReader's crash.log, and this line
+    -- carries the state the crash log would only show (issue #96).
     if self.state ~= self.STATE.STOPPED then
         local trace = debug.traceback("", 2)
         logger.warn("SyncController: stop() from state=", self.state,
             "sentence=", self.reading_sentence_idx, "/", self.total_sentences,
             "caller:", trace)
+        dlog("stop", "from_state", self.state,
+            "idx", self.reading_sentence_idx, "total", self.total_sentences,
+            "android_fails", self._android_tts_fail_count or 0,
+            "player_error", self.tts_engine and self.tts_engine.player_error or "none")
     end
     self.state = self.STATE.STOPPED
 
@@ -2873,8 +2896,21 @@ function SyncController:stop()
         pcall(function() self.highlight_manager:clearHighlights() end)
     end
 
-    -- Hide playback bar (also triggers full screen refresh)
-    pcall(function() self:hidePlaybackBar() end)
+    -- Keep the playback bar visible in the stopped state: it shows what
+    -- happened and its play button restarts from the current page.  A
+    -- mid-book stop that removed the whole UI looked like a crash (issue
+    -- #96, persistent PCM stream).  Only the explicit close paths pass
+    -- hide_bar (the bar's own close button, and the full teardown in
+    -- Audiobook:stopReadAlong), and those hide it themselves.
+    if opts and opts.hide_bar then
+        pcall(function() self:hidePlaybackBar() end)
+    else
+        pcall(function()
+            if self.playback_bar then
+                self.playback_bar:updatePlayState(false)
+            end
+        end)
+    end
 
     self.parsed_data = nil
     self.current_word_index = 0
@@ -2921,6 +2957,24 @@ function SyncController:stop()
     self:_cleanConcatFiles()
 
     logger.warn("SyncController: Stopped")
+end
+
+--[[--
+Restart read-aloud from the top of the currently shown page after a stop.
+The playback bar stays visible in the stopped state, and its play button
+routes here.  Reads whatever page is on screen, so turning the page first
+moves the restart point forward.
+--]]
+function SyncController:restartFromStopped()
+    if self.state ~= self.STATE.STOPPED then return end
+    local text = self.plugin and self.plugin.getCurrentPageText
+        and self.plugin:getCurrentPageText()
+    if not text or text == "" then
+        logger.warn("SyncController: restartFromStopped: no page text available")
+        return
+    end
+    logger.warn("SyncController: restarting read-aloud from the current page")
+    self:start(text)
 end
 
 --[[--
