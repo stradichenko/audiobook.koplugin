@@ -6381,8 +6381,9 @@ All waits use UIManager:scheduleIn so the main loop stays responsive
 for rotation, taps, and other input events.
 
 @param bt_retry_allowed boolean Whether BT early-death retry is allowed
+@param pcm_retried boolean Whether a BlueALSA PCM recovery already ran
 --]]
-function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_retried)
+function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_retried, pcm_retried)
     local my_gen = self.play_generation or 0
     local launch_time = UIManager:getTime()
     -- Real BT connection failures exit in <200ms (no A2DP sink).
@@ -6513,6 +6514,37 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_ret
                     or player_stderr:find("assert failed")
                     or player_stderr:find("Segmentation")
                     or player_stderr:find("Aborted"))
+
+                -- BlueALSA "PCM not found": BlueZ reports the sink as
+                -- connected but no A2DP transport was negotiated through
+                -- the running daemon, so the player exits having played
+                -- nothing and the chain keeps advancing in silence.  This
+                -- happens when the sink attaches in the seconds before
+                -- the daemon has registered its endpoints, which the
+                -- fresh-start cycle in BTManager cannot cover, because
+                -- BlueZ only re-runs endpoint selection on a fresh
+                -- connection.  Cycle the device once and relaunch the
+                -- same audio (issue #93).
+                if not pcm_retried
+                        and player_stderr
+                        and player_stderr:find("BlueALSA PCM: PCM not found")
+                        and (UIManager:getTime() - (engine._pcm_recover_at or 0)) > 30 then
+                    local btm = engine.plugin and engine.plugin.bt_manager
+                    if btm and engine._last_pid_cmd then
+                        engine._pcm_recover_at = UIManager:getTime()
+                        logger.warn("TTSEngine: BlueALSA has no PCM for the sink, cycling the connection and retrying")
+                        btm:recoverMissingPcm()
+                        os.remove(engine._gst_status_file)
+                        local handle = io.popen(engine._last_pid_cmd)
+                        local pid_str = handle and handle:read("*a") or ""
+                        if handle then handle:close() end
+                        engine.audio_pid = tonumber(pid_str:match("(%d+)"))
+                        engine._audio_launched_at = UIManager:getTime()
+                        logger.warn("TTSEngine: BT PCM recovery retry PID:", engine.audio_pid)
+                        engine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_retried, true)
+                        return
+                    end
+                end
 
                 -- wav-play crash: walk the session fallback ladder
                 -- (conversion first, then daemon-routed dmix devices that

@@ -736,80 +736,105 @@ function BTManager:powerOn()
             -- bluetooth before starting the daemon.
             self:_rfkillUnblock()
 
-            local had_to_restart_btd = false
-            if not is_bluetoothd_running() then
-                local daemon = bluetoothd_path or "bluetoothd"
-                logger.warn("BTManager: starting bluetoothd from:", daemon)
-                os.execute(daemon .. " 2>/dev/null &")
-                os.execute("sleep 1")
-                if not is_bluetoothd_running() then
-                    logger.warn("BTManager: bluetoothd failed to start from", daemon)
-                end
-            else
-                -- bluetoothd caches the adapter list at startup.  If the
-                -- adapter appears after bluetoothd started (e.g. because
-                -- sdio_bt_pwr was just reloaded), it may never see hci0.
-                -- Restarting bluetoothd forces a fresh adapter scan.
-                -- Issue #14 (Kobo Libra 2 hci0 not found after 6s).
-                logger.warn("BTManager: bluetoothd already running, restarting to pick up new adapter")
-                os.execute("killall bluetoothd 2>/dev/null; sleep 1")
-                local daemon = bluetoothd_path or "bluetoothd"
-                os.execute(daemon .. " 2>/dev/null &")
-                os.execute("sleep 1")
-                had_to_restart_btd = true
-            end
-            -- Reset the HCI adapter, then wait for it to come UP.
-            -- Use ";" instead of "&&" so that "hci0 up" still runs even
-            -- when "hci0 down" fails (which happens on Kobo Libra 2 when
-            -- the adapter hasn't been initialised yet and hci0 doesn't
-            -- exist).  After a fresh bluetoothd start the adapter
-            -- registers asynchronously: hciconfig can report "No such
-            -- device" for the first seconds, and the previous poll
-            -- matched the literal "hci0" text even for an adapter that
-            -- never came up, so playback raced a dead link (issue #93
-            -- second report: BlueALSA started against "Network is
-            -- down").  Retry "hci0 up" every second and require the UP
-            -- flag before proceeding.  Integer sleeps: PocketBook's
-            -- BusyBox sleep rejects fractions.
-            os.execute("hciconfig hci0 down 2>/dev/null")
-            local hci_ready = false
-            for attempt = 1, 12 do
-                os.execute("hciconfig hci0 up 2>/dev/null")
-                os.execute("sleep 1")
+            -- Probe the adapter once.  An hci0 that is already up was
+            -- initialised by the stock OS and works: the down/up reset
+            -- below wedges such an adapter on sunxi Kobos until the
+            -- stock OS initialises the chip again, and restarting
+            -- bluetoothd would drop the connections it adopted, so both
+            -- are skipped and only the daemon is made sure of (issue
+            -- #93).
+            local hci_was_up = false
+            do
                 local h = io.popen("hciconfig hci0 2>/dev/null")
                 local r = h and h:read("*a") or ""
                 if h then h:close() end
-                if r:match("UP") then
-                    hci_ready = true
-                    logger.warn("BTManager: hci0 up after", attempt, "s")
-                    break
-                end
+                hci_was_up = r:match("UP") ~= nil
             end
-            if not hci_ready then
-                logger.warn("BTManager: hci0 not up after 12s")
-                -- Fallback: try bluetoothctl power-on, which uses D-Bus
-                -- and sometimes succeeds where hciconfig fails.
-                local bc = io.popen("bluetoothctl power on 2>&1")
-                if bc then
-                    local out = bc:read("*a") or ""
-                    bc:close()
-                    logger.warn("BTManager: bluetoothctl power on result:", out:gsub("\n", " "))
-                    os.execute("sleep 2")
-                    local h2 = io.popen("hciconfig hci0 2>/dev/null")
-                    local r2 = h2 and h2:read("*a") or ""
-                    if h2 then h2:close() end
-                    -- Same rule as the main poll: require the UP flag.
-                    -- An adapter that merely registered (no UP) passes
-                    -- the old "hci0 in output" check but carries no
-                    -- powered radio, so playback would race a dead link.
-                    if r2:match("UP") then
+            local hci_ready = false
+            if hci_was_up then
+                logger.warn("BTManager: hci0 already up, keeping the initialised adapter untouched")
+                hci_ready = true
+                if not is_bluetoothd_running() then
+                    local daemon = bluetoothd_path or "bluetoothd"
+                    logger.warn("BTManager: starting bluetoothd from:", daemon)
+                    os.execute(daemon .. " 2>/dev/null &")
+                    os.execute("sleep 1")
+                end
+            else
+                local had_to_restart_btd = false
+                if not is_bluetoothd_running() then
+                    local daemon = bluetoothd_path or "bluetoothd"
+                    logger.warn("BTManager: starting bluetoothd from:", daemon)
+                    os.execute(daemon .. " 2>/dev/null &")
+                    os.execute("sleep 1")
+                    if not is_bluetoothd_running() then
+                        logger.warn("BTManager: bluetoothd failed to start from", daemon)
+                    end
+                else
+                    -- bluetoothd caches the adapter list at startup.  If the
+                    -- adapter appears after bluetoothd started (e.g. because
+                    -- sdio_bt_pwr was just reloaded), it may never see hci0.
+                    -- Restarting bluetoothd forces a fresh adapter scan.
+                    -- Issue #14 (Kobo Libra 2 hci0 not found after 6s).
+                    logger.warn("BTManager: bluetoothd already running, restarting to pick up new adapter")
+                    os.execute("killall bluetoothd 2>/dev/null; sleep 1")
+                    local daemon = bluetoothd_path or "bluetoothd"
+                    os.execute(daemon .. " 2>/dev/null &")
+                    os.execute("sleep 1")
+                    had_to_restart_btd = true
+                end
+                -- Reset the HCI adapter, then wait for it to come UP.
+                -- Use ";" instead of "&&" so that "hci0 up" still runs even
+                -- when "hci0 down" fails (which happens on Kobo Libra 2 when
+                -- the adapter hasn't been initialised yet and hci0 doesn't
+                -- exist).  After a fresh bluetoothd start the adapter
+                -- registers asynchronously: hciconfig can report "No such
+                -- device" for the first seconds, and the previous poll
+                -- matched the literal "hci0" text even for an adapter that
+                -- never came up, so playback raced a dead link (issue #93
+                -- second report: BlueALSA started against "Network is
+                -- down").  Retry "hci0 up" every second and require the UP
+                -- flag before proceeding.  Integer sleeps: PocketBook's
+                -- BusyBox sleep rejects fractions.
+                os.execute("hciconfig hci0 down 2>/dev/null")
+                for attempt = 1, 12 do
+                    os.execute("hciconfig hci0 up 2>/dev/null")
+                    os.execute("sleep 1")
+                    local h = io.popen("hciconfig hci0 2>/dev/null")
+                    local r = h and h:read("*a") or ""
+                    if h then h:close() end
+                    if r:match("UP") then
                         hci_ready = true
-                        logger.warn("BTManager: hci0 up after bluetoothctl power on")
+                        logger.warn("BTManager: hci0 up after", attempt, "s")
+                        break
                     end
                 end
-            end
-            if not hci_ready then
-                logger.err("BTManager: hci0 could not be brought up. Firmware may need initialization by the stock OS (Nickel).")
+                if not hci_ready then
+                    logger.warn("BTManager: hci0 not up after 12s")
+                    -- Fallback: try bluetoothctl power-on, which uses D-Bus
+                    -- and sometimes succeeds where hciconfig fails.
+                    local bc = io.popen("bluetoothctl power on 2>&1")
+                    if bc then
+                        local out = bc:read("*a") or ""
+                        bc:close()
+                        logger.warn("BTManager: bluetoothctl power on result:", out:gsub("\n", " "))
+                        os.execute("sleep 2")
+                        local h2 = io.popen("hciconfig hci0 2>/dev/null")
+                        local r2 = h2 and h2:read("*a") or ""
+                        if h2 then h2:close() end
+                        -- Same rule as the main poll: require the UP flag.
+                        -- An adapter that merely registered (no UP) passes
+                        -- the old "hci0 in output" check but carries no
+                        -- powered radio, so playback would race a dead link.
+                        if r2:match("UP") then
+                            hci_ready = true
+                            logger.warn("BTManager: hci0 up after bluetoothctl power on")
+                        end
+                    end
+                end
+                if not hci_ready then
+                    logger.err("BTManager: hci0 could not be brought up. Firmware may need initialization by the stock OS (Nickel).")
+                end
             end
         end
     end
@@ -1222,6 +1247,32 @@ function BTManager:stopBluealsa()
         os.execute("sleep 1")
         logger.warn("BTManager: bluealsa stopped")
     end
+end
+
+--- Recover a sink that has no BlueALSA PCM: BlueZ reports the device as
+-- connected, but no A2DP transport was negotiated through the running
+-- daemon (the sink attached before the daemon registered its endpoints,
+-- or bluetoothd adopted a stale link from the stock OS).  BlueZ only
+-- runs endpoint selection on a fresh connection, so cycle every
+-- connected audio device once.
+-- @treturn bool true when at least one device reconnected
+function BTManager:recoverMissingPcm()
+    if not self:isBluealsaRunning() then return false end
+    local reconnected = false
+    for _, dev in ipairs(self:listAudioDevices() or {}) do
+        if dev.connected then
+            logger.warn("BTManager: cycling", dev.address,
+                "so the A2DP transport re-negotiates with the running daemon")
+            self:disconnect(dev.address)
+            os.execute("sleep 1")
+            if self:connect(dev.address) then
+                reconnected = true
+            end
+            -- Transport setup trails the ACL link by a moment.
+            os.execute("sleep 2")
+        end
+    end
+    return reconnected
 end
 
 --- Check whether bluealsa is bundled with the plugin.
