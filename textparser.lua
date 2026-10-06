@@ -177,12 +177,27 @@ function TextParser:parseSentences(text, max_chunk)
             -- interrupt the reading flow.
             -- The Unicode ellipsis (…) must split too: otherwise "fin… La
             -- suite" is one utterance and some engines stop at the ellipsis.
+            -- CJK terminators (。！？…) end a sentence on their own: Chinese
+            -- and Japanese carry no spaces between sentences, so the
+            -- "terminator followed by a space" rule never matches and a
+            -- whole page parses as one utterance that reads for a minute,
+            -- stops early and then turns the page mid-text (issue #96).
+            -- Closing quotes/brackets that trail the terminator stay with
+            -- their sentence.
             local ell = "\226\128\166" -- …
+            local cjk_endings = {
+                ell,
+                "\227\128\130", -- 。 U+3002
+                "\239\188\129", -- ！ U+FF01
+                "\239\188\159", -- ？ U+FF1F
+            }
+            local cjk_closers =
+                "[\226\128\157\227\128\139\227\128\141\227\128\143\239\188\137\227\128\145\"]*"
             local pos = 1
             local segments_in_line = {}
             while pos <= #line do
                 -- Find the earliest .?!/… that is followed by a space (or is
-                -- at end of line)
+                -- at end of line), or a CJK terminator anywhere.
                 local best_s, best_e
                 local function consider(s, e)
                     if s and (not best_s or s < best_s) then
@@ -191,8 +206,9 @@ function TextParser:parseSentences(text, max_chunk)
                 end
                 consider(line:find("[%.%?!]+%s", pos))
                 consider(line:find("[%.%?!]+$", pos))
-                consider(line:find(ell .. "%s", pos))
-                consider(line:find(ell .. "$", pos))
+                for _, term in ipairs(cjk_endings) do
+                    consider(line:find(term .. cjk_closers, pos))
+                end
                 local pstart, pend = best_s, best_e
                 if pstart then
                     -- Include the punctuation but not the trailing space
@@ -444,12 +460,28 @@ function TextParser:_splitAtWordBoundary(text, max_chars)
         while split_pos > 0 and remaining:sub(split_pos, split_pos) ~= " " do
             split_pos = split_pos - 1
         end
+        local hard_cut = false
         if split_pos == 0 then
-            -- No space found - hard cut (extremely unlikely with natural text)
+            -- No space found - hard cut.  CJK runs have no spaces at all,
+            -- so the cut must land on a UTF-8 lead byte (never inside a
+            -- multi-byte character) and nothing is skipped afterwards.
+            hard_cut = true
             split_pos = max_chars
+            while split_pos > 1 do
+                local b = remaining:byte(split_pos)
+                if b and b >= 0x80 and b < 0xC0 then
+                    split_pos = split_pos - 1
+                else
+                    break
+                end
+            end
         end
         table.insert(chunks, remaining:sub(1, split_pos - 1))
-        remaining = remaining:sub(split_pos + 1)  -- skip the space
+        if hard_cut then
+            remaining = remaining:sub(split_pos)
+        else
+            remaining = remaining:sub(split_pos + 1)  -- skip the space
+        end
     end
 
     if #remaining > 0 then

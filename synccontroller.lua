@@ -194,7 +194,12 @@ local function _sentenceHasTerminator(s)
     if s:sub(-3) == "..." then return true end
     if s:sub(-3) == "\226\128\166" then return true end -- …
     local last = s:sub(-1)
-    return last == "." or last == "?" or last == "!"
+    if last == "." or last == "?" or last == "!" then return true end
+    -- CJK terminators are three-byte characters (issue #96).
+    local tail = s:sub(-3)
+    return tail == "\227\128\130" -- 。 U+3002
+        or tail == "\239\188\129" -- ！ U+FF01
+        or tail == "\239\188\159" -- ？ U+FF1F
 end
 
 local function _startsLowercase(s)
@@ -1026,9 +1031,19 @@ function SyncController:applySentenceTiming(sentence, timing_data)
             if is_neural then
                 local chars = #(word.clean_text or word.text:gsub("[%%p]", ""))
                 duration = math.floor(chars * 80)
-                if word.text:match("[,;:]$") then
+                -- CJK punctuation is multi-byte: compare the character tail
+                -- instead of the last byte (issue #96).
+                local tail = word.text:sub(-3)
+                local ends_clause = word.text:match("[,;:]$")
+                    or tail == "\239\188\140" -- ， U+FF0C
+                local ends_sentence = word.text:match("[%.%%?!]$")
+                    or tail == "\227\128\130" -- 。 U+3002
+                    or tail == "\239\188\129" -- ！ U+FF01
+                    or tail == "\239\188\159" -- ？ U+FF1F
+                    or tail == "\226\128\166" -- … U+2026
+                if ends_clause then
                     duration = duration + 150
-                elseif word.text:match("[%.%%?!]$") then
+                elseif ends_sentence then
                     duration = duration + 200
                 end
             else
