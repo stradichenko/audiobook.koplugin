@@ -304,8 +304,9 @@ function TextParser:splitLongSentence(text, max_chars)
     -- Step 1: split at clause boundaries
     local chunks = self:_splitAtClauses(text)
 
-    -- Step 2: merge fragments smaller than MIN_CHUNK_CHARS
-    chunks = self:_mergeSmallChunks(chunks, MIN_CHUNK_CHARS)
+    -- Step 2: merge fragments smaller than MIN_CHUNK_CHARS (but never past
+    -- max_chars, see _mergeSmallChunks)
+    chunks = self:_mergeSmallChunks(chunks, MIN_CHUNK_CHARS, max_chars)
 
     -- Step 3: re-split anything still over max_chars at word boundaries
     local final = {}
@@ -332,6 +333,12 @@ Recognised boundaries (kept at the end of the preceding chunk):
   - dashes:       " - "
   - conjunctions: ", and/but/or/nor/for/yet/so/which/who/that/where/when/
                     while/although/because/since/unless/if/after/before"
+  - CJK clause punctuation: after "，"(U+FF0C), "、"(U+3001), "；"(U+FF1B),
+    "："(U+FF1A).  CJK has no spaces, so the English rules above never fire
+    and a long Chinese sentence would otherwise fall through to
+    _splitAtWordBoundary's character-boundary cut: valid UTF-8, but the
+    pause lands mid-phrase instead of on the natural clause boundary the
+    author wrote.
 
 @param text string
 @return table Array of trimmed non-empty strings
@@ -344,6 +351,16 @@ function TextParser:_splitAtClauses(text)
         "after", "before",
     }
 
+    -- CJK clause punctuation as raw UTF-8 byte sequences (3 bytes each):
+    -- ，(U+FF0C) 、(U+3001) ；(U+FF1B) ：(U+FF1A).  Split AFTER the mark so
+    -- it stays at the end of the preceding chunk; there is no space to skip.
+    local cjk_clauses = {
+        "\239\188\140", -- ， U+FF0C
+        "\227\128\129", -- 、 U+3001
+        "\239\188\155", -- ； U+FF1B
+        "\239\188\154", -- ： U+FF1A
+    }
+
     local chunks = {}
     local current = ""
     local pos = 1
@@ -351,8 +368,23 @@ function TextParser:_splitAtClauses(text)
     while pos <= #text do
         local ch = text:sub(pos, pos)
 
+        -- CJK clause punctuation - split after the punctuation
+        local three = text:sub(pos, pos + 2)
+        local is_cjk_clause = false
+        for _, mark in ipairs(cjk_clauses) do
+            if three == mark then
+                is_cjk_clause = true
+                break
+            end
+        end
+        if is_cjk_clause then
+            current = current .. three
+            table.insert(chunks, current)
+            current = ""
+            pos = pos + 3
+
         -- "; " or ": " - split after the punctuation
-        if (ch == ";" or ch == ":") and text:sub(pos + 1, pos + 1) == " " then
+        elseif (ch == ";" or ch == ":") and text:sub(pos + 1, pos + 1) == " " then
             current = current .. ch
             table.insert(chunks, current)
             current = ""
@@ -411,20 +443,32 @@ Merge chunks shorter than min_chars with a neighbour.
 Prefers merging with the previous chunk (so we build up the leading chunk).
 Falls back to merging forward when there is no previous chunk.
 
-@param chunks table     Array of chunk strings
+A merge never pushes a chunk past max_chars.  Without the cap, many short
+clauses (20-50 bytes each) merge back into one over-long chunk, which
+splitLongSentence then has to re-split at word boundaries; for CJK there are
+no spaces, so that re-split degenerates to the character-boundary cut and the
+pause lands mid-phrase.  Stopping at max_chars keeps the natural clause
+boundaries produced by _splitAtClauses; a clause left shorter than min_chars
+is still better than a mid-phrase cut.
+
+@param chunks table      Array of chunk strings
 @param min_chars number  Minimum acceptable chunk length
+@param max_chars number  Upper bound a merged chunk must not exceed
+                         (nil = unlimited)
 @return table            Merged array
 --]]
-function TextParser:_mergeSmallChunks(chunks, min_chars)
+function TextParser:_mergeSmallChunks(chunks, min_chars, max_chars)
     if #chunks <= 1 then return chunks end
 
     local merged = {}
     for _, chunk in ipairs(chunks) do
-        if #chunk < min_chars and #merged > 0 then
-            -- Merge with previous chunk
+        if #chunk < min_chars and #merged > 0
+            and (not max_chars or #merged[#merged] + 1 + #chunk <= max_chars) then
+            -- Merge with previous chunk (only while it stays within max_chars)
             merged[#merged] = merged[#merged] .. " " .. chunk
         elseif #chunk < min_chars then
-            -- First chunk is tiny - just push, will merge on next iteration
+            -- First chunk is tiny, or merging would overflow max_chars -
+            -- just push, will merge on next iteration
             table.insert(merged, chunk)
         else
             table.insert(merged, chunk)
@@ -432,7 +476,9 @@ function TextParser:_mergeSmallChunks(chunks, min_chars)
     end
 
     -- Second pass: if the first chunk is still too small, merge it forward
-    if #merged > 1 and #merged[1] < min_chars then
+    -- (again respecting the max_chars ceiling)
+    if #merged > 1 and #merged[1] < min_chars
+        and (not max_chars or #merged[1] + 1 + #merged[2] <= max_chars) then
         merged[2] = merged[1] .. " " .. merged[2]
         table.remove(merged, 1)
     end
