@@ -18,6 +18,16 @@ local Utils = dofile(_plugin_root .. "utils.lua")
 local ffi = require("ffi")
 pcall(function() ffi.cdef[[ int kill(int pid, int sig); ]] end)
 pcall(function() ffi.cdef[[ int mkfifo(const char *pathname, unsigned int mode); ]] end)
+pcall(function() ffi.cdef[[
+    int socket(int domain, int type, int protocol);
+    int connect(int sockfd, const struct sockaddr *addr, unsigned int addrlen);
+    int send(int sockfd, const void *buf, unsigned long len, int flags);
+    long recv(int sockfd, void *buf, unsigned long len, int flags);
+    int setsockopt(int sockfd, int level, int optname, const void *optval, unsigned int optlen);
+    int close(int fd);
+    struct sockaddr_un { unsigned short sun_family; char sun_path[108]; };
+    struct timeval { long tv_sec; long tv_usec; };
+]] end)
 
 local MediaEngine = {}
 
@@ -1061,6 +1071,23 @@ function MediaEngine:_hasLuaSocket()
     return ok and socket ~= nil
 end
 
+--- True when the FFI AF_UNIX client can run.  KOReader's LuaSocket is
+--- built without socket.unix, so on desktop Linux this client is the
+--- only working mpv IPC channel (issue #101).
+function MediaEngine:_mpvFfiIpcAvailable()
+    return pcall(function()
+        return ffi.C.socket and ffi.C.connect
+            and ffi.C.send and ffi.C.recv and ffi.C.close
+    end)
+end
+
+--- IPC client ready: a socket server was requested and we have a client
+--- for it (LuaSocket's socket.unix or the FFI fallback).
+function MediaEngine:_mpvIpcUsable()
+    return self._socket_path ~= nil
+        and (self:_hasLuaSocket() or self:_mpvFfiIpcAvailable())
+end
+
 function MediaEngine:_mpvSendIpc(cmd_table, timeout_ms)
     timeout_ms = timeout_ms or 500
     if not self._socket_path then return nil end
@@ -1092,18 +1119,50 @@ function MediaEngine:_mpvSendIpc(cmd_table, timeout_ms)
         end
     end
 
-    -- Fallback: write directly to Unix socket via FFI
-    if ffi.C.open then
+    -- Fallback: raw AF_UNIX client via FFI.  KOReader's LuaSocket has no
+    -- socket.unix and open(2) can never connect to a socket file, so this
+    -- is what makes pause/seek/quit/time-pos work at all on desktop
+    -- Linux (issue #101).
+    if self:_mpvFfiIpcAvailable() then
         local ok_json, json = pcall(require, "json")
         if ok_json and json then
-            local O_WRONLY = 1
-            local fd = ffi.C.open(self._socket_path, O_WRONLY)
+            local AF_UNIX, SOCK_STREAM = 1, 1
+            local SOL_SOCKET, SO_RCVTIMEO = 1, 20
+            local fd = ffi.C.socket(AF_UNIX, SOCK_STREAM, 0)
             if fd >= 0 then
-                local payload = json.encode(cmd_table) .. "\n"
-                ffi.C.write(fd, payload, #payload)
-                ffi.C.close(fd)
-                -- For commands that don't need response, this is sufficient
-                return {data = true}
+                local addr = ffi.new("struct sockaddr_un")
+                addr.sun_family = AF_UNIX
+                ffi.copy(addr.sun_path, self._socket_path:sub(1, 107))
+                local rc = ffi.C.connect(fd,
+                    ffi.cast("struct sockaddr *", addr), ffi.sizeof(addr))
+                if rc == 0 then
+                    -- Bound the wait so a wedged mpv cannot freeze the UI.
+                    local tv = ffi.new("struct timeval")
+                    tv.tv_sec = 0
+                    tv.tv_usec = timeout_ms * 1000
+                    pcall(function()
+                        ffi.C.setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                            tv, ffi.sizeof(tv))
+                    end)
+                    local payload = json.encode(cmd_table) .. "\n"
+                    ffi.C.send(fd, payload, #payload, 0)
+                    local buf = ffi.new("char[4096]")
+                    local n = ffi.C.recv(fd, buf, 4096, 0)
+                    ffi.C.close(fd)
+                    if n and n > 0 then
+                        -- Skip any interleaved event lines; return the
+                        -- first real command response.
+                        for line in ffi.string(buf, n):gmatch("[^\r\n]+") do
+                            local ok2, decoded = pcall(json.decode, line)
+                            if ok2 and decoded and decoded.event == nil then
+                                return decoded
+                            end
+                        end
+                    end
+                else
+                    ffi.C.close(fd)
+                    logger.dbg("MediaEngine: FFI IPC connect failed")
+                end
             end
         end
     end
@@ -1478,23 +1537,43 @@ end
 function MediaEngine:_playMpv(gen)
     self:_setupMpvIpc()
 
+    -- IPC: --input-ipc-server whenever we have a client for it (LuaSocket's
+    -- socket.unix or the FFI fallback).  The --input-file FIFO needs its
+    -- reader to exist before writers open it, so it is the last resort.
     local ipc_arg
-    if self:_hasLuaSocket() then
+    self._mpv_ipc_ok = self:_hasLuaSocket() or self:_mpvFfiIpcAvailable()
+    if self._mpv_ipc_ok then
         ipc_arg = string.format('--input-ipc-server="%s"', self._socket_path)
     else
         ipc_arg = string.format('--input-file="%s"', self._fifo_path)
     end
 
+    -- Start at the requested offset: chapter jumps and "read from here"
+    -- launch with _seek_offset set and the position estimate adds it, so
+    -- playback must begin there or the highlight leads the audio by
+    -- exactly that margin (issue #101).
+    local start_arg = ""
+    if self._seek_offset and self._seek_offset > 0 then
+        start_arg = string.format(" --start=%.3f", self._seek_offset)
+    end
+
+    -- NOTE: no trailing "&" inside the wrapper command.  The wrapper is
+    -- already backgrounded; an inner "&" detaches mpv from the shell and
+    -- the pidfile then records a shell that exits immediately, so the
+    -- completion watcher believes every clip finished at once and the
+    -- next one starts while the last is still playing (issue #101).
     local cmd = string.format(
-        '%s %s --no-video --really-quiet --idle=no --keep-open=no "%s" &',
+        '%s %s%s --no-video --really-quiet --idle=no --keep-open=no "%s"',
         self.backend_cmd,
         ipc_arg,
+        start_arg,
         self.current_path:gsub('"', '\\"')
     )
 
     logger.warn("MediaEngine: mpv launch gen=", gen, "cmd=", cmd:sub(1, 200))
 
-    -- Spawn in background and capture PID
+    -- Spawn in background and capture PID; exec replaces the shell, so
+    -- the recorded PID is mpv's.
     local pid_file = self:_getTempDir() .. "/mpv-pid-" .. gen
     os.remove(pid_file)
     local wrapper = string.format("sh -c 'echo $$ > %s; exec %s' &", pid_file, cmd)
@@ -2899,10 +2978,17 @@ function MediaEngine:pause()
     end
 
     if self.backend == self.BACKENDS.MPV then
-        if self:_hasLuaSocket() and self._socket_path then
+        if self:_mpvIpcUsable() then
             self:_mpvSendIpc({command = {"set_property", "pause", true}})
         elseif self._fifo_path then
             self:_mpvSendFifo("set pause yes")
+        end
+        -- Park the position for the UI hold and for an exact restart
+        -- after a stop (same contract as the Android branch).  Only on
+        -- the IPC path: with the FIFO fallback the wall-clock estimate
+        -- keeps its own pause accounting and must not double-count.
+        if self._mpv_ipc_ok then
+            self._paused_position = math.max(0, live_pos)
         end
         return
     elseif self.backend == self.BACKENDS.MPLAYER then
@@ -3047,7 +3133,7 @@ function MediaEngine:resume()
     self.is_paused = false
 
     if self.backend == self.BACKENDS.MPV then
-        if self:_hasLuaSocket() and self._socket_path then
+        if self:_mpvIpcUsable() then
             self:_mpvSendIpc({command = {"set_property", "pause", false}})
         elseif self._fifo_path then
             self:_mpvSendFifo("set pause no")
@@ -3163,7 +3249,7 @@ function MediaEngine:stop()
 
     -- For mpv, send quit via IPC
     if self.backend == self.BACKENDS.MPV then
-        if self:_hasLuaSocket() and self._socket_path then
+        if self:_mpvIpcUsable() then
             pcall(function()
                 self:_mpvSendIpc({command = {"quit"}})
             end)
@@ -3274,7 +3360,7 @@ function MediaEngine:seek(seconds, mode)
 
     if self.backend == self.BACKENDS.MPV then
         local mode_str = mode == "relative" and "relative" or "absolute"
-        if self:_hasLuaSocket() and self._socket_path then
+        if self:_mpvIpcUsable() then
             self:_mpvSendIpc({command = {"seek", seconds, mode_str}})
             return true
         elseif self._fifo_path then
@@ -3557,6 +3643,19 @@ function MediaEngine:getPosition()
     -- Do NOT trust MediaPlayer.getCurrentPosition() alone via JNI (often
     -- stuck at 0 on Boox).  MediaEngine._play_start_time is real wall time.
 
+    -- mpv answers time-pos over IPC: the real decoder clock, which
+    -- accounts for pause, seek and speed natively.  It must be consulted
+    -- BEFORE the wall-clock estimate below: play() always sets
+    -- _play_start_time, so an estimate placed first made this branch
+    -- unreachable (issue #101).
+    if self.backend == self.BACKENDS.MPV and self:_mpvIpcUsable() then
+        local resp = self:_mpvSendIpc({command = {"get_property", "time-pos"}}, 300)
+        if resp and resp.data then
+            local pos = tonumber(resp.data)
+            if pos then return pos end
+        end
+    end
+
     -- For backends without IPC (gst-play, aplay, ffmpeg-pipe, android), estimate from elapsed time.
     -- Scale elapsed real time by playback speed so the reported position tracks the
     -- actual audio position when atempo / speed filters are in use.
@@ -3589,15 +3688,6 @@ function MediaEngine:getPosition()
         end)
         if ok and elapsed then
             return math.min(elapsed, self.current_duration or elapsed)
-        end
-    end
-
-    -- Try mpv IPC for accurate position
-    if self.backend == self.BACKENDS.MPV and self:_hasLuaSocket() and self._socket_path then
-        local resp = self:_mpvSendIpc({command = {"get_property", "time-pos"}}, 300)
-        if resp and resp.data then
-            local pos = tonumber(resp.data)
-            if pos then return pos end
         end
     end
 
