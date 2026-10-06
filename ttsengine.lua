@@ -271,6 +271,36 @@ function TTSEngine:detectBackend()
         end
         return false
     end
+    --- Reject bundled ELF binaries built for a foreign CPU.  The release
+    --- ships ARM builds, so on x86_64 desktops the bundled piper/espeak
+    --- "exist" but can never exec ("Exec format error"), which blocked
+    --- detection of a perfectly good system espeak-ng (issue #101).
+    --- Unknown host architectures and non-ELF files are accepted.
+    local ELF_MACHINE_BY_ARCH = {
+        x86 = { 3 }, x64 = { 62 }, arm = { 40 }, arm64 = { 183 },
+        mips = { 8, 10 }, ppc = { 20, 21 },
+    }
+    local function binaryRunsOnHost(path)
+        local arch = jit and jit.arch
+        local ok_machines = arch and ELF_MACHINE_BY_ARCH[arch]
+        if not ok_machines then return true end
+        local f = io.open(path, "r")
+        if not f then return false end
+        local hdr = f:read(20)
+        f:close()
+        if not hdr or #hdr < 20 or hdr:sub(1, 4) ~= "\027ELF" then
+            return true  -- not an ELF (script or wrapper): let the caller try
+        end
+        local big_endian = hdr:byte(6) == 2
+        local b19, b20 = hdr:byte(19), hdr:byte(20)
+        local machine = big_endian and (b19 * 256 + b20) or (b19 + b20 * 256)
+        for _, m in ipairs(ok_machines) do
+            if machine == m then return true end
+        end
+        logger.warn("TTSEngine:", path, "is ELF machine", machine,
+            "but host arch is", arch, "-- skipping bundled binary")
+        return false
+    end
     -- On Android, the bundled espeak-ng/Piper binaries are compiled for Linux
     -- (glibc) and won't run on Android's Bionic libc.  Skip bundled binaries
     -- and go straight to system PATH detection.
@@ -282,7 +312,7 @@ function TTSEngine:detectBackend()
         local bundled_base = plugin_dir .. "/espeak-ng"
         local bundled_bin = bundled_base .. "/bin/espeak-ng"
         local found_espeak = false
-        if ensureBinary(bundled_bin) then
+        if ensureBinary(bundled_bin) and binaryRunsOnHost(bundled_bin) then
             found_espeak = true
             self.backend_cmd = bundled_bin
             self.espeak_bin = bundled_bin  -- keep reference for fallback even when Piper is active
@@ -319,7 +349,7 @@ function TTSEngine:detectBackend()
         local piper_dir = plugin_dir .. "/piper"
         local bundled_piper_bin = piper_dir .. "/piper"
         local found_piper = false
-        if ensureBinary(bundled_piper_bin) then
+        if ensureBinary(bundled_piper_bin) and binaryRunsOnHost(bundled_piper_bin) then
             -- Also rename Piper's helper binaries (.bin -> original)
             ensureBinary(piper_dir .. "/piper_phonemize")
             ensureBinary(piper_dir .. "/espeak-ng")
@@ -332,7 +362,7 @@ function TTSEngine:detectBackend()
         end
         -- Check for bundled wav-play (ALSA player for devices without aplay)
         local wav_play_bin = plugin_dir .. "/wav-play/wav-play"
-        if ensureBinary(wav_play_bin) then
+        if ensureBinary(wav_play_bin) and binaryRunsOnHost(wav_play_bin) then
             self._wav_play_bin = wav_play_bin
             self._wav_play_lib = plugin_dir .. "/wav-play/lib"
             logger.dbg("TTSEngine: Found bundled wav-play at", wav_play_bin)
@@ -343,7 +373,7 @@ function TTSEngine:detectBackend()
         local sanotts_dir = plugin_dir .. "/sanotts"
         local sanotts_server = sanotts_dir .. "/snt_server"
         local found_sanotts = false
-        if ensureBinary(sanotts_server) then
+        if ensureBinary(sanotts_server) and binaryRunsOnHost(sanotts_server) then
             -- Voice inventory: amy (piperlite int8, ~1.5 MB across four
             -- blob files, the quality voice) and kristin (R7 int8, ~700 KB,
             -- the light voice).  Either alone is enough to offer the
@@ -392,7 +422,7 @@ function TTSEngine:detectBackend()
         -- shipped sizes.  Never a default tier.
         local jp_dir = plugin_dir .. "/sanotts-jp"
         local jp_server = jp_dir .. "/snt_jp_server"
-        if ensureBinary(jp_server) then
+        if ensureBinary(jp_server) and binaryRunsOnHost(jp_server) then
             self.snt_jp_server = jp_server
             local wpath = jp_dir .. "/saanotts-jp-v4-int8.bin"
             local dpath = jp_dir .. "/k1-dict-438750.bin"
