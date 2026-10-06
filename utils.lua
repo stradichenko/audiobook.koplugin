@@ -435,6 +435,98 @@ function Utils.visibleSentenceWordRange(words, page)
     return best_i, best_j
 end
 
+-- Spaceless-script detection as raw UTF-8 byte patterns (no unicode library).
+-- Same block coverage as TTSEngine's CJK detection (Han, Kana, Hangul); the
+-- patterns are duplicated here because utils is a leaf module ttsengine cannot
+-- be required from.  Korean words carry spaces, but Korean also allows breaking
+-- a word across lines, which hits the same wrap case as Han/Kana.
+local RE_HAN    = "[\228-\233][\128-\191][\128-\191]"
+local RE_KANA   = "\227[\129-\131][\128-\191]"
+local RE_HANGUL = "[\234-\237][\128-\191][\128-\191]"
+
+--- True when `s` contains at least one Han, Kana, or Hangul codepoint, i.e.
+--- a script written without spaces between words.  Used to gate the
+--- whitespace-insensitive sentence match (findIgnoringSpaces): for a spaced
+--- script an exact-match miss means the sentence is not on the page at all,
+--- so a space-insensitive hit could only be a mid-word coincidence.  For a
+--- spaceless script the usual cause of an exact miss is a line wrap.
+-- @param s string
+-- @return boolean
+function Utils.hasSpacelessScript(s)
+    if not s or s == "" then return false end
+    if s:find(RE_HAN) then return true end
+    if s:find(RE_KANA) then return true end
+    if s:find(RE_HANGUL) then return true end
+    return false
+end
+
+--- Find `needle` inside `haystack` while IGNORING all whitespace, returning
+--- the (1-based, inclusive) byte range in the ORIGINAL haystack, or nil.
+---
+--- Why this exists: `_highlightSentenceRolling` builds `built_text` by
+--- concatenating rendered line texts, inserting a single space at every line
+--- break.  A CJK sentence has no internal spaces, so when it wraps across two
+--- rendered lines the inserted space makes a plain `find(sentence)` miss, and
+--- the word-level fallbacks degenerate (splitWords treats the whole sentence
+--- as one token).  This matcher compares both strings with ASCII whitespace
+--- removed and maps the hit back onto the original haystack, so a phrase that
+--- merely wrapped is still found.
+---
+--- Text is compared byte-wise; only bytes Lua's "%s" matches (space, \t, \n,
+--- \v, \f, \r) are skipped, and those never occur inside a multi-byte UTF-8
+--- sequence, so codepoint alignment is preserved and `find`'s hit is always
+--- codepoint-aligned.  Needles stripping to fewer than 6 bytes are rejected:
+--- a very short needle ("好。") could otherwise match inside a different
+--- sentence on the page and highlight the wrong region.
+--- @param haystack string  Rendered page text (with line-break spaces)
+--- @param needle string    Sentence text (whitespace runs collapsed)
+--- @return number|nil start, number|nil end  Byte range in `haystack`
+function Utils.findIgnoringSpaces(haystack, needle)
+    if not haystack or not needle or needle == "" then return nil end
+
+    -- Reject if the needle has no non-space content or is very short.
+    local needle_stripped = needle:gsub("%s+", "")
+    if #needle_stripped < 6 then return nil end
+
+    -- Walk `haystack`, dropping whitespace, and record for every kept
+    -- codepoint: its byte offset in the stripped string AND its original
+    -- byte range in haystack.  The map must be keyed by BYTE offset (`find`
+    -- returns a byte position), so keep one entry per stripped byte.
+    local stripped = {}
+    local strip_byte = {}   -- stripped byte offset (1-based) -> { s = , e = }
+    local n = #haystack
+    local i = 1
+    local so = 0            -- running byte length of the stripped string
+    while i <= n do
+        local b = haystack:byte(i)
+        if b == 0x20 or (b >= 0x09 and b <= 0x0D) then
+            i = i + 1
+        else
+            -- Copy one full UTF-8 codepoint so multibyte chars stay intact.
+            local len = 1
+            if b >= 0xF0 then len = 4
+            elseif b >= 0xE0 then len = 3
+            elseif b >= 0xC0 then len = 2 end
+            stripped[#stripped + 1] = haystack:sub(i, i + len - 1)
+            -- Map every byte of this codepoint back to its original range.
+            for k = 1, len do
+                strip_byte[so + k] = { s = i, e = i + len - 1 }
+            end
+            so = so + len
+            i = i + len
+        end
+    end
+    local hay_stripped = table.concat(stripped)
+
+    local p = hay_stripped:find(needle_stripped, 1, true)
+    if not p then return nil end
+    local q = p + #needle_stripped - 1       -- byte range in the stripped string
+    local start_entry = strip_byte[p]
+    local end_entry = strip_byte[q]
+    if not start_entry or not end_entry then return nil end
+    return start_entry.s, end_entry.e
+end
+
 --- Detect the number of CPU cores (same logic as piperqueue.lua).
 -- @return number  Core count (1 when undetectable)
 function Utils.getCpuCores()
