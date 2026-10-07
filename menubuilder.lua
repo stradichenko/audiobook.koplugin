@@ -253,6 +253,25 @@ function MenuBuilder.buildVoiceSettingsMenu(plugin)
                 .. "system TTS engine (Google, SherpaTTS, …)."
             ),
         })
+        -- Background lookahead synthesis (off by default): removes most of
+        -- the fixed pause between sentences by having the next sentence's
+        -- audio ready before the current one finishes (issue #96).
+        table.insert(menu, {
+            text = _("Pre-synthesize next sentence in background"),
+            checked_func = function()
+                return plugin:getSetting("android_prefetch", false)
+            end,
+            callback = function()
+                plugin:toggleSetting("android_prefetch", false)
+            end,
+            help_text = _(
+                "Synthesizes the next sentence in the background while the "
+                .. "current one plays, removing most of the pause between "
+                .. "sentences. Useful when your TTS engine is slow to answer "
+                .. "each request. If audio glitches or repeated sentences "
+                .. "occur, turn this off."
+            ),
+        })
     end
 
     -- Speech rate submenu

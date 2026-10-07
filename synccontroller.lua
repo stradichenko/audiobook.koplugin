@@ -1452,6 +1452,17 @@ function SyncController:beginSentencePlayback(sentence)
         concat_files
     )
 
+    -- Android play() can return false when it could not launch audio at all
+    -- (TTS helper unavailable, or a prefetched clip failed to start).  The
+    -- historical contract had no handler for a falsy return and the chain
+    -- dead-ended silently; route it through the Android retry path, which
+    -- resynthesizes the sentence on demand and only stops after repeated
+    -- failures.
+    if not play_ok and self.tts_engine.backend == self.tts_engine.BACKENDS.ANDROID then
+        self:_onAndroidSynthFailed("play() could not start audio")
+        return
+    end
+
     if play_ok then
         -- Scale the FIRST sentence's word timings to match the real WAV
         -- duration.  play() scales engine.timing_data but the sync loop
@@ -2705,6 +2716,11 @@ function SyncController:_onAndroidSynthFailed(reason)
     -- readNextSentence already incremented the index; retry this sentence.
     if self.reading_sentence_idx and self.reading_sentence_idx > 0 then
         self.reading_sentence_idx = self.reading_sentence_idx - 1
+        -- Lower the dispatched watermark so the retry passes the
+        -- backward-jump guard in readNextSentence: the failed attempt
+        -- recorded this index as dispatched, and the guard would otherwise
+        -- reject re-dispatching it (silent dead end).
+        self._highest_dispatched_idx = self.reading_sentence_idx
     end
     UIManager:scheduleIn(0.35, function()
         if self.state == self.STATE.STOPPED then return end
