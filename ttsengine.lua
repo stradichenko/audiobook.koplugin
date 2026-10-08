@@ -2093,6 +2093,22 @@ function TTSEngine:_androidPrefetchInvalidate()
         os.remove(self._android_prefetch_inflight)
         self._android_prefetch_inflight = nil
     end
+    self._android_prefetch_inflight_text = nil
+end
+
+--- Lookahead status for a sentence: "ready" (the slot holds its audio),
+--- "inflight" (background synthesis still running), or "none".  Used by the
+--- sentence controller to wait out an in-flight lookahead instead of
+--- dispatching a duplicate on-demand synthesis (issue #96).
+function TTSEngine:getAndroidPrefetchStatus(text)
+    if self._prefetch_file and self._prefetch_text == text then
+        return "ready"
+    end
+    if self._android_prefetch_inflight
+            and self._android_prefetch_inflight_text == text then
+        return "inflight"
+    end
+    return "none"
 end
 
 --- Background lookahead synthesis for the Android TTS backend (issue #96).
@@ -2169,7 +2185,7 @@ function TTSEngine:prefetchAndroid(text)
         return false
     end
     self._android_prefetch_inflight = slot_path
-    -- Poll for completion (scheduled, non-blocking; the playing sentence
+    self._android_prefetch_inflight_text = text
     -- keeps its own callbacks).  A real synthesis dispatch or stop()
     -- invalidates this loop via the generation counter.
     self._android_prefetch_gen = (self._android_prefetch_gen or 0) + 1
@@ -2183,6 +2199,7 @@ function TTSEngine:prefetchAndroid(text)
         local st = atts:getSynthStatus()
         if st == 1 then
             engine._android_prefetch_inflight = nil
+            engine._android_prefetch_inflight_text = nil
             -- Compute the word-timing estimates for the slot text without
             -- clobbering the playing sentence's timing_data.
             local saved_timing = engine.timing_data
@@ -2194,12 +2211,14 @@ function TTSEngine:prefetchAndroid(text)
             logger.warn("TTSEngine: Android prefetch ready for:", text:sub(1, 40))
         elseif st == 2 then
             engine._android_prefetch_inflight = nil
+            engine._android_prefetch_inflight_text = nil
             logger.warn("TTSEngine: Android prefetch synthesis failed")
             os.remove(slot_path)
         elseif poll_count < max_polls then
             UIManager:scheduleIn(0.1, pollPrefetchDone)
         else
             engine._android_prefetch_inflight = nil
+            engine._android_prefetch_inflight_text = nil
             logger.warn("TTSEngine: Android prefetch timed out after",
                 poll_count * 0.1, "s")
             os.remove(slot_path)

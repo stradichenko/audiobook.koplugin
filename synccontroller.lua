@@ -658,6 +658,55 @@ function SyncController:readNextSentence()
         return
     end
 
+    -- Android lookahead: background synthesis for this exact sentence is
+    -- still running.  Waiting for it beats dispatching a duplicate: the
+    -- duplicate invalidates the in-flight work and re-synthesizes the same
+    -- text through the engine's slower on-demand path, which is exactly the
+    -- gap the lookahead is meant to remove (issue #96).
+    if self.tts_engine.backend == self.tts_engine.BACKENDS.ANDROID
+            and self.tts_engine.getAndroidPrefetchStatus
+            and self.tts_engine:getAndroidPrefetchStatus(sentence.text) == "inflight" then
+        local waited_ms = 0
+        local my_wait_gen = self._chain_generation or 0
+        local function waitForAndroidPrefetch()
+            if self.state == self.STATE.STOPPED then return end
+            if (self._chain_generation or 0) ~= my_wait_gen then return end
+            local st = self.tts_engine:getAndroidPrefetchStatus(sentence.text)
+            if st == "ready" then
+                if self.tts_engine:usePrefetched(sentence.text) then
+                    logger.warn("SyncController: Android lookahead consumed after",
+                        waited_ms, "ms wait")
+                    controller:applySentenceTiming(sentence, self.tts_engine.timing_data)
+                    controller:beginSentencePlayback(sentence)
+                end
+                return
+            end
+            if st ~= "inflight" or waited_ms >= 10000 then
+                -- Prefetch gone (stop, superseded) or too slow: drop the
+                -- straggler and synthesize this sentence on demand.  This
+                -- must NOT re-enter readNextSentence, which would advance
+                -- the index and skip the sentence.
+                self.tts_engine:_androidPrefetchInvalidate()
+                logger.warn("SyncController: Android lookahead not ready after",
+                    waited_ms, "ms, synthesizing on demand")
+                controller.tts_engine:synthesize(sentence.text, function(synth_success, timing_data)
+                    if not synth_success then
+                        controller:_onAndroidSynthFailed("lookahead fallback")
+                        return
+                    end
+                    controller._android_tts_fail_count = 0
+                    controller:applySentenceTiming(sentence, timing_data)
+                    controller:beginSentencePlayback(sentence)
+                end)
+                return
+            end
+            waited_ms = waited_ms + 100
+            UIManager:scheduleIn(0.1, waitForAndroidPrefetch)
+        end
+        waitForAndroidPrefetch()
+        return
+    end
+
     -- For Piper: if a prefetch is pending/queued, wait for it instead of
     -- launching a duplicate synthesis (which wastes ~11s and RAM).
     local piper_status = self.tts_engine:getPiperPrefetchStatus(sentence.text)
