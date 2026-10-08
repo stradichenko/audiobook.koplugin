@@ -965,7 +965,7 @@ for d in \
 do
     SETTINGS_FILE="${d}audiobook.lua"
     if [ -f "$SETTINGS_FILE" ]; then
-        SETTINGS_SECTION=$(grep -E '(tts_backend|speech_rate|speech_pitch|speech_volume|highlight_style|auto_advance|highlight_words|highlight_sentences|espeak_cold_start|keep_playing_on_lid_close|bt_media_control|piper_model)' "$SETTINGS_FILE" 2>/dev/null | sed 's/^/  /' || echo "  (parse error)")
+        SETTINGS_SECTION=$(grep -E '(tts_backend|speech_rate|speech_pitch|speech_volume|highlight_style|auto_advance|highlight_words|highlight_sentences|espeak_cold_start|keep_playing_on_lid_close|bt_media_control|piper_model|android_prefetch|android_pcm_stream|sentence_pause|paragraph_pause|piper_sentence_gap)' "$SETTINGS_FILE" 2>/dev/null | sed 's/^/  /' || echo "  (parse error)")
         break
     fi
 done
