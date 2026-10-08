@@ -365,7 +365,18 @@ function SyncController:_wasSpoken(t)
     if s == t then return true end
     if #t >= 8 and #s >= #t and s:sub(-#t) == t then return true end
     local k, n = _wrapWordOverlap(s, t)
-    return k >= 2 and k >= n
+    if k >= 2 and k >= n then return true end
+    -- Whitespace-insensitive containment (CJK-safe).  The previous page's
+    -- text often bleeds past the visible end, so its last utterance already
+    -- contains the continuation fragment this page opens with; byte-suffix
+    -- and word-overlap checks above cannot see it: the two extractions start
+    -- at different points inside the sentence, and spaceless scripts make
+    -- every sentence a single "word", so the >= 2 word threshold never
+    -- fires.  A whitespace-stripped containment match closes that gap.
+    if #t >= 12 and Utils.findIgnoringSpaces(s, t) then
+        return true
+    end
+    return false
 end
 
 --- Drop the wrap tail already in the last clip (any length). Only sentence 1.
