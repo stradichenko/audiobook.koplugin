@@ -21,6 +21,9 @@ AndroidMediaSession.CMD_PAUSE = 3
 AndroidMediaSession.CMD_STOP = 4
 AndroidMediaSession.CMD_NEXT = 5
 AndroidMediaSession.CMD_PREV = 6
+-- Phone call / audio focus interruption (see MediaSessionHelper.java).
+AndroidMediaSession.CMD_INTERRUPT_PAUSE = 7
+AndroidMediaSession.CMD_INTERRUPT_RESUME = 8
 
 local function checkException(env)
     if env[0].ExceptionCheck(env) ~= 0 then
@@ -263,7 +266,17 @@ function AndroidMediaSession:startPolling(plugin)
     local function tick()
         if self._poll_gen ~= gen then return end
         local cmd = self:pollCommand()
-        if cmd and cmd ~= self.CMD_NONE and self._plugin then
+        if (cmd == self.CMD_INTERRUPT_PAUSE or cmd == self.CMD_INTERRUPT_RESUME)
+                and self._plugin then
+            -- Not a button press: explicit pause/resume, no debounce/toggle.
+            logger.warn("AndroidMediaSession: interruption", cmd)
+            local p = self._plugin
+            if cmd == self.CMD_INTERRUPT_PAUSE then
+                pcall(function() p:onMediaPause() end)
+            else
+                pcall(function() p:onMediaPlay() end)
+            end
+        elseif cmd and cmd ~= self.CMD_NONE and self._plugin then
             -- Extra Lua debounce: AVRCP may still deliver a second command on
             -- the next poll tick after Java's 700ms window starts.
             local now = UIManager:getTime()
