@@ -4130,6 +4130,15 @@ function Audiobook:onSuspend()
         pcall(function() self.session_recorder:stop() end)
     end
     if not self._init_ok then return end
+    -- Android: Suspend fires when KOReader is merely sent to the background
+    -- (home button, app switch, screen off).  There is no hardware sleep to
+    -- protect against, and audiobook playback must keep going in the
+    -- background like any media app.  Calls are handled via audio focus in
+    -- MediaSessionHelper instead.
+    if Device:isAndroid() then
+        logger.warn("Audiobook: Android Suspend is lifecycle-only, keeping playback running")
+        return
+    end
     -- Handle media playback suspend
     if self.media_sync and (self.media_sync:isPlaying() or self.media_sync:isPaused()) then
         self._media_was_playing = self.media_sync:isPlaying()

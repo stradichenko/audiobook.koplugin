@@ -267,6 +267,7 @@
               binutils        # readelf (used by package-for-kobo.sh)
               curl             # downloading Piper voices
               file             # inspecting binaries
+              jdk17            # javac for android/build-dex.sh (d8 comes from the Android SDK)
               lua5_4           # local Lua testing
               luajit           # closer to KOReader's runtime
             ];
