@@ -2070,7 +2070,7 @@ so when the current sentence finishes we can skip straight to playback.
 @param text string Text of the next sentence
 @return boolean Success
 --]]
-function TTSEngine:prefetch(text, use_espeak)
+function TTSEngine:prefetch(text, use_espeak, idx)
     if not self.backend or not text or text == "" then
         return false
     end
@@ -2079,7 +2079,7 @@ function TTSEngine:prefetch(text, use_espeak)
     -- and would clobber current_audio_file), so prefetchAndroid fills the
     -- same slot from its own background completion instead.
     if self.backend == self.BACKENDS.ANDROID then
-        return self:prefetchAndroid(text)
+        return self:prefetchAndroid(text, idx)
     end
     -- Piper/sanoTTS: delegate to the async queue-based prefetcher
     if (self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS
@@ -2141,8 +2141,10 @@ function TTSEngine:_androidPrefetchInvalidate()
         self._android_prefetch_inflight = nil
     end
     self._android_prefetch_inflight_text = nil
+    self._android_prefetch_inflight_idx = nil
     self._android_prefetch_inflight_slot = nil
     self._android_prefetch_queued_text = nil
+    self._android_prefetch_queued_idx = nil
 end
 
 --- Drop the second lookahead slot's content (Android only; no-op elsewhere).
@@ -2152,6 +2154,7 @@ function TTSEngine:_androidCleanSlot2()
         self._android_prefetch2_file = nil
     end
     self._android_prefetch2_text = nil
+    self._android_prefetch2_idx = nil
     self._prefetch2_timing = nil
 end
 
@@ -2160,16 +2163,24 @@ end
 --- "none".  Used by the sentence controller to wait out an in-flight
 --- lookahead instead of dispatching a duplicate on-demand synthesis
 --- (issue #96).
-function TTSEngine:getAndroidPrefetchStatus(text)
-    if self._prefetch_file and self._prefetch_text == text then
+function TTSEngine:getAndroidPrefetchStatus(text, idx)
+    -- Match by sentence index when the caller knows it: the scheduler and
+    -- the consumer can hold byte-different (equal-length) text for the same
+    -- sentence when the page was parsed twice, which made exact-text
+    -- matching miss every slot mid-page (issue #96).
+    if self._prefetch_file and (self._prefetch_text == text
+            or (idx and self._prefetch_idx == idx)) then
         return "ready"
     end
-    if self._android_prefetch2_file and self._android_prefetch2_text == text then
+    if self._android_prefetch2_file and (self._android_prefetch2_text == text
+            or (idx and self._android_prefetch2_idx == idx)) then
         return "ready"
     end
     if (self._android_prefetch_inflight
-                and self._android_prefetch_inflight_text == text)
-            or self._android_prefetch_queued_text == text then
+                and (self._android_prefetch_inflight_text == text
+                    or (idx and self._android_prefetch_inflight_idx == idx)))
+            or (self._android_prefetch_queued_text == text
+                or (idx and self._android_prefetch_queued_idx == idx)) then
         return "inflight"
     end
     return "none"
@@ -2199,7 +2210,7 @@ end
 ---     inherits the current rate/pitch; language is (re)selected per chunk.
 --- @param text string  Next sentence text
 --- @return boolean     true when a background synthesis was launched or queued
-function TTSEngine:prefetchAndroid(text)
+function TTSEngine:prefetchAndroid(text, idx)
     if self.backend ~= self.BACKENDS.ANDROID or not text or text == "" then
         return false
     end
@@ -2213,11 +2224,14 @@ function TTSEngine:prefetchAndroid(text)
     if not atts then
         return false  -- not initialized yet; the on-demand path lazy-inits
     end
-    -- Already holding this text (pending or ready)?  Nothing to do.
-    if self._prefetch_file and self._prefetch_text == text then
+    -- Already holding this sentence (pending or ready)?  Nothing to do.
+    -- Index match first: byte-equality fails across double parses (issue #96).
+    if self._prefetch_file and (self._prefetch_text == text
+            or (idx and self._prefetch_idx == idx)) then
         return true
     end
-    if self._android_prefetch2_file and self._android_prefetch2_text == text then
+    if self._android_prefetch2_file and (self._android_prefetch2_text == text
+            or (idx and self._android_prefetch2_idx == idx)) then
         return true
     end
     -- A background synthesis is already running: Java handles one utterance
@@ -2226,9 +2240,11 @@ function TTSEngine:prefetchAndroid(text)
     -- as soon as the engine frees.
     if self._android_prefetch_inflight then
         if not self._android_prefetch_queued_text
-                and self._android_prefetch_inflight_text ~= text then
+                and self._android_prefetch_inflight_text ~= text
+                and self._android_prefetch_inflight_idx ~= idx then
             self._android_prefetch_queued_text = text
-            dlog("android-prefetch", "queued", "chars", #text)
+            self._android_prefetch_queued_idx = idx
+            dlog("android-prefetch", "queued", "chars", #text, "idx", idx)
         end
         return true
     end
@@ -2242,7 +2258,7 @@ function TTSEngine:prefetchAndroid(text)
     -- Drop a stale slot from an earlier sentence before filling anew.
     self:_cleanPrefetch()
     self:_androidPrefetchInvalidate()
-    return self:_androidDispatchPrefetch(atts, text, 1)
+    return self:_androidDispatchPrefetch(atts, text, 1, idx)
 end
 
 --- Dispatch one background synthesis into a lookahead slot and start its
@@ -2251,8 +2267,9 @@ end
 -- @param atts table  AndroidTts instance
 -- @param text string  Sentence text
 -- @param slot_no number  1 (shared prefetch slot) or 2 (Android-only slot)
+-- @param idx number|nil  Sentence index the slot is being filled for
 -- @return boolean  true when dispatched
-function TTSEngine:_androidDispatchPrefetch(atts, text, slot_no)
+function TTSEngine:_androidDispatchPrefetch(atts, text, slot_no, idx)
     self.file_counter = (self.file_counter or 0) + 1
     local slot_path = atts:getTempDir() .. "/audiobook_prefetch_"
         .. os.time() .. "_" .. self.file_counter .. ".wav"
@@ -2275,17 +2292,18 @@ function TTSEngine:_androidDispatchPrefetch(atts, text, slot_no)
     end
     self._android_prefetch_inflight = slot_path
     self._android_prefetch_inflight_text = text
+    self._android_prefetch_inflight_idx = idx
     self._android_prefetch_inflight_slot = slot_no
     -- A real synthesis dispatch or stop() invalidates this loop via the
     -- generation counter (the Java helper runs one synthesis under one
     -- utterance id, so after a dispatch or stop the old onDone never fires).
     self._android_prefetch_gen = (self._android_prefetch_gen or 0) + 1
-    self:_androidPollPrefetch(slot_path, text, slot_no, self._android_prefetch_gen)
+    self:_androidPollPrefetch(slot_path, text, slot_no, self._android_prefetch_gen, idx)
     return true
 end
 
 --- Poll a background synthesis to completion and fill its slot.
-function TTSEngine:_androidPollPrefetch(slot_path, text, slot_no, my_gen)
+function TTSEngine:_androidPollPrefetch(slot_path, text, slot_no, my_gen, idx)
     local engine = self
     local atts = self._android_tts
     local poll_count = 0
@@ -2297,6 +2315,7 @@ function TTSEngine:_androidPollPrefetch(slot_path, text, slot_no, my_gen)
         if st == 1 then
             engine._android_prefetch_inflight = nil
             engine._android_prefetch_inflight_text = nil
+            engine._android_prefetch_inflight_idx = nil
             engine._android_prefetch_inflight_slot = nil
             -- The engine bakes silence into its clips; trim it at fill time
             -- so the shortened file is what every later duration/scale read
@@ -2311,22 +2330,25 @@ function TTSEngine:_androidPollPrefetch(slot_path, text, slot_no, my_gen)
             if slot_no == 2 then
                 engine._android_prefetch2_file = slot_path
                 engine._android_prefetch2_text = text
+                engine._android_prefetch2_idx = idx
                 engine._prefetch2_timing = timing
             else
                 engine._prefetch_timing = timing
                 engine._prefetch_file = slot_path
                 engine._prefetch_text = text
+                engine._prefetch_idx = idx
             end
             logger.warn("TTSEngine: Android prefetch ready for:", text:sub(1, 40))
-            dlog("android-prefetch", "ready", "slot", slot_no, "chars", #text)
+            dlog("android-prefetch", "ready", "slot", slot_no, "chars", #text, "idx", idx)
             -- The engine is free: launch a queued follow-up if one waits.
             engine:_androidDispatchQueuedPrefetch()
         elseif st == 2 then
             engine._android_prefetch_inflight = nil
             engine._android_prefetch_inflight_text = nil
+            engine._android_prefetch_inflight_idx = nil
             engine._android_prefetch_inflight_slot = nil
             logger.warn("TTSEngine: Android prefetch synthesis failed")
-            dlog("android-prefetch", "failed", "slot", slot_no)
+            dlog("android-prefetch", "failed", "slot", slot_no, "idx", idx)
             os.remove(slot_path)
         elseif poll_count < max_polls then
             UIManager:scheduleIn(0.1, pollPrefetchDone)
@@ -2349,14 +2371,17 @@ end
 --- requested).
 function TTSEngine:_androidDispatchQueuedPrefetch()
     local text = self._android_prefetch_queued_text
+    local idx = self._android_prefetch_queued_idx
     if not text or text == "" then return end
     if self._android_prefetch_inflight then return end
     if self._android_prefetch_session_disabled then
         self._android_prefetch_queued_text = nil
+        self._android_prefetch_queued_idx = nil
         return
     end
     if not self.plugin or not self.plugin:getSetting("android_prefetch", false) then
         self._android_prefetch_queued_text = nil
+        self._android_prefetch_queued_idx = nil
         return
     end
     local atts = self._android_tts
@@ -2370,16 +2395,19 @@ function TTSEngine:_androidDispatchQueuedPrefetch()
         return
     end
     self._android_prefetch_queued_text = nil
-    self:_androidDispatchPrefetch(atts, text, slot_no)
+    self._android_prefetch_queued_idx = nil
+    self:_androidDispatchPrefetch(atts, text, slot_no, idx)
 end
 --[[--
-Check if prefetched audio matches the given text and swap it in.
+Check if prefetched audio matches the given sentence and swap it in.
 @param text string The sentence text to check
+@param idx number|nil Sentence index (matches across double parses, #96)
 @return boolean true if prefetch was used
 --]]
-function TTSEngine:usePrefetched(text)
+function TTSEngine:usePrefetched(text, idx)
     -- Check single-slot prefetch (espeak-ng)
-    if self._prefetch_file and self._prefetch_text == text then
+    if self._prefetch_file and (self._prefetch_text == text
+            or (idx and self._prefetch_idx == idx)) then
         if self.current_audio_file then
             os.remove(self.current_audio_file)
         end
@@ -2388,6 +2416,7 @@ function TTSEngine:usePrefetched(text)
         self._prefetch_file = nil
         self._prefetch_timing = nil
         self._prefetch_text = nil
+        self._prefetch_idx = nil
         -- Android: the prefetched WAV is played straight from the file by
         -- play()'s slot sub-path (no synthesizeAndPlay dispatch happened for
         -- this sentence, so the pipeline status is stale from the last one).
@@ -2399,7 +2428,8 @@ function TTSEngine:usePrefetched(text)
     end
     -- Check the second Android lookahead slot
     if self.backend == self.BACKENDS.ANDROID and self._android_prefetch2_file
-            and self._android_prefetch2_text == text then
+            and (self._android_prefetch2_text == text
+                or (idx and self._android_prefetch2_idx == idx)) then
         if self.current_audio_file then
             os.remove(self.current_audio_file)
         end
@@ -2407,12 +2437,13 @@ function TTSEngine:usePrefetched(text)
         self.timing_data = self._prefetch2_timing
         self._android_prefetch2_file = nil
         self._android_prefetch2_text = nil
+        self._android_prefetch2_idx = nil
         self._prefetch2_timing = nil
         -- The prefetched WAV is played straight from the file by play()'s
         -- slot sub-path (no synthesizeAndPlay dispatch happened for this
         -- sentence, so the pipeline status is stale from the last one).
         self._android_prefetch_consumed = true
-        dlog("android-sentence", "slot2-hit")
+        dlog("android-sentence", "slot2-hit", "idx", idx)
         logger.dbg("TTSEngine: Using prefetched audio (slot 2)")
         return true
     end
@@ -2484,10 +2515,12 @@ function TTSEngine:_cleanPrefetch()
     end
     self._prefetch_timing = nil
     self._prefetch_text = nil
+    self._prefetch_idx = nil
     self._prefetch_in_use = false
     -- Second Android lookahead slot and any queued follow-up
     self:_androidCleanSlot2()
     self._android_prefetch_queued_text = nil
+    self._android_prefetch_queued_idx = nil
     -- Clean Piper async queue
     self._piper:cleanQueue()
 end

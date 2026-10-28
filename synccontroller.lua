@@ -818,7 +818,7 @@ function SyncController:readNextSentence()
     if self._piper_abandoned and self.tts_engine and self.tts_engine.espeak_bin then
         logger.dbg("SyncController: espeak-only mode, sentence", self.reading_sentence_idx)
         local fb_file = nil
-        if self.tts_engine:usePrefetched(sentence.text) then
+        if self.tts_engine:usePrefetched(sentence.text, sentence.index) then
             -- Prefetched during the previous sentence's playback (issue #49)
             fb_file = self.tts_engine.current_audio_file
         else
@@ -838,8 +838,12 @@ function SyncController:readNextSentence()
         self.reading_sentence_idx, "/", self.total_sentences, ":",
         sentence.text:sub(1, 60))
 
-    -- Check if we already prefetched this sentence's audio
-    local used_prefetch = self.tts_engine:usePrefetched(sentence.text)
+    -- Check if we already prefetched this sentence's audio.  The index is
+    -- part of the match: the scheduler and this consumer can hold
+    -- byte-different (equal-length) text for the same sentence after a
+    -- re-parse, which made exact-text matching miss every slot mid-page
+    -- and each sentence pay full synthesis latency (issue #96).
+    local used_prefetch = self.tts_engine:usePrefetched(sentence.text, sentence.index)
     if used_prefetch then
         -- Audio is ready — apply timing and start playback immediately
         logger.warn("SyncController: Using prefetched audio for sentence", self.reading_sentence_idx)
@@ -860,15 +864,15 @@ function SyncController:readNextSentence()
     -- gap the lookahead is meant to remove (issue #96).
     if self.tts_engine.backend == self.tts_engine.BACKENDS.ANDROID
             and self.tts_engine.getAndroidPrefetchStatus
-            and self.tts_engine:getAndroidPrefetchStatus(sentence.text) == "inflight" then
+            and self.tts_engine:getAndroidPrefetchStatus(sentence.text, sentence.index) == "inflight" then
         local waited_ms = 0
         local my_wait_gen = self._chain_generation or 0
         local function waitForAndroidPrefetch()
             if self.state == self.STATE.STOPPED then return end
             if (self._chain_generation or 0) ~= my_wait_gen then return end
-            local st = self.tts_engine:getAndroidPrefetchStatus(sentence.text)
+            local st = self.tts_engine:getAndroidPrefetchStatus(sentence.text, sentence.index)
             if st == "ready" then
-                if self.tts_engine:usePrefetched(sentence.text) then
+                if self.tts_engine:usePrefetched(sentence.text, sentence.index) then
                     logger.warn("SyncController: Android lookahead consumed after",
                         waited_ms, "ms wait")
                     controller._android_lookahead_waits = (controller._android_lookahead_waits or 0) + 1
@@ -1035,7 +1039,7 @@ function SyncController:readNextSentence()
 
                 if enough or timed_out then
                     -- Consume the prefetch and start playback
-                    local ok = controller.tts_engine:usePrefetched(sentence.text)
+                    local ok = controller.tts_engine:usePrefetched(sentence.text, sentence.index)
                     if ok then
                         logger.warn("SyncController: Piper prefetch arrived for sentence",
                             controller.reading_sentence_idx, "after",
@@ -1056,7 +1060,7 @@ function SyncController:readNextSentence()
                     UIManager:scheduleIn(0.25, waitForPiperPrefetch)
                 else
                     -- Hard timeout: play whatever we have
-                    local ok = controller.tts_engine:usePrefetched(sentence.text)
+                    local ok = controller.tts_engine:usePrefetched(sentence.text, sentence.index)
                     if ok then
                         controller._piper_warmed_up = true
                         controller:applySentenceTiming(sentence, controller.tts_engine.timing_data)
@@ -1182,7 +1186,7 @@ function SyncController:readNextSentence()
                     return
                 end
             end
-            local ok = controller.tts_engine:usePrefetched(sentence.text)
+            local ok = controller.tts_engine:usePrefetched(sentence.text, sentence.index)
             if ok then
                 logger.warn("SyncController: Piper queue delivered sentence",
                     controller.reading_sentence_idx, "after", poll_count * 0.25, "s",
@@ -1843,7 +1847,7 @@ function SyncController:_prefetchNextSentence(explicit_idx)
     -- instead of the dead Piper queue.
     local use_espeak = self._piper_abandoned and true or false
     UIManager:scheduleIn(0.2, function()
-        engine:prefetch(text, use_espeak)
+        engine:prefetch(text, use_espeak, next_idx)
     end)
 end
 
