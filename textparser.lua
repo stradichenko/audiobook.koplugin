@@ -147,13 +147,55 @@ function TextParser:parseSentences(text, max_chunk)
     local sentences = {}
     local sentence_index = 1
 
+    -- True when the string carries at least one readable character: a
+    -- letter, digit, or any non-punctuation symbol.  Segments without one
+    -- (e.g. the lone second period in Chinese "。。", which the CJK
+    -- terminator split leaves as its own segment) have nothing to say and
+    -- make speech engines fail outright (issue #96).
+    local function hasReadableContent(s)
+        local i = 1
+        while i <= #s do
+            local b = s:byte(i)
+            local cp, len
+            if b < 0x80 then
+                cp, len = b, 1
+            elseif b >= 0xC0 and b < 0xE0 then
+                cp, len = b - 0xC0, 2
+            elseif b >= 0xE0 and b < 0xF0 then
+                cp, len = b - 0xE0, 3
+            elseif b >= 0xF0 then
+                cp, len = b - 0xF0, 4
+            else
+                cp, len = b, 1
+            end
+            for j = 2, len do
+                cp = cp * 64 + ((s:byte(i + j - 1) or 0x80) - 0x80)
+            end
+            -- Not readable: ASCII control/whitespace, NBSP, general
+            -- punctuation (dashes, quotes, ellipsis), CJK symbols and
+            -- punctuation (。、「」…), vertical/fullwidth forms, and the
+            -- halfwidth punctuation block.
+            if cp >= 33
+                and cp ~= 0xA0
+                and cp ~= 0xB7
+                and not (cp >= 0x2000 and cp <= 0x206F)
+                and not (cp >= 0x3000 and cp <= 0x303F)
+                and not (cp >= 0xFE10 and cp <= 0xFE4F)
+                and not (cp >= 0xFF01 and cp <= 0xFF65) then
+                return true
+            end
+            i = i + len
+        end
+        return false
+    end
+
     -- Helper: add a sentence if non-empty
     -- @param s string  Trimmed sentence text
     -- @param end_type string  "paragraph" = last segment before a newline,
     --                         "sentence"  = split by .?!;: mid-line
     local function addSentence(s, end_type)
         s = s:match("^%s*(.-)%s*$")  -- trim
-        if s and s ~= "" then
+        if s and s ~= "" and hasReadableContent(s) then
             table.insert(sentences, {
                 index = sentence_index,
                 text = s,
@@ -183,7 +225,11 @@ function TextParser:parseSentences(text, max_chunk)
             -- whole page parses as one utterance that reads for a minute,
             -- stops early and then turns the page mid-text (issue #96).
             -- Closing quotes/brackets that trail the terminator stay with
-            -- their sentence.
+            -- their sentence.  They must be matched as WHOLE characters: a
+            -- byte class here also swallows UTF-8 continuation bytes, and
+            -- the second 。 in "。。" shares its bytes with the class, so
+            -- the split landed mid-character and handed the engine invalid
+            -- UTF-8, which some engines reject outright (issue #96).
             local ell = "\226\128\166" -- …
             local cjk_endings = {
                 ell,
@@ -191,8 +237,28 @@ function TextParser:parseSentences(text, max_chunk)
                 "\239\188\129", -- ！ U+FF01
                 "\239\188\159", -- ？ U+FF1F
             }
-            local cjk_closers =
-                "[\226\128\157\227\128\139\227\128\141\227\128\143\239\188\137\227\128\145\"]*"
+            local closer_chars = {
+                "\"",
+                "\226\128\157", -- ” U+201D
+                "\227\128\139", -- 「 U+300C
+                "\227\128\141", -- 」 U+300D
+                "\227\128\143", -- 『 U+300E
+                "\227\128\145", -- 』 U+300F
+                "\239\188\137", -- ） U+FF09
+            }
+            local function extend_closers(s, pend)
+                local extended = true
+                while extended do
+                    extended = false
+                    for _, c in ipairs(closer_chars) do
+                        if s:sub(pend + 1, pend + #c) == c then
+                            pend = pend + #c
+                            extended = true
+                        end
+                    end
+                end
+                return pend
+            end
             local pos = 1
             local segments_in_line = {}
             while pos <= #line do
@@ -207,10 +273,11 @@ function TextParser:parseSentences(text, max_chunk)
                 consider(line:find("[%.%?!]+%s", pos))
                 consider(line:find("[%.%?!]+$", pos))
                 for _, term in ipairs(cjk_endings) do
-                    consider(line:find(term .. cjk_closers, pos))
+                    consider(line:find(term, pos))
                 end
                 local pstart, pend = best_s, best_e
                 if pstart then
+                    pend = extend_closers(line, pend)
                     -- Include the punctuation but not the trailing space
                     local seg_end = pend
                     -- If the match ended with a space, don't include the space
