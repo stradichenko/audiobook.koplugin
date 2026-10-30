@@ -18,6 +18,7 @@ import android.speech.tts.Voice;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Locale;
@@ -157,6 +158,10 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
                                 if (!pipelineActive || !path.equals(pipelineFile)) {
                                     return;
                                 }
+                                // Trim engine-baked silence before playback:
+                                // this clip never passes back through Lua, so
+                                // the Lua slot trim cannot reach it here.
+                                trimWavSilence(path);
                                 int dur = pcmMode ? startPcmPlayback(path)
                                                   : startPlayback(path, speechAttributes());
                                 if (dur >= 0) {
@@ -1060,6 +1065,116 @@ public class TtsHelper implements TextToSpeech.OnInitListener {
     private static boolean tagEq(byte[] b, int off, String tag) {
         return b[off] == tag.charAt(0) && b[off + 1] == tag.charAt(1)
             && b[off + 2] == tag.charAt(2) && b[off + 3] == tag.charAt(3);
+    }
+
+    private static void putLe32(byte[] b, int off, int v) {
+        b[off] = (byte) v;
+        b[off + 1] = (byte) (v >> 8);
+        b[off + 2] = (byte) (v >> 16);
+        b[off + 3] = (byte) (v >> 24);
+    }
+
+    // Silence trim for pipeline clips.  Port of the Lua slot trim in
+    // wavutils.lua (trimSilence): engines like Xiaomi mibrain bake trailing
+    // silence into every synthesized clip and no pause setting can reach it
+    // (issue #96).  On-demand clips go straight from the synthesizer
+    // callback into playback here, so the Lua trim never sees them; the
+    // thresholds are the Lua implementation's.  Anything non-canonical is
+    // left untouched, and a failed trim must never fail the sentence.
+    private static final int TRIM_THRESHOLD = 300;    // max |sample| counted as silence
+    private static final int TRIM_MIN_MS = 60;        // only cut an edge at least this long
+    private static final int TRIM_KEEP_LEAD_MS = 20;  // keep a natural onset
+    private static final int TRIM_KEEP_TAIL_MS = 40;  // keep a natural decay
+
+    /** Trim leading/trailing silence from a synthesized 16-bit PCM WAV, in place. */
+    private static void trimWavSilence(String path) {
+        File tmp = new File(path + ".trim");
+        try {
+            File f = new File(path);
+            byte[] b;
+            try {
+                b = new byte[(int) f.length()];
+                FileInputStream in = new FileInputStream(f);
+                int off = 0;
+                while (off < b.length) {
+                    int r = in.read(b, off, b.length - off);
+                    if (r < 0) break;
+                    off += r;
+                }
+                in.close();
+                if (off < b.length) return;  // short read
+            } catch (Exception e) {
+                return;
+            }
+            if (b.length < 44 || !tagEq(b, 0, "RIFF") || !tagEq(b, 8, "WAVE")) return;
+            int bits = 0, blockAlign = 0, byteRate = 0;
+            int dataOff = -1, dataLen = 0;
+            int pos = 12;
+            while (pos + 8 <= b.length) {
+                int size = le32(b, pos + 4);
+                if (size < 0) return;  // corrupt chunk length
+                if (tagEq(b, pos, "fmt ") && size >= 16) {
+                    bits = le16(b, pos + 22);
+                    blockAlign = le16(b, pos + 20);
+                    byteRate = le32(b, pos + 16);
+                } else if (tagEq(b, pos, "data")) {
+                    dataOff = pos + 8;
+                    dataLen = Math.min(size, b.length - dataOff);
+                    break;
+                }
+                pos += 8 + size + (size & 1);  // chunks are 2-byte aligned
+            }
+            if (bits != 16 || blockAlign < 2 || byteRate <= 0
+                    || dataOff < 0 || dataLen <= 0 || dataLen % blockAlign != 0) {
+                return;
+            }
+            int frames = dataLen / blockAlign;
+            int[] frameMax = new int[frames];
+            for (int p = dataOff; p + 1 < dataOff + dataLen; p += 2) {
+                int v = (b[p] & 0xFF) | (b[p + 1] << 8);
+                if (v >= 32768) v -= 65536;
+                int a = v < 0 ? -v : v;
+                int frame = (p - dataOff) / blockAlign;
+                if (frame >= frames) break;
+                if (a > frameMax[frame]) frameMax[frame] = a;
+            }
+            double msPerFrame = 1000.0 / ((double) byteRate / blockAlign);
+            int minTrim = Math.max(1, (int) Math.floor(TRIM_MIN_MS / msPerFrame));
+            int leadKeep = (int) Math.floor(TRIM_KEEP_LEAD_MS / msPerFrame);
+            int tailKeep = (int) Math.floor(TRIM_KEEP_TAIL_MS / msPerFrame);
+            int first = 0;
+            while (first < frames && frameMax[first] <= TRIM_THRESHOLD) first++;
+            if (first >= frames) return;  // entirely silent
+            int last = frames - 1;
+            while (last > first && frameMax[last] <= TRIM_THRESHOLD) last--;
+            int lead = first - leadKeep;
+            int tail = (frames - 1 - last) - tailKeep;
+            if (lead < minTrim) lead = 0;
+            if (tail < minTrim) tail = 0;
+            // Never remove more than half the clip per edge: a quiet onset
+            // or decay must not be mistaken for silence.
+            if (lead > frames / 2) lead = 0;
+            if (tail > frames / 2) tail = 0;
+            if (lead + tail <= 0) return;
+            int newStart = dataOff + lead * blockAlign;
+            int newLen = dataLen - (lead + tail) * blockAlign;
+            if (newLen <= 0) return;
+            // Patch the container sizes (RIFF size at 4, data chunk size in
+            // front of the data body); header and any extra chunks between
+            // them are copied through unchanged.
+            putLe32(b, 4, newStart + newLen - 8);
+            putLe32(b, dataOff - 4, newLen);
+            FileOutputStream out = new FileOutputStream(tmp);
+            try {
+                out.write(b, 0, newStart);
+                out.write(b, newStart, newLen);
+            } finally {
+                out.close();
+            }
+            if (!tmp.renameTo(f)) tmp.delete();
+        } catch (Exception e) {
+            try { tmp.delete(); } catch (Exception ignored) {}
+        }
     }
 
     /**
