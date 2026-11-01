@@ -1135,7 +1135,12 @@ Synthesize using command-line TTS.
 @return boolean Success
 --]]
 function TTSEngine:synthesizeCommand(text, callback)
-    -- Use Android cache dir when running on Android (no /tmp); otherwise /tmp
+    -- Use Android cache dir when running on Android (no /tmp); otherwise /tmp.
+    -- The helper is lazily created, so make sure it exists before the first
+    -- sentence picks its path; /tmp does not exist on Android.
+    if self.backend == self.BACKENDS.ANDROID and not self._android_tts then
+        self:_ensureAndroidTts()
+    end
     local temp_dir = self._android_tts and self._android_tts:getTempDir() or "/tmp"
     self.file_counter = (self.file_counter or 0) + 1
     local audio_file = temp_dir .. "/audiobook_tts_" .. os.time() .. "_" .. self.file_counter .. ".wav"
