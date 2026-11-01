@@ -1123,6 +1123,7 @@ function HighlightManager:_wordScreenBoxes(c0, c1)
     if line0 == line1 then
         local box = ctx.sboxes[line0]
         local lo_c = ctx.cum[line0 - 1] or 0
+        local hi_c = ctx.cum[line0]
         local y = box.y + math.floor(box.h / 2)
         local right = box.x + box.w
         local target0 = c0 - lo_c
