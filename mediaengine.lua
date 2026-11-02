@@ -1773,7 +1773,7 @@ function MediaEngine:_playFfmpegPipe(gen)
 
     -- exec=false: `exec a | b` would replace the shell with the last pipeline
     -- stage (gst-launch), losing the PID we capture.
-    return self:_spawnTracked(cmd, gen, { name = "ffmpeg", exec = false })
+    return self:_spawnTracked(cmd, gen, { name = "ffmpeg", exec = false, setsid = true })
 end
 
 function MediaEngine:_playGstPlay(gen)
@@ -2310,7 +2310,7 @@ function MediaEngine:_playAudiooutExternal(gen)
     end
     self._audioout_ext_dec = use_dec or nil
     self._audioout_external = true
-    self._killAudiooutFeeder()
+    self:_killAudiooutFeeder()
 
     -- Session recording tee, same as the wrapper path.
     local wav_out = ""
