@@ -2917,10 +2917,26 @@ function MediaEngine:pause()
     self._pause_start_time = UIManager:getTime()
 
     if self._audioout_external and self._audioout_client then
+        -- Remember where we paused: the daemon's status while paused reports
+        -- the stream's start epoch, so resume restarted the section from
+        -- where play was first pressed.
+        self._paused_position = math.max(0, live_pos)
+        self._seek_offset = self._paused_position
         -- Kill the ffmpeg feeder; the daemon feeds keepalive silence so
         -- the A2DP link stays up, exactly like the wrapper path.
         self:_killAudiooutFeeder()
         self._audioout_client:pause()
+        if self._use_persistent_pipeline then
+            -- MTK sink: a paused daemon cannot restart its stream (the resume
+            -- rebuild never reaches PLAYING, so resume is silent). Release the
+            -- daemon and the sink; resume() starts a fresh daemon here.
+            self._audioout_client:killDaemon()
+            self._audioout_external = false
+            self._audioout_ext_dec = nil
+            self._audioout_released_on_pause = true
+            logger.warn("MediaEngine: paused audioout: daemon released at", self._paused_position)
+            return
+        end
         logger.warn("MediaEngine: paused audioout external stream")
         return
     end
@@ -2995,13 +3011,32 @@ end
 function MediaEngine:resume()
     if not self.is_playing or not self.is_paused then return end
 
+    if self._audioout_released_on_pause then
+        self._audioout_released_on_pause = nil
+        local pos = self._paused_position or 0
+        self:_killAudiooutFeeder()
+        if self._pause_start_time then
+            self._total_pause_ms = self._total_pause_ms + time.to_ms(UIManager:getTime() - self._pause_start_time)
+            self._pause_start_time = nil
+        end
+        self.is_paused = false
+        self._paused_position = nil
+        self._seek_offset = pos
+        logger.warn("MediaEngine: resume via fresh daemon at", pos)
+        return self:play(self._on_complete, self._on_fail)
+    end
+
     if self._audioout_external and self._audioout_client then
-        local resume_pos = self:getPosition()
+        local resume_pos = self._paused_position or self:getPosition()
+        self:_killAudiooutFeeder()
+        self._paused_position = nil
         self.is_paused = false
         if self._pause_start_time then
             self._total_pause_ms = self._total_pause_ms + time.to_ms(UIManager:getTime() - self._pause_start_time)
             self._pause_start_time = nil
         end
+        self._resume_hold_pos = resume_pos or 0
+        self._resume_hold_until = UIManager:getTime() + time.s(2)
         self._audioout_client:resume((resume_pos or 0) * 1000)
         if not self._audioout_ext_dec then
             self:_spawnAudiooutFeeder(resume_pos, self:_persistentFilterChain(), "")
@@ -3126,6 +3161,7 @@ function MediaEngine:stop()
     self:_nextGeneration()
     self.is_playing = false
     self.is_paused = false
+    self._audioout_released_on_pause = nil
 
     if self._position_timer then
         UIManager:unschedule(self._position_timer)
@@ -3138,7 +3174,14 @@ function MediaEngine:stop()
 
     if self._audioout_external then
         self:_killAudiooutFeeder()
-        if self._audioout_client then self._audioout_client:stop() end
+        if self._audioout_client then
+            self._audioout_client:stop()
+            -- MTK: a stopped daemon does not answer the next externalStart
+            -- (9 s stall, then respawn). Release it so every start is fresh.
+            if self._use_persistent_pipeline then
+                self._audioout_client:killDaemon()
+            end
+        end
         self._audioout_external = false
     end
     -- Kill audio process (for most backends).
@@ -3619,6 +3662,17 @@ function MediaEngine:getPosition()
         end)
         if ok_st and st and st.pos_ms then
             local pos = st.pos_ms / 1000
+            -- Right after resume the daemon's first status adds its
+            -- accumulated play time to the resume point; hold the resume mark.
+            if self._resume_hold_until then
+                if UIManager:getTime() < self._resume_hold_until then
+                    if pos > (self._resume_hold_pos or 0) + 5 then
+                        pos = self._resume_hold_pos
+                    end
+                else
+                    self._resume_hold_until = nil
+                end
+            end
             if not self.is_paused then
                 self._seek_offset = pos
             end
