@@ -3122,6 +3122,10 @@ function Audiobook:startAlignedAudioFromSelection(selected_text)
         self:_showInitError()
         return
     end
+    -- A new play-from-here ends any manual browsing-away state, or the
+    -- highlight stays frozen for the whole new session.
+    self._readaloud_browsing_away = false
+    pcall(function() self:_hideReturnToReadAloudButton() end)
     if not self:_audioOutputReady() then return end
 
     local doc_path = self.ui and self.ui.document and (self.ui.document.file_path or self.ui.document.file)
@@ -3150,6 +3154,10 @@ end
 
 function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allow_resume)
     allow_resume = (allow_resume ~= false)
+    -- A new play-from-here ends any manual browsing-away state, or the
+    -- highlight stays frozen for the whole new session.
+    self._readaloud_browsing_away = false
+    pcall(function() self:_hideReturnToReadAloudButton() end)
     local ok, EpubMediaOverlay = pcall(dofile, PLUGIN_PATH .. "epubmediaoverlay.lua")
     if not ok or not EpubMediaOverlay then
         local why = tostring(EpubMediaOverlay)
