@@ -1238,12 +1238,25 @@ function MediaEngine:load(path)
     return true
 end
 
+-- Kobo MTK: the Bluetooth daemon can be left in a nonstop discovery loop
+-- (10 s on / 4 s off) that starves the A2DP stream: AirPods drop audio
+-- after ~10 s. Stop any discovery before playback. Fire-and-forget so it
+-- can never block the UI.
+function MediaEngine:_stopMtkDiscovery()
+    if not self._use_persistent_pipeline then return end
+    os.execute("dbus-send --system --print-reply --reply-timeout=3000 "
+        .. "--dest=com.kobo.mtk.bluedroid /org/bluez/hci0 "
+        .. "org.bluez.Adapter1.StopDiscovery >/dev/null 2>&1 &")
+    logger.warn("MediaEngine: requested MTK StopDiscovery before playback")
+end
+
 function MediaEngine:play(on_complete, on_fail)
     if not self.current_path then
         logger.err("MediaEngine: play() called without load()")
         if on_fail then on_fail("no file loaded") end
         return false
     end
+    pcall(self._stopMtkDiscovery, self)
 
     -- Kindle A2DP (AirPods): any stop→play gap (seek, track advance, resume)
     -- lets audiomgrd suspend the datapath.  Park silence first so orphan-kill
