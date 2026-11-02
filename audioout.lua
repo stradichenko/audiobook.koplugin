@@ -168,6 +168,13 @@ function AudioOut:start()
     return nil, "daemon did not come up"
 end
 
+-- Kill the daemon outright and clear its socket. The mtk sink allows one
+-- open instance, so a wedged daemon must go before a new one can play.
+function AudioOut:killDaemon()
+    os.execute("killall -9 audioout 2>/dev/null; rm -f '"
+        .. self.socket_path .. "'")
+end
+
 function AudioOut:stopDaemon()
     self:_command({ cmd = "shutdown" }, 500)
     -- socket unlink by the daemon is the confirmation; a kill fallback
