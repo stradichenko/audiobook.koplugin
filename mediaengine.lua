@@ -1250,6 +1250,97 @@ function MediaEngine:_stopMtkDiscovery()
     logger.warn("MediaEngine: requested MTK StopDiscovery before playback")
 end
 
+-- Restart playback at pos, keeping the caller's callbacks.
+function MediaEngine:_restartAt(pos, reason)
+    local saved_on_complete = self._on_complete
+    local saved_on_fail = self._on_fail
+    logger.warn("MediaEngine: restart at", pos, "reason=", reason)
+    self._seek_offset = pos
+    self:stop()
+    local restart_gen = self.play_generation
+    UIManager:scheduleIn(1.0, function()
+        if self.play_generation ~= restart_gen then return end
+        self:play(saved_on_complete, saved_on_fail)
+    end)
+end
+
+-- MTK: playback started before the headset connected goes to a dead route
+-- and never re-attaches. Poll for a connected audio device for up to two
+-- minutes, then restart from where play was pressed (nothing was heard).
+function MediaEngine:_startBtReattachWatcher(gen, from_pos)
+    local bt = self.plugin and self.plugin.bt_manager
+    if not bt then return end
+    local tries, seen = 0, false
+    local function check()
+        if self.play_generation ~= gen or not self.is_playing then return end
+        if seen then
+            self:_restartAt(from_pos, "bt device connected")
+            return
+        end
+        tries = tries + 1
+        if tries > 40 then
+            logger.warn("MediaEngine: reattach watcher gave up")
+            return
+        end
+        pcall(bt.clearAudioDeviceCache, bt)
+        local ok, up = pcall(bt.anyAudioDeviceConnected, bt)
+        -- Give A2DP a few seconds to come up after the link connects.
+        if ok and up then seen = true end
+        UIManager:scheduleIn(3, check)
+    end
+    UIManager:scheduleIn(3, check)
+end
+
+-- MTK: the A2DP stream sometimes never starts (daemon clock stuck at
+-- ~0.2 s, no "PSM setting: 0" in dmesg): silence and a frozen highlight.
+-- Restart from the start point up to twice, then tell the user.
+function MediaEngine:_startAudiooutStallWatchdog(gen)
+    local start_pos = self._seek_offset or 0
+    local last_pos, still, good = nil, 0, 0
+    local function check()
+        if self.play_generation ~= gen or not self.is_playing
+                or not self._audioout_external then return end
+        if self.is_paused then
+            UIManager:scheduleIn(2, check)
+            return
+        end
+        local ok, st = pcall(function()
+            return self._audioout_client:status(300)
+        end)
+        local pos = ok and st and st.pos_ms and st.pos_ms / 1000 or nil
+        if pos and last_pos and pos - last_pos > 0.5 then
+            still = 0
+            good = good + 1
+            if good >= 5 then
+                self._stall_retries = 0
+                return
+            end
+        else
+            still = still + 1
+            good = 0
+        end
+        last_pos = pos or last_pos
+        if still >= 4 then
+            self._stall_retries = (self._stall_retries or 0) + 1
+            if self._stall_retries <= 2 then
+                logger.warn("MediaEngine: audioout stalled at", pos,
+                    "retry", self._stall_retries)
+                self:_restartAt(start_pos, "audio stalled")
+            else
+                self._stall_retries = 0
+                logger.warn("MediaEngine: audioout still stalled; giving up")
+                local InfoMessage = require("ui/widget/infomessage")
+                UIManager:show(InfoMessage:new{
+                    text = _("Bluetooth audio isn't starting.\nTurn Bluetooth off and on, then press play again."),
+                })
+            end
+            return
+        end
+        UIManager:scheduleIn(2, check)
+    end
+    UIManager:scheduleIn(4, check)
+end
+
 function MediaEngine:play(on_complete, on_fail)
     if not self.current_path then
         logger.err("MediaEngine: play() called without load()")
@@ -1295,8 +1386,18 @@ function MediaEngine:play(on_complete, on_fail)
             self._total_pause_ms = 0
             return true
         end
-        logger.warn("MediaEngine: persistent pipeline play failed, falling back to standard backend")
-        self._use_persistent_pipeline = false
+        local bt = self.plugin and self.plugin.bt_manager
+        if bt and bt.anyAudioDeviceConnected and not bt:anyAudioDeviceConnected() then
+            -- No headset yet (Bluetooth still coming up). Keep the persistent
+            -- path and restart once a device connects, instead of playing on
+            -- into a dead route for the rest of the session.
+            logger.warn("MediaEngine: no BT audio device at play; fallback + reattach watcher")
+            self._reattach_from = self._seek_offset or 0
+        else
+            logger.warn("MediaEngine: persistent pipeline play failed, falling back to standard backend")
+            self._use_persistent_pipeline = false
+            self._reattach_from = nil
+        end
     end
 
     local ok = false
@@ -1330,6 +1431,10 @@ function MediaEngine:play(on_complete, on_fail)
         self._play_start_time = UIManager:getTime()
         self._pause_start_time = nil
         self._total_pause_ms = 0
+        if self._reattach_from then
+            self:_startBtReattachWatcher(self.play_generation, self._reattach_from)
+            self._reattach_from = nil
+        end
     else
         self.is_playing = false
         self.is_paused = false
@@ -2362,6 +2467,7 @@ function MediaEngine:_playAudiooutExternal(gen)
     if self.current_duration and self.current_duration > 0 then
         self:_startPersistentCompletionWatcher(gen, self.current_duration)
     end
+    self:_startAudiooutStallWatchdog(gen)
     return true
 end
 
