@@ -191,6 +191,14 @@ function MediaSync:_gotoSmilFragment(text_doc, fragment_id, allow_scan, sentence
             ui.rolling:_gotoXPointer(cached)
         end)
         if ok then
+            -- _gotoXPointer leaves ReaderRolling's xpointer at the old page,
+            -- so the next re-render (e.g. closing the player) jumped back to
+            -- where playback started.
+            pcall(function()
+                if ui.document.getXPointer then
+                    ui.rolling.xpointer = ui.document:getXPointer()
+                end
+            end)
             UIManager:setDirty("all", "ui")
             return true
         end
@@ -882,6 +890,34 @@ function MediaSync:stop(keep_chapter_menu, opts)
     local track_transition = opts.track_transition and true or false
     local drop_chrome = opts.drop_chrome and true or false
     local was_playing = self.state ~= self.STATE.STOPPED
+    -- Sync ReaderRolling to the page actually shown before the stop
+    -- re-renders, or the view snaps back to the session start.
+    if was_playing and not track_transition
+            and not (self.plugin and self.plugin._readaloud_browsing_away) then
+        pcall(function()
+            local ui = self.plugin and self.plugin.ui
+            if not (ui and ui.rolling and ui.document) then return end
+            -- Prefer the sentence being read: the page-top xpointer can resolve
+            -- to the end of the previous page.
+            local idx = self._highlighted_sentence_idx or self._current_sentence_idx
+            -- _highlighted_sentence_idx is a cue-GROUP id when grouping is
+            -- active; timing_data is indexed by entry, so map a group back
+            -- to its first member before indexing.
+            if idx and self._cue_groups and self._cue_groups[idx] then
+                idx = self._cue_groups[idx].first
+            end
+            local e = idx and self.timing_data and self.timing_data[idx]
+            local xp
+            if e and e.fragment_id and e.text_doc and e.text_doc ~= "" and self._xpointer_cache then
+                xp = self._xpointer_cache[e.text_doc .. "#" .. e.fragment_id]
+            end
+            if xp then
+                ui.rolling.xpointer = xp
+            elseif ui.document.getXPointer then
+                ui.rolling.xpointer = ui.document:getXPointer()
+            end
+        end)
+    end
     if self.overlay_mode and was_playing and not track_transition
         and self.plugin and self.plugin._saveCurrentAlignedProgress then
         pcall(function() self.plugin:_saveCurrentAlignedProgress() end)
