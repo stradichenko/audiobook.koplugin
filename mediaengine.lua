@@ -2312,10 +2312,25 @@ function MediaEngine:_playAudiooutExternal(gen)
     -- decodes the file itself -- no ffmpeg feeder process at all. Speed
     -- changes fall back to the feeder, whose filter chain carries atempo.
     local use_dec = ao:hasDecoder() and (self._playback_speed or 1.0) == 1.0
-    local resp = ao:externalStart(44100, 2, nil,
-        (self._seek_offset or 0) * 1000,
-        (self.current_duration or 0) * 1000,
-        use_dec and self.current_path or nil)
+    local function ext_start()
+        return ao:externalStart(44100, 2, nil,
+            (self._seek_offset or 0) * 1000,
+            (self.current_duration or 0) * 1000,
+            use_dec and self.current_path or nil)
+    end
+    local resp = ext_start()
+    if not resp then
+        -- A wedged daemon (e.g. left paused by a previous KOReader run) still
+        -- answers ping but holds the single-instance mtk sink: falling back
+        -- now makes every clip fail instantly and races through the book.
+        logger.warn("MediaEngine: audioout not answering; respawning daemon")
+        ao:killDaemon()
+        os.execute("usleep 300000")
+        if ao:start() then
+            use_dec = ao:hasDecoder() and (self._playback_speed or 1.0) == 1.0
+            resp = ext_start()
+        end
+    end
     if not resp or not resp.ok then
         logger.warn("MediaEngine: audioout external start refused:",
             resp and resp.error or "timeout")
