@@ -18,6 +18,10 @@ fed_end_ms is reached.
 local ffi = require("ffi")
 local logger = require("logger")
 
+-- NOTE: KOReader's ffi/posix_h already defines struct timeval, so this
+-- whole block can fail as one unit and leave setsockopt undeclared; the
+-- command loop therefore polls a non-blocking socket instead of relying
+-- on SO_RCVTIMEO.
 pcall(function() ffi.cdef[[
     int socket(int domain, int type, int protocol);
     int connect(int sockfd, const struct sockaddr *addr, unsigned int addrlen);
@@ -39,7 +43,7 @@ local AudioOut = {
     STARTUP_WAIT_MS = 4000,
 }
 
-local AF_UNIX, SOCK_STREAM = 1, 1
+local AF_UNIX, SOCK_STREAM, SOCK_NONBLOCK = 1, 1, 2048
 local SOL_SOCKET, SO_RCVTIMEO = 1, 20
 
 function AudioOut:new(o)
@@ -63,7 +67,7 @@ function AudioOut:_command(cmd_table, timeout_ms)
         return nil, "no json module"
     end
     timeout_ms = timeout_ms or self.COMMAND_TIMEOUT_MS
-    local fd = ffi.C.socket(AF_UNIX, SOCK_STREAM, 0)
+    local fd = ffi.C.socket(AF_UNIX, SOCK_STREAM + SOCK_NONBLOCK, 0)
     if fd < 0 then return nil, "socket" end
     local addr = ffi.new("struct sockaddr_un")
     addr.sun_family = AF_UNIX
@@ -85,10 +89,17 @@ function AudioOut:_command(cmd_table, timeout_ms)
     ffi.C.send(fd, payload, #payload, 0)
     local buf = ffi.new("char[4096]")
     local out = nil
-    local attempts = math.ceil(timeout_ms / 50)
+    -- Non-blocking socket polled every 10 ms: SO_RCVTIMEO is not reliable
+    -- here (see the cdef note above), and a blocking recv() on a wedged
+    -- daemon hangs KOReader for good.
+    local attempts = math.ceil(timeout_ms / 10)
     while attempts > 0 and not out do
         attempts = attempts - 1
         local n = ffi.C.recv(fd, buf, 4096, 0)
+        if not n or n <= 0 then
+            if n == 0 then break end
+            ffi.C.usleep(10 * 1000)
+        end
         if n and n > 0 then
             for line in ffi.string(buf, n):gmatch("[^\r\n]+") do
                 local ok2, decoded = pcall(json.decode, line)
