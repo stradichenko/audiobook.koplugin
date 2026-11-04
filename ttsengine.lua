@@ -2086,6 +2086,13 @@ function TTSEngine:prefetch(text, use_espeak, idx)
     if self.backend == self.BACKENDS.ANDROID then
         return self:prefetchAndroid(text, idx)
     end
+    -- Platform-native helpers answer asynchronously, like Android: the
+    -- generic slot fill below races (duplicate launches, a cleaned-up slot
+    -- file, clobbered current_audio_file), so synthesize on demand instead
+    -- (issue #110).
+    if self.backend == self.BACKENDS.NATIVE then
+        return false
+    end
     -- Piper/sanoTTS: delegate to the async queue-based prefetcher
     if (self.backend == self.BACKENDS.PIPER or self.backend == self.BACKENDS.SANOTTS
             or self.backend == self.BACKENDS.SANOTTS_JP)
