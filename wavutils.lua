@@ -4,7 +4,11 @@ Provides functions for reading, writing, and manipulating WAV files.
 Used by ttsengine and piperqueue modules for audio file operations.
 
 All functions assume standard PCM WAV format with a 44-byte header.
-Piper and espeak-ng both produce this canonical layout.
+Piper and espeak-ng both produce this canonical layout.  Helpers that
+write extra RIFF chunks (LIST/INFO between fmt and data, or trailing
+chunks) are handled by locating the data chunk before touching sizes;
+optional operations (trim, fade, resample) skip such files rather than
+risk corruption (issue #110).
 
 @module wavutils
 --]]
@@ -116,8 +120,12 @@ function WavUtils.resampleFile(path, target_rate)
         WavUtils.CHANNELS_OFFSET + 1, WavUtils.CHANNELS_OFFSET + 2))
     local bps = WavUtils.readLE16(header:sub(
         WavUtils.BITS_PER_SAMPLE_OFFSET + 1, WavUtils.BITS_PER_SAMPLE_OFFSET + 2))
-    local data_size = WavUtils.readLE32(header:sub(
-        WavUtils.DATA_SIZE_OFFSET + 1, WavUtils.DATA_SIZE_OFFSET + 4))
+    local data_off, data_size = WavUtils.locateDataChunk(f)
+    if not data_off then f:close(); return false end
+    if data_size == 0 then
+        local fs = f:seek("end")
+        data_size = fs - data_off
+    end
 
     if channels ~= 1 or bps ~= 16 then
         -- Only mono 16-bit supported for resampling
@@ -127,6 +135,7 @@ function WavUtils.resampleFile(path, target_rate)
     end
 
     -- Read all PCM data
+    f:seek("set", data_off)
     local pcm_data = f:read(data_size)
     f:close()
     if not pcm_data or #pcm_data < 2 then return false end
@@ -208,6 +217,39 @@ function WavUtils.readBlockAlign(f)
     return val > 0 and val or 2
 end
 
+--- Locate the PCM data chunk by walking the RIFF chunk list.
+-- A 44-byte header is the common case, not a guarantee: helpers built on
+-- ffmpeg may add a LIST/INFO chunk between fmt and data, or trailing
+-- chunks after data.  Sizes patched at fixed offsets then corrupt those
+-- files (issue #110).
+-- @param f file  Open binary file handle; its position is restored.
+-- @return number|nil  Byte offset of the PCM data, nil when unparseable
+-- @return number|nil  Data chunk size (0 when the header streams, e.g. pipes)
+function WavUtils.locateDataChunk(f)
+    local restore = f:seek("cur")
+    local file_size = f:seek("end") or 0
+    f:seek("set", 12)  -- skip "RIFF"<size>"WAVE"
+    local guard = 0
+    while guard < 16 do
+        guard = guard + 1
+        local tag = f:read(4)
+        local raw = f:read(4)
+        if not tag or not raw or #raw < 4 then break end
+        local csize = WavUtils.readLE32(raw)
+        if tag == "data" then
+            local offset = f:seek("cur")
+            f:seek("set", restore or 0)
+            return offset, csize
+        end
+        if csize <= 0 then break end  -- streamed or bogus chunk: stop walking
+        local pos = f:seek("cur") + csize + (csize % 2)
+        if pos + 8 > file_size then break end
+        f:seek("set", pos)
+    end
+    f:seek("set", restore or 0)
+    return nil, nil
+end
+
 --- Update RIFF and data chunk headers for a WAV file.
 -- Must be called after appending data to keep the file valid.
 -- @param f file  Open file handle (r+b)
@@ -215,8 +257,11 @@ function WavUtils.updateHeaders(f)
     local file_size = f:seek("end")
     f:seek("set", WavUtils.RIFF_SIZE_OFFSET)
     f:write(WavUtils.le32(file_size - 8))
-    f:seek("set", WavUtils.DATA_SIZE_OFFSET)
-    f:write(WavUtils.le32(file_size - WavUtils.HEADER_SIZE))
+    -- The data chunk is only at the fixed offset 40 in the canonical
+    -- layout; walk the chunk list so extra chunks keep their sizes.
+    local data_off = WavUtils.locateDataChunk(f) or WavUtils.HEADER_SIZE
+    f:seek("set", data_off - 4)
+    f:write(WavUtils.le32(file_size - data_off))
 end
 
 --[[--
@@ -245,9 +290,17 @@ function WavUtils.getDurationMs(path)
     if not f then return 0 end
     local size = f:seek("end")
     local byte_rate = WavUtils.readByteRate(f)
+    local data_off, data_size = WavUtils.locateDataChunk(f)
     f:close()
     if byte_rate <= 0 then return 0 end
-    local data_bytes = size - WavUtils.HEADER_SIZE
+    local data_bytes
+    if data_off and data_size and data_size > 0 then
+        data_bytes = data_size
+    elseif data_off then
+        data_bytes = size - data_off
+    else
+        data_bytes = size - WavUtils.HEADER_SIZE
+    end
     if data_bytes <= 0 then return 0 end
     return math.floor((data_bytes / byte_rate) * 1000)
 end
@@ -271,6 +324,17 @@ function WavUtils.appendSilence(path, duration_ms)
     if byte_rate <= 0 then f:close(); return false end
 
     local block_align = WavUtils.readBlockAlign(f)
+
+    -- Only append when the data chunk reaches EOF: a helper with a trailing
+    -- chunk after data would otherwise have the silence grow that chunk
+    -- (issue #110).  Skipping a gap is cosmetic; growing a chunk is not.
+    local file_size = f:seek("end")
+    local data_off, data_sz = WavUtils.locateDataChunk(f)
+    if not (data_off and data_sz and data_sz > 0 and data_off + data_sz == file_size) then
+        f:close()
+        logger.warn("WavUtils: appendSilence skipped, data chunk not found last in ", path)
+        return false
+    end
 
     -- Calculate silence bytes (aligned to block_align)
     local silence_bytes = math.floor(byte_rate * (duration_ms / 1000))
@@ -472,10 +536,14 @@ function WavUtils.applyFade(path, fade_ms)
     local block_align = WavUtils.readBlockAlign(f)
     if byte_rate <= 0 or block_align <= 0 then f:close(); return false end
 
-    -- Read data size from header
-    f:seek("set", WavUtils.DATA_SIZE_OFFSET)
-    local raw = f:read(4)
-    local data_size = WavUtils.readLE32(raw)
+    -- Locate the data chunk: a fixed offset 40 reads a LIST/INFO chunk's
+    -- size on helper-written files and fades would land in the wrong place.
+    local data_off, data_size = WavUtils.locateDataChunk(f)
+    if not data_off then f:close(); return false end
+    if not data_size or data_size <= 0 then
+        local fs = f:seek("end")
+        data_size = fs - data_off
+    end
     if data_size <= 0 then f:close(); return false end
 
     -- Fade length in bytes, aligned to block_align
@@ -491,7 +559,7 @@ function WavUtils.applyFade(path, fade_ms)
     local num_samples = fade_bytes / 2  -- 16-bit = 2 bytes per sample
 
     -- ── Fade-in (first fade_bytes) ──────────────────────────────
-    f:seek("set", WavUtils.HEADER_SIZE)
+    f:seek("set", data_off)
     local chunk = f:read(fade_bytes)
     if not chunk or #chunk < fade_bytes then f:close(); return false end
 
@@ -505,11 +573,11 @@ function WavUtils.applyFade(path, fade_ms)
         if sample < 0 then sample = sample + 65536 end
         out[i + 1] = string.char(sample % 256, math.floor(sample / 256) % 256)
     end
-    f:seek("set", WavUtils.HEADER_SIZE)
+    f:seek("set", data_off)
     f:write(table.concat(out))
 
     -- ── Fade-out (last fade_bytes) ──────────────────────────────
-    local fo_start = WavUtils.HEADER_SIZE + data_size - fade_bytes
+    local fo_start = data_off + data_size - fade_bytes
     f:seek("set", fo_start)
     chunk = f:read(fade_bytes)
     if not chunk or #chunk < fade_bytes then f:close(); return false end
@@ -548,17 +616,43 @@ function WavUtils.mergeFiles(main_file, concat_files)
     local f = io.open(main_file, "r+b")
     if not f then return false end
 
+    -- The appended bytes must land inside the main file's data chunk: a
+    -- trailing chunk after data would swallow them (issue #110).
+    local main_size = f:seek("end")
+    local main_off, main_sz = WavUtils.locateDataChunk(f)
+    if not (main_off and main_sz and main_sz > 0 and main_off + main_sz == main_size) then
+        f:close()
+        logger.warn("WavUtils: merge skipped, data chunk not found last in ", main_file)
+        return false
+    end
+
     local total_appended = 0
     for _, cf in ipairs(concat_files) do
         local src = io.open(cf.file, "rb")
         if src then
-            src:seek("set", WavUtils.HEADER_SIZE)
-            local data = src:read("*a")
-            src:close()
-            if data and #data > 0 then
-                f:seek("end")
-                f:write(data)
-                total_appended = total_appended + #data
+            local src_off, src_sz = WavUtils.locateDataChunk(src)
+            if src_off then
+                src:seek("set", src_off)
+                if src_sz and src_sz > 0 then
+                    local data = src:read(src_sz)
+                    src:close()
+                    if data and #data > 0 then
+                        f:seek("end")
+                        f:write(data)
+                        total_appended = total_appended + #data
+                    end
+                else
+                    -- streamed header: take everything after the data offset
+                    local data = src:read("*a")
+                    src:close()
+                    if data and #data > 0 then
+                        f:seek("end")
+                        f:write(data)
+                        total_appended = total_appended + #data
+                    end
+                end
+            else
+                src:close()
             end
         end
     end
@@ -856,6 +950,14 @@ function WavUtils.appendTone(path, duration_ms, freq_hz, amplitude)
     local sample_rate = WavUtils.readSampleRate(f)
     if sample_rate <= 0 then f:close(); return false end
     local block_align = WavUtils.readBlockAlign(f)
+
+    local file_size = f:seek("end")
+    local data_off, data_sz = WavUtils.locateDataChunk(f)
+    if not (data_off and data_sz and data_sz > 0 and data_off + data_sz == file_size) then
+        f:close()
+        logger.warn("WavUtils: appendTone skipped, data chunk not found last in ", path)
+        return false
+    end
 
     local num_samples = math.floor(sample_rate * (duration_ms / 1000))
     -- Align to block_align
