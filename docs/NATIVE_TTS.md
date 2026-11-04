@@ -59,6 +59,10 @@ Pipe characters inside paths are escaped as `\|`. The helper must:
 
 The plugin polls for the marker file, so the helper never needs to write back to a FIFO.
 
+## WAV output format
+
+Write a plain canonical 44-byte PCM header (16-bit mono/stereo, `data` chunk last). The plugin patches WAV sizes in place when it appends sentence gaps, and it locates the `data` chunk by walking the RIFF chunk list, but the simplest way to stay out of trouble is a header with no extra chunks: produce it with `ffmpeg -map_metadata -1 -fflags +bitexact -flags:a +bitexact`, or write the 44 bytes yourself. Files with extra `LIST`/`INFO` chunks still play, but gap-appends into them are refused rather than risk a corrupted clip.
+
 ## Encoding
 
 Some device-native engines (including PocketBook ReadSpeaker) expect CP1252 input rather than UTF-8. If you select **Input encoding: CP1252** in settings, the plugin converts the text before writing the helper input file. Characters that cannot be represented in CP1252 become `?`.
