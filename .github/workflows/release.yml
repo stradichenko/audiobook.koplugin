@@ -49,6 +49,15 @@ jobs:
       - name: Build bundle (espeak-ng + Piper)
         run: bash package-for-kobo.sh --with-piper --piper-voice en_US-danny-low
 
+      - name: Set up JDK 17 for the dex build
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+        # ubuntu-latest drifted its default JDK past what build-tools;34.0.0
+        # d8 accepts (v0.6.9 first failed with an r8 internal error on
+        # unchanged sources); pin the toolchain the local devShell uses.
+
       - name: Build Android TTS helper (.dex)
         run: |
           # Install minimal Android SDK components for dex compilation
