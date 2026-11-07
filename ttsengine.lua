@@ -6265,11 +6265,16 @@ end
 -- (filesrc /dev/zero ! mixersink) in the mixer for the whole reading
 -- session keeps the datapath up so sentence streams start instantly.
 -- Verified on PW5: zero suspend_audio_datapath events while running.
--- On the 5.17+ generation (no gst-launch-0.10) the silence stream is
--- currently SKIPPED: the GStreamer 1.0 variant shipped in v0.6.2 and two
--- 5.19.x devices have lost the KOReader process mid-sentence ever since
--- (issue #73), so until the crash is attributed, that path runs without
--- the stream and only takes Music focus.
+-- The stream also runs over GStreamer 1.0 on the 5.17+ generation (no
+-- gst-launch-0.10 there).  It was briefly skipped on that path while two
+-- 5.19.x crash reports were attributed to it (issue #73), but the crash
+-- evidence dissolved: the kernel side stayed clean, and both reporting
+-- devices turned out to run non-standard environments (a third-party
+-- KOReader shell that power-cycles Bluetooth at startup, and a dev
+-- build 275 commits past stable).  Meanwhile the skip had its own
+-- visible cost: with the datapath suspending between sentences, every
+-- sentence start swallowed a second of re-attach stutter over
+-- Bluetooth (issue #114).
 function TTSEngine:_ensureKindleKeepalive()
     -- Remember a failed probe for the rest of the session: without this,
     -- every sentence would re-run commandExists + io.popen on firmware
@@ -6290,17 +6295,11 @@ function TTSEngine:_ensureKindleKeepalive()
             .. " ! 'audio/x-raw-int,rate=22050,channels=1,width=16,depth=16,signed=true,endianness=1234'"
             .. " ! mixersink stream-type=Music sync=true >/dev/null 2>&1 & echo $!"
     elseif self:commandExists("gst-launch-1.0") then
-        -- 5.17+ firmware (juno generation, no gst-launch-0.10): SKIP the
-        -- silence stream.  It is the only always-on audio stream v0.6.2
-        -- introduced on this path, and since it shipped, two 5.19.x
-        -- devices lose the whole KOReader process a couple of words into
-        -- every TTS session (issue #73).  Until the crash log names the
-        -- real cause, return this path to the v0.6.1 stream profile; the
-        -- focus take above still runs, and sentence gaps just pay the
-        -- datapath resume the stream used to avoid.
-        self._keepalive_unavailable = true
-        logger.warn("TTSEngine: skipping A2DP keepalive stream on gst-launch-1.0-only firmware (issue #73)")
-        return
+        cmd = "gst-launch-1.0 filesrc location=/dev/zero"
+            .. " ! rawaudioparse use-sink-caps=false format=pcm pcm-format=s16le"
+            .. " sample-rate=22050 num-channels=1"
+            .. " ! audioconvert ! audio/x-raw,format=S16LE,rate=22050,channels=1,layout=interleaved"
+            .. " ! mixersink stream-type=Music sync=true >/dev/null 2>&1 & echo $!"
     else
         self._keepalive_unavailable = true
         logger.warn("TTSEngine: no gst-launch binary for Kindle A2DP keepalive")
