@@ -904,6 +904,26 @@ function Audiobook:addToMainMenu(menu_items)
                         end,
                     },
                     {
+                        text = _("Highlight words"),
+                        enabled_func = function() return (self.ui and self.ui.document) or false end,
+                        checked_func = function()
+                            return self:getSetting("highlight_words", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("highlight_words", false)
+                            -- A word box may be on screen right now; drop it
+                            -- so switching off takes effect immediately
+                            -- instead of at the next sentence.
+                            if not self:getSetting("highlight_words", false)
+                                    and self.highlight_manager then
+                                pcall(function()
+                                    self.highlight_manager:clearWordHighlight()
+                                end)
+                            end
+                        end,
+                        help_text = _("Paint the word being narrated as a moving highlight inside the sentence highlight. Off by default: word highlighting needs one e-ink refresh per spoken word, and on slower devices those refreshes can skip words or flash, so sentence-only highlighting reads better there. The current word still appears as text in the read-along bar."),
+                    },
+                    {
                         text = _("Group short cues (e-ink)"),
                         enabled_func = function() return (self.ui and self.ui.document) or false end,
                         checked_func = function()

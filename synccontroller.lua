@@ -2729,7 +2729,7 @@ function SyncController:highlightCurrentWord(word)
     local android_tts = self.tts_engine
         and self.tts_engine.backend == self.tts_engine.BACKENDS.ANDROID
     if not android_tts
-        and self.plugin and self.plugin:getSetting("highlight_words", true) then
+        and self.plugin and self.plugin:getSetting("highlight_words", false) then
         self.highlight_manager:highlightWord(word, self.parsed_data)
     end
 end

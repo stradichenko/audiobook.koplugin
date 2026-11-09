@@ -1227,6 +1227,14 @@ msgstr "Avance automatique des pages"
 msgid "Highlight sentences"
 msgstr "Surligner les phrases"
 
+#: main.lua:907
+msgid "Highlight words"
+msgstr ""
+
+#: main.lua:924
+msgid "Paint the word being narrated as a moving highlight inside the sentence highlight. Off by default: word highlighting needs one e-ink refresh per spoken word, and on slower devices those refreshes can skip words or flash, so sentence-only highlighting reads better there. The current word still appears as text in the read-along bar."
+msgstr ""
+
 #: main.lua:912
 msgid "Group short cues (e-ink)"
 msgstr "Grouper les repères courts (e-ink)"
