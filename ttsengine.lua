@@ -4271,6 +4271,18 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         -- process death must name the native step in flight.
         dlog("player-spawn", "pid", pid, "gen", my_gen,
             "bundled", from_bundled, "wav", file_path)
+        -- Issue #114: report the dead air between the previous sentence's
+        -- clean player exit and this spawn, so bug reports quantify the
+        -- per-sentence pipeline startup cost directly. Only the clean-finish
+        -- path sets _last_play_end_at, so fallback re-launches inside one
+        -- sentence never produce a bogus gap.
+        if self._last_play_end_at then
+            local gap_ms = time.to_ms(UIManager:getTime() - self._last_play_end_at)
+            if gap_ms >= 0 and gap_ms < 60000 then
+                dlog("player-gap", "ms", gap_ms)
+            end
+            self._last_play_end_at = nil
+        end
         self:startTimingLoop()
         -- Poll /proc/<pid> for process completion.
         -- When the process exits, check its status to distinguish
@@ -4283,6 +4295,10 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         -- but the log hasn't progressed beyond initial loading, assume hung.
         local health_check_polls = 25   -- 2.5s (poll interval is 0.1s)
         local health_checked = false
+        -- Issue #114: sample the helper's stderr log until it reports
+        -- PLAYING, so bug reports carry the spawn-to-preroll latency (the
+        -- per-sentence startup cost a persistent pipeline would remove).
+        local preroll_logged = false
         local function pollGstPlayDone()
             if (engine.play_generation or 0) ~= my_gen then return end
             if not engine.is_speaking then return end
@@ -4291,6 +4307,22 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 return
             end
             poll_count = poll_count + 1
+            -- Issue #114: sample the helper's stderr log until it reports
+            -- PLAYING, so bug reports carry the spawn-to-preroll latency (the
+            -- per-sentence startup cost a persistent pipeline would remove).
+            if from_bundled and not preroll_logged and poll_count % 5 == 0 then
+                local pfh = io.open("/tmp/.gst_play_last.log", "r")
+                if pfh then
+                    local ptext = pfh:read("*a") or ""
+                    pfh:close()
+                    if ptext:match("state=PLAYING") then
+                        preroll_logged = true
+                        dlog("player-preroll", "ms",
+                            time.to_ms(UIManager:getTime() - engine._audio_launched_at),
+                            "polls", poll_count)
+                    end
+                end
+            end
             -- Check if process still running via /proc
             local proc_fh = pid and io.open("/proc/" .. pid .. "/status", "r")
             if proc_fh then
@@ -4447,6 +4479,8 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
                 end
                 logger.warn("TTSEngine: kindle-gst-play finished, polls=", poll_count)
                 engine._gst_play_pid = nil
+                -- Issue #114: anchor for the next spawn's player-gap line.
+                engine._last_play_end_at = UIManager:getTime()
                 -- Clean up system fallback raw PCM file if present
                 if engine._gst_system_raw_file then
                     os.remove(engine._gst_system_raw_file)
