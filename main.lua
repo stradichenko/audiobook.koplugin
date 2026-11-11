@@ -4838,7 +4838,12 @@ function Audiobook:_saveSmilXPointerCache(doc_path, cache)
     if not doc_path or not cache then return end
     local all = self:getSetting("smil_xpointer_cache", {})
     all[doc_path] = cache
-    self:setSetting("smil_xpointer_cache", all)
+    -- No flush: this runs for every newly resolved sentence during
+    -- read-along, and the cache makes the settings file large (hundreds of
+    -- KB after a few chapters), so flushing here rewrote all of it every few
+    -- seconds of narration.  KOReader writes it on suspend and exit; a lost
+    -- cache entry is simply resolved again.
+    self:setSetting("smil_xpointer_cache", all, true)
 end
 
 -- Count entries in a table for logging.
