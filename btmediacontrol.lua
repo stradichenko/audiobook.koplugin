@@ -512,6 +512,13 @@ function BtMediaControl._dispatchMediaEvent(event_name)
 
     logger.warn("BtMediaControl: Dispatching media event:", event_name)
 
+    -- Kobo (mtkbtd): every AirPods stem press arrives as KEY_PLAYCD, since
+    -- the headset is never told we are playing and so always asks to play.
+    -- Treat play / pause as one toggle so the same press can also pause.
+    if Device:isKobo() and (event_name == "MediaPlay" or event_name == "MediaPause") then
+        event_name = "MediaPlayPause"
+    end
+
     -- Determine which controller is active: media_sync (audio files) or
     -- sync_controller (TTS).  media_sync takes priority when it is not stopped.
     local media_active = plugin.media_sync and plugin.media_sync.state ~= "stopped"
