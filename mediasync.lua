@@ -2716,7 +2716,9 @@ function MediaSync:showPlaybackBar()
             local p = self.plugin
             if not (p and p.getSetting) then return nil end
             local v = (p:getSetting("smil_sync_offset_ms", 0) or 0) + delta_ms
-            p:setSetting("smil_sync_offset_ms", v)
+            -- No flush: writing the whole reader settings file on every tap
+            -- froze the UI for seconds on e-ink devices.
+            p:setSetting("smil_sync_offset_ms", v, true)
             return v
         end or nil,
         show_shuffle = self.playlist_files and #self.playlist_files > 0,

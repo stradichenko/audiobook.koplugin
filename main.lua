@@ -4759,13 +4759,15 @@ function Audiobook:getSetting(key, default)
     return default
 end
 
-function Audiobook:setSetting(key, value)
+--- @param no_flush boolean|nil  skip the immediate disk flush (rapid UI
+---   nudges; KOReader still writes the settings on suspend and exit)
+function Audiobook:setSetting(key, value, no_flush)
     local settings = G_reader_settings:readSetting("audiobook_settings") or {}
     settings[key] = value
     G_reader_settings:saveSetting("audiobook_settings", settings)
     -- Force an immediate disk flush so the value survives a crash or forced
     -- restart (e.g. the chapter-list crash that triggered issue #38).
-    if G_reader_settings and G_reader_settings.flush then
+    if not no_flush and G_reader_settings and G_reader_settings.flush then
         G_reader_settings:flush()
     end
 end
