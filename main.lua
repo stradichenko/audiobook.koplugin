@@ -1136,6 +1136,26 @@ function Audiobook:addToMainMenu(menu_items)
                         end,
                         help_text = _("Shifts EPUB Media Overlay sentence highlighting relative to the audio. Some audiobooks (e.g. with publisher intros) have timing tables offset from the embedded audio."),
                     },
+                    {
+                        text = _("Large player bar"),
+                        checked_func = function()
+                            return self:getSetting("large_mini_bar", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("large_mini_bar", false)
+                        end,
+                        help_text = _("A taller read-along bar with bigger buttons that are easier to hit. Applies the next time playback starts."),
+                    },
+                    {
+                        text = _("Line-by-line view in the full-screen player"),
+                        checked_func = function()
+                            return self:getSetting("player_line_view", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("player_line_view", false)
+                        end,
+                        help_text = _("EPUB read-along: the full-screen player shows the previous, current and next sentence in place of the cover, with sync adjusters below. Applies the next time playback starts."),
+                    },
                 },
             },
             -- ── Diagnostics ──

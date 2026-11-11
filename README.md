@@ -255,6 +255,8 @@ All settings are under **Tools > Audiobook Read-Along**:
   - **Auto-advance pages** - turn pages automatically
   - **Highlight sentences** - draw highlight on the active sentence
   - **Highlight words** - draw a small inverted box on the spoken word inside the sentence highlight (EPUB read-along; the box position comes from real word timing and the rendered line map). Off by default: the per-word e-ink refreshes skip words or flash on slower devices, so sentence-only highlighting reads better there
+  - **Large player bar** - a taller read-along bar with bigger buttons that are easier to hit on e-ink (taps count anywhere in a button's column). Off by default
+  - **Line-by-line view in the full-screen player** - EPUB read-along: the full-screen player shows the previous, current and next sentence in place of the cover, with sync − / + below. Off by default
   - **Group short cues (e-ink)** - for Media Overlay read-aloud books, merge consecutive short phrases into one highlight that stays on screen at least half a second, so slow e-ink refreshes do not skip between words; audio is unaffected
 - **Generate bug report** - save a diagnostic report to share when reporting issues
 - **Run device benchmark** - run a TTS performance benchmark on this device

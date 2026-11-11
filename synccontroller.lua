@@ -2038,6 +2038,8 @@ function SyncController:showPlaybackBar()
         chapter_title = "",
         output_name = title,
         tts_mode = true,
+        large_mini_bar = plugin and plugin.getSetting
+            and plugin:getSetting("large_mini_bar", false) or nil,
         start_minimized = true,
         keep_reader_status_bars = keep_footer,
         playback_speed = speech_rate,
