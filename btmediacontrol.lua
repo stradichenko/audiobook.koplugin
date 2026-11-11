@@ -97,6 +97,16 @@ function BtMediaControl.start(plugin)
         return true
     end
 
+    -- The headset went away: the node we had open is gone.  Drop it so the
+    -- node a reconnect creates is opened afresh instead of being taken for
+    -- "already opened" (a dead fd that never delivers a key).
+    if BtMediaControl._avrcp_evdev_path and Device.input then
+        pcall(Device.input.close, Device.input, BtMediaControl._avrcp_evdev_path)
+        logger.warn("BtMediaControl: AVRCP evdev gone, dropped:", BtMediaControl._avrcp_evdev_path)
+        BtMediaControl._avrcp_evdev_path = nil
+        BtMediaControl._evdev_active = false
+    end
+
     -- Fall back to D-Bus key monitoring
     logger.warn("BtMediaControl: No AVRCP evdev device found, trying D-Bus polling")
     BtMediaControl._startDbusPolling()
@@ -447,6 +457,15 @@ function BtMediaControl._pollDbusMediaControl()
 
     local plugin = BtMediaControl._plugin
     if not plugin then
+        BtMediaControl._dbus_polling_active = false
+        return
+    end
+
+    -- The AVRCP evdev node exists only while a headset is connected.  Pick it
+    -- up when it (re)appears instead of staying on D-Bus polling, which sees
+    -- no key presses on the Kobo MTK stack.
+    if BtMediaControl._tryEvdevApproach() then
+        logger.warn("BtMediaControl: AVRCP evdev device appeared, leaving D-Bus polling")
         BtMediaControl._dbus_polling_active = false
         return
     end
