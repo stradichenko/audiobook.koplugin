@@ -3506,3 +3506,19 @@ msgstr "Reštartovať teraz"
 msgid "Later"
 msgstr "Neskôr"
 
+
+#: main.lua:1140
+msgid "Large player bar"
+msgstr ""
+
+#: main.lua:1147
+msgid "A taller player bar with bigger buttons that are easier to hit. Off by default. Applies the next time playback starts."
+msgstr ""
+
+#: main.lua:1150
+msgid "Line-by-line view in the full-screen player"
+msgstr ""
+
+#: main.lua:1158
+msgid "EPUB read-along: the full-screen player shows the previous, current and next sentence in place of the cover, with sync adjusters below. Applies the next time playback starts."
+msgstr ""

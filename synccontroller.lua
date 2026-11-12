@@ -2038,6 +2038,8 @@ function SyncController:showPlaybackBar()
         chapter_title = "",
         output_name = title,
         tts_mode = true,
+        large_mini_bar = plugin and plugin.getSetting
+            and plugin:getSetting("large_mini_bar", false) or nil,
         start_minimized = true,
         keep_reader_status_bars = keep_footer,
         playback_speed = speech_rate,
@@ -3525,7 +3527,9 @@ function SyncController:setSpeechRate(speed)
     speed = tonumber(speed) or 1.0
     speed = math.max(0.25, math.min(2.0, speed))
     if self.plugin and self.plugin.setSetting then
-        self.plugin:setSetting("speech_rate", speed)
+        -- Speed is nudged in quick steps; skip the disk flush (KOReader
+        -- writes the settings on suspend and exit).
+        self.plugin:setSetting("speech_rate", speed, true)
     end
     if self.tts_engine and self.tts_engine.setRate then
         self.tts_engine:setRate(speed)
@@ -3594,7 +3598,8 @@ function SyncController:setSpeechVolumePct(pct)
     if pct > 100 then pct = 100 end
     local vol = pct / 100
     if self.plugin and self.plugin.setSetting then
-        self.plugin:setSetting("speech_volume", vol)
+        -- Volume is nudged in quick steps; skip the disk flush.
+        self.plugin:setSetting("speech_volume", vol, true)
     end
     if self.tts_engine and self.tts_engine.setVolume then
         self.tts_engine:setVolume(vol)

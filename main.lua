@@ -1136,6 +1136,26 @@ function Audiobook:addToMainMenu(menu_items)
                         end,
                         help_text = _("Shifts EPUB Media Overlay sentence highlighting relative to the audio. Some audiobooks (e.g. with publisher intros) have timing tables offset from the embedded audio."),
                     },
+                    {
+                        text = _("Large player bar"),
+                        checked_func = function()
+                            return self:getSetting("large_mini_bar", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("large_mini_bar", false)
+                        end,
+                        help_text = _("A taller player bar with bigger buttons that are easier to hit. Off by default. Applies the next time playback starts."),
+                    },
+                    {
+                        text = _("Line-by-line view in the full-screen player"),
+                        checked_func = function()
+                            return self:getSetting("player_line_view", false)
+                        end,
+                        callback = function()
+                            self:toggleSetting("player_line_view", false)
+                        end,
+                        help_text = _("EPUB read-along: the full-screen player shows the previous, current and next sentence in place of the cover, with sync adjusters below. Applies the next time playback starts."),
+                    },
                 },
             },
             -- ── Diagnostics ──
@@ -4759,13 +4779,15 @@ function Audiobook:getSetting(key, default)
     return default
 end
 
-function Audiobook:setSetting(key, value)
+--- @param no_flush boolean|nil  skip the immediate disk flush (rapid UI
+---   nudges; KOReader still writes the settings on suspend and exit)
+function Audiobook:setSetting(key, value, no_flush)
     local settings = G_reader_settings:readSetting("audiobook_settings") or {}
     settings[key] = value
     G_reader_settings:saveSetting("audiobook_settings", settings)
     -- Force an immediate disk flush so the value survives a crash or forced
     -- restart (e.g. the chapter-list crash that triggered issue #38).
-    if G_reader_settings and G_reader_settings.flush then
+    if not no_flush and G_reader_settings and G_reader_settings.flush then
         G_reader_settings:flush()
     end
 end
@@ -4781,6 +4803,13 @@ Called by KOReader's "Delete plugin settings" UI action.
 --]]
 function Audiobook:deletePluginSettings()
     G_reader_settings:delSetting("audiobook_settings")
+    -- The SMIL xpointer cache lives in its own file; purge it with the rest.
+    if self._smil_cache_settings and self._smil_cache_settings.file then
+        pcall(function() self._smil_cache_settings:purge() end)
+    end
+    self._smil_cache_settings = nil
+    self._smil_cache_dirty = false
+    self._active_smil_doc_path = nil
     -- Reset in-memory state to defaults
     self.current_speed = 1.0
     if self.media_engine then
@@ -4804,8 +4833,20 @@ end
 --
 -- crengine does not expose a reliable "go to file#id" API from Lua.  The
 -- workaround is to capture the full internal xpointer for a fragment the
--- first time it is highlighted during normal playback, save it to KOReader
--- settings, and reuse it later for resume/refocus/Play-from-here.
+-- first time it is highlighted during normal playback, save it, and reuse it
+-- later for resume/refocus/Play-from-here.
+--
+-- The cache grows by one entry per resolved sentence, which made
+-- settings.reader.lua hundreds of KB heavier after a few chapters. Every
+-- unrelated settings write and the startup parse paid for it, so it now
+-- lives in its own plugin-owned LuaSettings file. The file is read only when
+-- read-along starts and written on suspend, exit and stop, never per
+-- sentence. Entries and books are capped; a dropped entry is simply resolved
+-- again.
+
+local SMIL_CACHE_FILENAME = "audiobook_smil_cache.lua"
+local SMIL_CACHE_MAX_ENTRIES_PER_BOOK = 2000
+local SMIL_CACHE_MAX_BOOKS = 6
 
 -- Build a stable cache key for a fragment.  The key includes the EPUB path
 -- so different books do not collide.
@@ -4818,10 +4859,99 @@ function Audiobook:_smilXPointerCacheKey(doc_path, text_doc, fragment_id)
     return doc_path .. "|" .. fragment_key
 end
 
+-- Lazily open the dedicated cache file. Returns nil when the file cannot be
+-- opened, in which case the cache simply stays in memory for this session.
+function Audiobook:_smilCacheSettings()
+    if self._smil_cache_settings ~= nil then
+        return self._smil_cache_settings or nil
+    end
+    local ok, settings = pcall(function()
+        local LuaSettings = require("luasettings")
+        local DataStorage = require("datastorage")
+        return LuaSettings:open(DataStorage:getSettingsDir() .. "/" .. SMIL_CACHE_FILENAME)
+    end)
+    if not ok or not settings then
+        logger.warn("Audiobook: SMIL xpointer cache file unavailable:", settings)
+        self._smil_cache_settings = false
+        return nil
+    end
+    self._smil_cache_settings = settings
+    self:_migrateLegacySmilXPointerCache(settings)
+    return settings
+end
+
+--- Move a cache left in reader settings by an older build into the new file,
+--- once, then drop it from reader settings so that file shrinks back down.
+function Audiobook:_migrateLegacySmilXPointerCache(settings)
+    local legacy = self:getSetting("smil_xpointer_cache")
+    if type(legacy) ~= "table" then return end
+    local data = settings.data
+    local migrated = 0
+    for doc_path, book_cache in pairs(legacy) do
+        if type(book_cache) == "table" and data[doc_path] == nil then
+            data[doc_path] = book_cache
+            migrated = migrated + 1
+        end
+    end
+    local all = G_reader_settings:readSetting("audiobook_settings") or {}
+    if all.smil_xpointer_cache ~= nil then
+        all.smil_xpointer_cache = nil
+        G_reader_settings:saveSetting("audiobook_settings", all)
+        if G_reader_settings.flush then G_reader_settings:flush() end
+    end
+    self._smil_cache_dirty = true
+    self:_flushSmilXPointerCache()
+    logger.warn("Audiobook: moved SMIL xpointer cache for", migrated,
+        "books out of reader settings")
+end
+
+--- Bound the persisted cache: a few thousand recent entries per book keep
+--- resume, refocus and page-follow fast; older entries fall back to the
+--- slower text-matching resolver. Eviction is arbitrary because the entries
+--- carry no recency, and a miss only costs one re-resolution.
+function Audiobook:_trimSmilXPointerCache(data, keep_doc_path)
+    local book = keep_doc_path and data[keep_doc_path]
+    if type(book) == "table" then
+        local n = self:_countTable(book)
+        while n > SMIL_CACHE_MAX_ENTRIES_PER_BOOK do
+            local dropped = false
+            for key in pairs(book) do
+                book[key] = nil
+                dropped = true
+                break
+            end
+            if not dropped then break end
+            n = n - 1
+        end
+    end
+    local books = {}
+    for doc_path in pairs(data) do
+        books[#books + 1] = doc_path
+    end
+    while #books > SMIL_CACHE_MAX_BOOKS do
+        local victim
+        for _, doc_path in ipairs(books) do
+            if doc_path ~= keep_doc_path then
+                victim = doc_path
+                break
+            end
+        end
+        if not victim then break end
+        data[victim] = nil
+        for i, doc_path in ipairs(books) do
+            if doc_path == victim then
+                table.remove(books, i)
+                break
+            end
+        end
+    end
+end
+
 -- Load the persisted xpointer cache for the current EPUB.
 function Audiobook:_loadSmilXPointerCache(doc_path)
     if not doc_path then return {} end
-    local all = self:getSetting("smil_xpointer_cache", {})
+    local settings = self:_smilCacheSettings()
+    local all = settings and settings.data or {}
     local book_cache = all[doc_path] or {}
     local copy = {}
     for k, v in pairs(book_cache) do
@@ -4831,12 +4961,38 @@ function Audiobook:_loadSmilXPointerCache(doc_path)
     return copy
 end
 
--- Save the in-memory xpointer cache back to KOReader settings.
+-- Save the in-memory xpointer cache. This runs for every newly resolved
+-- sentence, so it only touches memory; _flushSmilXPointerCache writes the
+-- file on suspend, exit and stop.
 function Audiobook:_saveSmilXPointerCache(doc_path, cache)
     if not doc_path or not cache then return end
-    local all = self:getSetting("smil_xpointer_cache", {})
-    all[doc_path] = cache
-    self:setSetting("smil_xpointer_cache", all)
+    local settings = self:_smilCacheSettings()
+    if not settings then return end
+    settings.data[doc_path] = cache
+    self._active_smil_doc_path = doc_path
+    self._smil_cache_dirty = true
+end
+
+function Audiobook:_flushSmilXPointerCache()
+    local settings = self._smil_cache_settings
+    if not (settings and self._smil_cache_dirty) then return end
+    self:_trimSmilXPointerCache(settings.data, self._active_smil_doc_path)
+    local ok, err = pcall(function() settings:flush() end)
+    if ok then
+        self._smil_cache_dirty = false
+    else
+        logger.warn("Audiobook: could not flush the SMIL xpointer cache:", err)
+    end
+end
+
+--- KOReader broadcasts FlushSettings before suspend and on close, and sends
+--- SaveSettings on exit; persist the cache with the rest of the settings.
+function Audiobook:onFlushSettings()
+    self:_flushSmilXPointerCache()
+end
+
+function Audiobook:onSaveSettings()
+    self:_flushSmilXPointerCache()
 end
 
 -- Count entries in a table for logging.

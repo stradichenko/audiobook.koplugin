@@ -55,6 +55,9 @@ local DBUS_DEST = "com.kobo.mtk.bluedroid"
 BtMediaControl._avrcp_evdev_path = nil
 -- Whether the evdev-based input is active
 BtMediaControl._evdev_active = false
+-- True only when we called Device.input.open ourselves. KOReader core may
+-- have opened the AVRCP node first; closing its fd would kill input.
+BtMediaControl._evdev_opened_by_us = false
 -- Original event_map before we merged media keys
 BtMediaControl._original_event_map = nil
 -- Whether the D-Bus polling fallback is active
@@ -95,6 +98,29 @@ function BtMediaControl.start(plugin)
         logger.warn("BtMediaControl: Kindle AVRCP path (no BlueZ evdev)")
         BtMediaControl._startKindleAvrcpSupport()
         return true
+    end
+
+    -- The headset went away: the node we had open is gone.  Drop it so the
+    -- node a reconnect creates is opened afresh instead of being taken for
+    -- "already opened" (a dead fd that never delivers a key).
+    if BtMediaControl._avrcp_evdev_path and Device.input then
+        -- Only close what we opened. If KOReader's own input layer opened
+        -- this node, the fd belongs to it and closing it would leave the
+        -- device deaf until restart.
+        if BtMediaControl._evdev_opened_by_us then
+            pcall(Device.input.close, Device.input, BtMediaControl._avrcp_evdev_path)
+            logger.warn("BtMediaControl: AVRCP evdev gone, closed:",
+                BtMediaControl._avrcp_evdev_path)
+        else
+            logger.warn("BtMediaControl: AVRCP evdev gone, released (owned by KOReader):",
+                BtMediaControl._avrcp_evdev_path)
+        end
+        BtMediaControl._avrcp_evdev_path = nil
+        BtMediaControl._evdev_active = false
+        BtMediaControl._evdev_opened_by_us = false
+        -- The next headset gets a fresh status push instead of being
+        -- suppressed by the dedupe guard.
+        BtMediaControl._last_sent_status = nil
     end
 
     -- Fall back to D-Bus key monitoring
@@ -301,6 +327,7 @@ function BtMediaControl._tryEvdevApproach()
         BtMediaControl._mergeMediaKeyMap()
         BtMediaControl._avrcp_evdev_path = dev_path
         BtMediaControl._evdev_active = true
+        BtMediaControl._evdev_opened_by_us = false
         return true
     end
 
@@ -311,6 +338,7 @@ function BtMediaControl._tryEvdevApproach()
             logger.warn("BtMediaControl: Opened AVRCP evdev:", dev_path, "fd:", fd)
             BtMediaControl._avrcp_evdev_path = dev_path
             BtMediaControl._evdev_active = true
+            BtMediaControl._evdev_opened_by_us = true
             BtMediaControl._mergeMediaKeyMap()
             return true
         else
@@ -386,8 +414,13 @@ Close the AVRCP evdev device and restore event_map, adapters, and handlers.
 --]]
 function BtMediaControl._stopEvdev()
     if BtMediaControl._avrcp_evdev_path and Device.input then
-        pcall(Device.input.close, Device.input, BtMediaControl._avrcp_evdev_path)
-        logger.warn("BtMediaControl: Closed AVRCP evdev:", BtMediaControl._avrcp_evdev_path)
+        if BtMediaControl._evdev_opened_by_us then
+            pcall(Device.input.close, Device.input, BtMediaControl._avrcp_evdev_path)
+            logger.warn("BtMediaControl: Closed AVRCP evdev:", BtMediaControl._avrcp_evdev_path)
+        else
+            logger.warn("BtMediaControl: Released AVRCP evdev (owned by KOReader):",
+                BtMediaControl._avrcp_evdev_path)
+        end
     end
 
     -- Restore everything we changed
@@ -414,6 +447,7 @@ function BtMediaControl._stopEvdev()
 
     BtMediaControl._avrcp_evdev_path = nil
     BtMediaControl._evdev_active = false
+    BtMediaControl._evdev_opened_by_us = false
     BtMediaControl._original_event_map = nil
     BtMediaControl._original_adapters = nil
     BtMediaControl._original_handlers = nil
@@ -429,6 +463,7 @@ function BtMediaControl._startDbusPolling()
     if BtMediaControl._dbus_polling_active then return end
     BtMediaControl._dbus_polling_active = true
     BtMediaControl._last_dbus_status = nil
+    BtMediaControl._dbus_poll_count = 0
 
     BtMediaControl._pollDbusMediaControl()
 end
@@ -447,6 +482,19 @@ function BtMediaControl._pollDbusMediaControl()
 
     local plugin = BtMediaControl._plugin
     if not plugin then
+        BtMediaControl._dbus_polling_active = false
+        return
+    end
+
+    -- The AVRCP evdev node exists only while a headset is connected.  Pick it
+    -- up when it (re)appears instead of staying on D-Bus polling, which sees
+    -- no key presses on the Kobo MTK stack. Probing scans /sys and /proc
+    -- with two shells, so do it every third poll (about 6 s) rather than on
+    -- every 2 s tick on a one-core device; the first tick still probes.
+    BtMediaControl._dbus_poll_count = (BtMediaControl._dbus_poll_count or 0) + 1
+    if BtMediaControl._dbus_poll_count % 3 == 1
+            and BtMediaControl._tryEvdevApproach() then
+        logger.warn("BtMediaControl: AVRCP evdev device appeared, leaving D-Bus polling")
         BtMediaControl._dbus_polling_active = false
         return
     end
@@ -490,10 +538,13 @@ function BtMediaControl._handleDbusStatusChange(new_status)
     local plugin = BtMediaControl._plugin
     if not plugin then return end
 
+    -- These mirror the reported state, so they must stay directional: a
+    -- "paused" report while we are already paused must not resume playback
+    -- the way a single-button toggle would.
     if new_status == "paused" then
-        BtMediaControl._dispatchMediaEvent("MediaPause")
+        BtMediaControl._dispatchMediaEvent("MediaPause", { from_status = true })
     elseif new_status == "playing" then
-        BtMediaControl._dispatchMediaEvent("MediaPlay")
+        BtMediaControl._dispatchMediaEvent("MediaPlay", { from_status = true })
     elseif new_status == "stopped" then
         BtMediaControl._dispatchMediaEvent("MediaStop")
     end
@@ -505,12 +556,25 @@ end
 Dispatch a media event to the plugin.
 @param event_name string  One of "MediaPlayPause", "MediaPlay", "MediaPause",
                           "MediaStop", "MediaNext", "MediaPrev"
+@param opts table|nil  from_status: the event mirrors a reported state, so
+                       Kobo must not turn it into a toggle.
 --]]
-function BtMediaControl._dispatchMediaEvent(event_name)
+function BtMediaControl._dispatchMediaEvent(event_name, opts)
     local plugin = BtMediaControl._plugin
     if not plugin then return end
 
     logger.warn("BtMediaControl: Dispatching media event:", event_name)
+
+    -- Kobo (mtkbtd): every AirPods stem press arrives as KEY_PLAYCD, since
+    -- the headset is never told we are playing and so always asks to play.
+    -- Treat play / pause as one toggle so the same press can also pause.
+    -- Status-change events are excluded: those mirror a state, so pausing
+    -- an already-paused player must stay a no-op.
+    if Device:isKobo() and not (opts and opts.from_status)
+            and (event_name == "MediaPlay" or event_name == "MediaPause") then
+        logger.warn("BtMediaControl: Kobo play/pause key treated as a toggle:", event_name)
+        event_name = "MediaPlayPause"
+    end
 
     -- Determine which controller is active: media_sync (audio files) or
     -- sync_controller (TTS).  media_sync takes priority when it is not stopped.

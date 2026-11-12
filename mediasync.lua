@@ -945,6 +945,13 @@ function MediaSync:stop(keep_chapter_menu, opts)
     if self.highlight_manager then
         pcall(function() self.highlight_manager:clearHighlights() end)
     end
+    -- Playback is over; persist the xpointer cache now rather than waiting
+    -- for suspend/exit, so a later crash cannot lose this book's entries.
+    -- Not on a playlist track transition, which keeps the session going.
+    if not track_transition and self.plugin
+            and self.plugin._flushSmilXPointerCache then
+        pcall(function() self.plugin:_flushSmilXPointerCache() end)
+    end
     if not track_transition then
         local keep_bar = self:_shouldKeepOverlayBar() and not drop_chrome
         if keep_bar then
@@ -1429,9 +1436,11 @@ function MediaSync:setVolume(pct)
     if self.media_engine then
         pcall(function() self.media_engine:setVolume(pct) end)
     end
-    -- Persist so the level carries across tracks and sessions.
+    -- Persist so the level carries across tracks and sessions. No flush:
+    -- volume buttons are tapped repeatedly and KOReader writes the settings
+    -- file on suspend and exit anyway.
     if self.plugin and self.plugin.setSetting then
-        self.plugin:setSetting("media_volume_pct", pct)
+        self.plugin:setSetting("media_volume_pct", pct, true)
     end
     if self.playback_bar then
         pcall(function() self.playback_bar:updateVolume(pct) end)
@@ -1919,6 +1928,27 @@ function MediaSync:_startSyncLoop(gen)
     self._sync_timer = UIManager:scheduleIn(0.05, tick)
 end
 
+--- Feed the full-screen player's optional line-by-line view (previous,
+--- current and next sentence). Safe to call often: setLines returns early
+--- when the three strings are unchanged. With no index, uses the current
+--- audio position.
+function MediaSync:_refreshLineView(sent_idx)
+    local bar = self.playback_bar
+    if not (bar and bar.lines_mode and bar.setLines) then return end
+    local td = self.timing_data
+    if not td then return end
+    local idx = tonumber(sent_idx) or 0
+    if idx < 1 then
+        local pos = self.media_engine and self.media_engine:getPosition() or 0
+        idx = self:_findSentenceAtTime(pos) or 0
+    end
+    if idx < 1 then return end
+    local function lineText(i)
+        return td[i] and td[i].text or ""
+    end
+    pcall(bar.setLines, bar, lineText(idx - 1), lineText(idx), lineText(idx + 1))
+end
+
 function MediaSync:_updateHighlightAtTime(pos)
     if not self.timing_data then return end
 
@@ -1928,6 +1958,12 @@ function MediaSync:_updateHighlightAtTime(pos)
 
     local sentence = self.timing_data[sent_idx]
     if not sentence then return end
+
+    -- Full-screen player's optional line-by-line view. Called before the
+    -- change guard because navigation stamps _current_sentence_idx first
+    -- (Play aligned from here), which used to leave the panel blank until
+    -- the next sentence. setLines no-ops when the text has not changed.
+    self:_refreshLineView(sent_idx)
 
     -- Update sentence highlight if changed
     if sent_idx ~= self._current_sentence_idx then
@@ -2712,11 +2748,17 @@ function MediaSync:showPlaybackBar()
         -- Read-along (EPUB overlay) mode: start minimized so the book page
         -- stays visible; highlighting and page-follow are the primary UI.
         start_minimized = self.overlay_mode or nil,
+        large_mini_bar = self.plugin and self.plugin.getSetting
+            and self.plugin:getSetting("large_mini_bar", false) or nil,
+        lines_mode = self.overlay_mode and self.plugin and self.plugin.getSetting
+            and self.plugin:getSetting("player_line_view", false) or nil,
         on_sync_nudge = self.overlay_mode and function(delta_ms)
             local p = self.plugin
             if not (p and p.getSetting) then return nil end
             local v = (p:getSetting("smil_sync_offset_ms", 0) or 0) + delta_ms
-            p:setSetting("smil_sync_offset_ms", v)
+            -- No flush: writing the whole reader settings file on every tap
+            -- froze the UI for seconds on e-ink devices.
+            p:setSetting("smil_sync_offset_ms", v, true)
             return v
         end or nil,
         show_shuffle = self.playlist_files and #self.playlist_files > 0,
@@ -2841,6 +2883,10 @@ function MediaSync:showPlaybackBar()
         end)
     end
     self.playback_bar = player
+    -- Seed the optional line view now: playback can start paused ("Play
+    -- aligned from here") and the first sync tick would otherwise leave it
+    -- empty until the sentence changes.
+    self:_refreshLineView(self._current_sentence_idx)
     self:_refreshPlaybackBarTitles()
     self:_reserveMiniBarSpace()
 end
@@ -2908,6 +2954,8 @@ function MediaSync:navigateToSentenceEntry(entry)
             end)
         end)
     end
+    -- Also refresh a paused full-screen line view, where no sync tick runs.
+    self:_refreshLineView(sent_idx)
     return true
 end
 
