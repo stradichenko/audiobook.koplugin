@@ -1273,12 +1273,18 @@ function MediaEngine:_startBtReattachWatcher(gen, from_pos)
     local tries, seen = 0, false
     local function check()
         if self.play_generation ~= gen or not self.is_playing then return end
+        -- Paused while waiting: don't start audio behind the user's back.
+        if self.is_paused then
+            UIManager:scheduleIn(3, check)
+            return
+        end
         if seen then
-            self:_restartAt(from_pos, "bt device connected")
+            self:_restartAt(self._waiting_for_bt and (self._seek_offset or from_pos)
+                or from_pos, "bt device connected")
             return
         end
         tries = tries + 1
-        if tries > 40 then
+        if tries > 40 and not self._waiting_for_bt then
             logger.warn("MediaEngine: reattach watcher gave up")
             return
         end
@@ -1286,7 +1292,8 @@ function MediaEngine:_startBtReattachWatcher(gen, from_pos)
         local ok, up = pcall(bt.anyAudioDeviceConnected, bt)
         -- Give A2DP a few seconds to come up after the link connects.
         if ok and up then seen = true end
-        UIManager:scheduleIn(3, check)
+        -- Nothing is running while we wait, so keep waiting, just less often.
+        UIManager:scheduleIn(tries > 40 and 10 or 3, check)
     end
     UIManager:scheduleIn(3, check)
 end
@@ -1391,8 +1398,18 @@ function MediaEngine:play(on_complete, on_fail)
             -- No headset yet (Bluetooth still coming up). Keep the persistent
             -- path and restart once a device connects, instead of playing on
             -- into a dead route for the rest of the session.
-            logger.warn("MediaEngine: no BT audio device at play; fallback + reattach watcher")
-            self._reattach_from = self._seek_offset or 0
+            -- Don't start the fallback ffmpeg|gst pipeline: it feeds the MTK
+            -- sink with no headset attached (nothing is heard) and was running
+            -- while the headset reconnected right before a full device reset.
+            -- Hold the position and start for real once a device connects.
+            logger.warn("MediaEngine: no BT audio device at play; waiting for headset")
+            self._waiting_for_bt = true
+            self.is_playing = true
+            self._play_start_time = UIManager:getTime()
+            self._pause_start_time = nil
+            self._total_pause_ms = 0
+            self:_startBtReattachWatcher(gen, self._seek_offset or 0)
+            return true
         else
             logger.warn("MediaEngine: persistent pipeline play failed, falling back to standard backend")
             self._use_persistent_pipeline = false
@@ -3268,6 +3285,7 @@ function MediaEngine:stop()
     self.is_playing = false
     self.is_paused = false
     self._audioout_released_on_pause = nil
+    self._waiting_for_bt = nil
 
     if self._position_timer then
         UIManager:unschedule(self._position_timer)
@@ -3706,6 +3724,11 @@ function MediaEngine:getPosition()
         -- Hold the paused/seek target so the UI doesn't flicker back to zero.
         local held = tonumber(self._paused_position) or tonumber(self._seek_offset) or 0
         return math.max(0, held)
+    end
+
+    -- Waiting for the headset: nothing is playing yet, hold the start point.
+    if self._waiting_for_bt then
+        return math.max(0, tonumber(self._seek_offset) or 0)
     end
 
     -- Kindle A2DP pause-halt: pipeline is gone; hold the saved pause position.
