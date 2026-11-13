@@ -645,6 +645,19 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
     self._epub_path = epub_path
     self._cache_dir = self:_ensureCacheDir(plugin_dir, epub_path)
 
+    -- Fast path: the parse of this exact EPUB from an earlier session.
+    local epub_fp = self:_epubFingerprint(epub_path)
+    local cached = self:_loadTimingCache(epub_fp)
+    if cached then
+        self._chapter_titles = cached.chapter_titles
+        self._spine_hrefs = cached.spine_hrefs or {}
+        report("done", #cached.timing, 0,
+            string.format("%d timing (cached)", #cached.timing))
+        logger.warn("EpubMediaOverlay: loaded", #cached.timing,
+            "timing entries from cache,", #(cached.audio_paths or {}), "audio files")
+        return cached.timing
+    end
+
     -- Step 1: Find OPF path
     local opf_path = self:_findOpfPath(epub_path)
     if not opf_path then
@@ -799,7 +812,87 @@ function EpubMediaOverlay:loadFromEpub(epub_path, plugin_dir, progress_callback)
 
     logger.warn("EpubMediaOverlay: loaded", #all_timing_data, "timing entries,",
         unique_audio, "audio files")
+    pcall(self._saveTimingCache, self, epub_fp, all_timing_data)
     return all_timing_data
+end
+
+-- ---------------------------------------------------------------------------
+-- Parsed timing cache
+-- ---------------------------------------------------------------------------
+-- Parsing a long book's overlays runs one unzip per SMIL and per content
+-- document and pattern-matches every sentence: 20 s on a Kobo Clara BW for
+-- an 18,000-sentence book, on every first play after KOReader starts. The
+-- result only depends on the EPUB, so it is stored next to the extracted
+-- audio. That directory is already wiped when the EPUB's size or mtime
+-- changes (_ensureCacheDir), so a stale file cannot outlive its book.
+-- Bump TIMING_CACHE_VERSION whenever the parse output changes shape.
+local TIMING_CACHE_VERSION = 1
+local TIMING_CACHE_NAME = ".timing.v" .. TIMING_CACHE_VERSION .. ".bin"
+
+local function stringBuffer()
+    local ok, buf = pcall(require, "string.buffer")
+    return ok and buf or nil
+end
+
+--- Load the cached parse for this EPUB, or nil.
+function EpubMediaOverlay:_loadTimingCache(epub_fp)
+    local sb = stringBuffer()
+    if not (sb and self._cache_dir and epub_fp) then return nil end
+    local f = io.open(self._cache_dir .. "/" .. TIMING_CACHE_NAME, "rb")
+    if not f then return nil end
+    local blob = f:read("*a")
+    f:close()
+    local ok, c = pcall(sb.decode, blob)
+    if not ok or type(c) ~= "table" or c.version ~= TIMING_CACHE_VERSION
+            or c.epub_fp ~= epub_fp or type(c.timing) ~= "table" or #c.timing == 0 then
+        logger.warn("EpubMediaOverlay: timing cache unusable, reparsing")
+        return nil
+    end
+    -- The audio files live in the same directory; if any went missing,
+    -- reparse (which re-extracts them) rather than play a hole.
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if ok_lfs and lfs and lfs.attributes then
+        for _, p in ipairs(c.audio_paths or {}) do
+            if lfs.attributes(p, "mode") ~= "file" then
+                logger.warn("EpubMediaOverlay: cached audio missing", p, "; reparsing")
+                return nil
+            end
+        end
+    end
+    return c
+end
+
+--- Store the parse result for this EPUB. Failures only cost the speed-up.
+function EpubMediaOverlay:_saveTimingCache(epub_fp, timing)
+    local sb = stringBuffer()
+    if not (sb and self._cache_dir and epub_fp) then return end
+    local seen, audio_paths = {}, {}
+    for _, e in ipairs(timing) do
+        if e.audio_path and not seen[e.audio_path] then
+            seen[e.audio_path] = true
+            table.insert(audio_paths, e.audio_path)
+        end
+    end
+    local ok, blob = pcall(sb.encode, {
+        version = TIMING_CACHE_VERSION,
+        epub_fp = epub_fp,
+        timing = timing,
+        chapter_titles = self._chapter_titles,
+        spine_hrefs = self._spine_hrefs,
+        audio_paths = audio_paths,
+    })
+    if not ok then
+        logger.warn("EpubMediaOverlay: timing cache encode failed:", blob)
+        return
+    end
+    -- Write then rename, so an interrupted write never leaves a torn file.
+    local path = self._cache_dir .. "/" .. TIMING_CACHE_NAME
+    local f = io.open(path .. ".tmp", "wb")
+    if not f then return end
+    f:write(blob)
+    f:close()
+    os.rename(path .. ".tmp", path)
+    logger.warn("EpubMediaOverlay: saved timing cache,", #blob, "bytes")
 end
 
 function EpubMediaOverlay:getCacheDir()
