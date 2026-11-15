@@ -416,6 +416,15 @@ function Audiobook:_initSubmodules()
         end
     end)
 
+    -- ── Self-cleaning audiobook cache, a minute after start ──
+    -- Off the startup path; deletes only caches of books not open now.
+    pcall(function()
+        UIManager:scheduleIn(60, function()
+            local ok, err = pcall(self._cleanupCaches, self)
+            if not ok then logger.warn("Audiobook: cache cleanup failed:", err) end
+        end)
+    end)
+
     -- ── Media playback modules (always load; works without a document) ──
     local ok_media, err_media = pcall(function()
         local function dofile_v25(name)
@@ -4768,6 +4777,21 @@ function Audiobook:onSetRotationMode()
             end
         end)
     end
+end
+
+--- Self-cleaning overlay caches (see EpubMediaOverlay.cleanupCaches): by
+--- EPUB gone, age and total size. Limits: settings cache_max_age_days (60)
+--- and cache_max_total_mb (2048).
+function Audiobook:_cleanupCaches()
+    if not PLUGIN_PATH then return end
+    local keep = self._smil_doc_path
+        or (self.ui and self.ui.document and (self.ui.document.file_path or self.ui.document.file))
+    local EMO = dofile(PLUGIN_PATH .. "epubmediaoverlay.lua")
+    EMO.cleanupCaches(PLUGIN_PATH:gsub("/$", ""), {
+        max_age_days = self:getSetting("cache_max_age_days", 60),
+        max_total_mb = self:getSetting("cache_max_total_mb", 2048),
+        keep_path = keep,
+    })
 end
 
 -- Settings management
