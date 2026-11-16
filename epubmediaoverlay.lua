@@ -168,6 +168,13 @@ function EpubMediaOverlay:_ensureCacheDir(plugin_dir, epub_path)
             wf:close()
         end
     end
+    -- Rewritten on every open: its mtime is the book's "last used" for
+    -- cleanupCaches, and the path tells cleanup when the EPUB is gone.
+    local pf = io.open(cache .. "/.epub_path", "w")
+    if pf then
+        pf:write(epub_path)
+        pf:close()
+    end
     return cache
 end
 
@@ -899,16 +906,153 @@ function EpubMediaOverlay:getCacheDir()
     return self._cache_dir
 end
 
-function EpubMediaOverlay:cleanupOldCaches(plugin_dir, max_age_days)
-    max_age_days = tonumber(max_age_days) or 7
-    local cache_root = plugin_dir .. "/cache/overlays"
-    -- Find directories older than max_age_days and remove them
-    local cmd = string.format(
-        'find %s -maxdepth 1 -type d -mtime +%d -exec rm -rf {} + 2>/dev/null',
-        self:_quoteShell(cache_root),
-        max_age_days
-    )
-    os.execute(cmd)
+-- ---------------------------------------------------------------------------
+-- Self-cleaning cache
+-- ---------------------------------------------------------------------------
+-- Each book's overlay cache holds its extracted audio (~250 MB for a long
+-- audiobook) plus the parsed timing. Rules, in order:
+--   1. the EPUB recorded in .epub_path no longer exists -> delete;
+--   2. not opened for max_age_days -> delete;
+--   3. while the caches together exceed max_total_mb, or the card has
+--      less than min_free_mb free, delete the least recently opened.
+-- The book in keep_path is never deleted. "Last opened" is the mtime of
+-- .epub_fingerprint, which _ensureCacheDir rewrites on every open. A
+-- deleted book is simply extracted again the next time it is opened.
+
+local function dirSizeBytes(lfs, dir)
+    local total = 0
+    for name in lfs.dir(dir) do
+        if name ~= "." and name ~= ".." then
+            local p = dir .. "/" .. name
+            local a = lfs.attributes(p)
+            if a and a.mode == "directory" then
+                total = total + dirSizeBytes(lfs, p)
+            elseif a and a.size then
+                total = total + a.size
+            end
+        end
+    end
+    return total
+end
+
+local function freeMb(path)
+    local h = io.popen("df -k '" .. path:gsub("'", "'\\''") .. "' 2>/dev/null | tail -1")
+    if not h then return nil end
+    local line = h:read("*l") or ""
+    h:close()
+    -- Filesystem 1K-blocks Used Available Use% Mounted
+    local avail = line:match("^%S+%s+%d+%s+%d+%s+(%d+)")
+    return avail and math.floor(tonumber(avail) / 1024) or nil
+end
+
+--- Delete overlay caches by the rules above. Returns a summary table.
+-- @tparam string plugin_dir
+-- @tparam table opts max_age_days (60), max_total_mb (2048),
+--   min_free_mb (1024), keep_path (EPUB currently open), dry_run
+function EpubMediaOverlay.cleanupCaches(plugin_dir, opts)
+    opts = opts or {}
+    local max_age_s = (tonumber(opts.max_age_days) or 60) * 86400
+    local max_total = (tonumber(opts.max_total_mb) or 2048) * 1024 * 1024
+    local min_free_mb = tonumber(opts.min_free_mb) or 1024
+    local keep_hash = opts.keep_path and EpubMediaOverlay:_simpleHash(opts.keep_path)
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs or not lfs then return { error = "no lfs" } end
+    local root = plugin_dir .. "/cache/overlays"
+    if lfs.attributes(root, "mode") ~= "directory" then return { books = 0 } end
+
+    local now = os.time()
+    local books = {}
+    for name in lfs.dir(root) do
+        local dir = root .. "/" .. name
+        if name ~= "." and name ~= ".." and lfs.attributes(dir, "mode") == "directory" then
+            local fp_attr = lfs.attributes(dir .. "/.epub_fingerprint")
+            local dir_attr = lfs.attributes(dir)
+            local epub_path
+            local f = io.open(dir .. "/.epub_path", "r")
+            if f then
+                epub_path = f:read("*l")
+                f:close()
+            end
+            table.insert(books, {
+                hash = name, dir = dir, epub_path = epub_path,
+                used = (fp_attr and fp_attr.modification)
+                    or (dir_attr and dir_attr.modification) or now,
+                size = dirSizeBytes(lfs, dir),
+            })
+        end
+    end
+
+    local summary = { books = #books, deleted = {}, freed_mb = 0 }
+    local function delete(b, why)
+        if b.hash == keep_hash or b.deleted then return false end
+        if not opts.dry_run then
+            os.execute("rm -rf '" .. b.dir:gsub("'", "'\\''") .. "'")
+            -- Only count what actually went away; a read-only card or a
+            -- failed rm must not inflate the freed figure.
+            if lfs.attributes(b.dir, "mode") == "directory" then
+                logger.warn("EpubMediaOverlay: cache cleanup: could not remove", b.dir)
+                return false
+            end
+        end
+        b.deleted = true
+        logger.warn("EpubMediaOverlay: cache cleanup:", why, b.hash,
+            b.epub_path or "(path unknown)", math.floor(b.size / 1048576), "MB")
+        table.insert(summary.deleted, { hash = b.hash, why = why, path = b.epub_path })
+        summary.freed_mb = summary.freed_mb + math.floor(b.size / 1048576)
+        return true
+    end
+
+    for _, b in ipairs(books) do
+        if b.epub_path and lfs.attributes(b.epub_path, "mode") ~= "file" then
+            delete(b, "EPUB gone")
+        elseif now - b.used > max_age_s then
+            delete(b, "unused for " .. math.floor((now - b.used) / 86400) .. " days")
+        end
+    end
+
+    -- Least recently opened first.
+    table.sort(books, function(a, b) return a.used < b.used end)
+    local total = 0
+    for _, b in ipairs(books) do
+        if not b.deleted then total = total + b.size end
+    end
+    local free = freeMb(plugin_dir)
+    for _, b in ipairs(books) do
+        local over = total > max_total
+        local low = free and free < min_free_mb
+        if not (over or low) then break end
+        if not b.deleted and b.hash ~= keep_hash then
+            if delete(b, over and "over the size cap" or "card low on space") then
+                total = total - b.size
+                if free then free = free + math.floor(b.size / 1048576) end
+            end
+        end
+    end
+    summary.total_mb = math.floor(total / 1048576)
+    logger.warn("EpubMediaOverlay: cache cleanup: kept", summary.books - #summary.deleted,
+        "book(s),", summary.total_mb, "MB; freed", summary.freed_mb, "MB")
+    return summary
+end
+
+--- Sum the overlay caches for the menu: total bytes and book count.
+function EpubMediaOverlay.cacheUsage(plugin_dir)
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs or not lfs then return nil end
+    local root = plugin_dir .. "/cache/overlays"
+    if lfs.attributes(root, "mode") ~= "directory" then
+        return { bytes = 0, books = 0 }
+    end
+    local bytes, books = 0, 0
+    for name in lfs.dir(root) do
+        if name ~= "." and name ~= ".." then
+            local dir = root .. "/" .. name
+            if lfs.attributes(dir, "mode") == "directory" then
+                books = books + 1
+                bytes = bytes + dirSizeBytes(lfs, dir)
+            end
+        end
+    end
+    return { bytes = bytes, books = books }
 end
 
 function EpubMediaOverlay:_tableCount(t)

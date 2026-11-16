@@ -3114,3 +3114,19 @@ msgstr ""
 #: main.lua:1158
 msgid "EPUB read-along: the full-screen player shows the previous, current and next sentence in place of the cover, with sync adjusters below. Applies the next time playback starts."
 msgstr ""
+
+#: main.lua:1217
+msgid "Audiobook cache"
+msgstr ""
+
+#: main.lua:1218
+msgid "Audiobook cache: %1 MB in %2 book(s)"
+msgstr ""
+
+#: main.lua:1226
+msgid "Audiobook cache: freed %1 MB."
+msgstr ""
+
+#: main.lua:1233
+msgid "Extracted audiobook audio is kept here so a book reopens quickly. Cleanup runs automatically for books unused for 60 days, when the caches exceed 2 GB in total, or when the card is low on space. The open book is never removed. Tap to clean up now."
+msgstr ""

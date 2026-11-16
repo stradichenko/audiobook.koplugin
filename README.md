@@ -260,6 +260,7 @@ All settings are under **Tools > Audiobook Read-Along**:
   - **Group short cues (e-ink)** - for Media Overlay read-aloud books, merge consecutive short phrases into one highlight that stays on screen at least half a second, so slow e-ink refreshes do not skip between words; audio is unaffected
 - **Generate bug report** - save a diagnostic report to share when reporting issues
 - **Run device benchmark** - run a TTS performance benchmark on this device
+- **Audiobook cache** - shows how much extracted audiobook audio is stored and frees it when tapped. Cleanup also runs automatically for books unused for 60 days, when the caches exceed 2 GB in total, or when the card is low on space; the open book is never removed. The thresholds can be changed with the `cache_max_age_days` and `cache_max_total_mb` settings
 - **Check for updates** - fetch and install a newer release from GitHub
 
 ## Tweaking & advanced configuration

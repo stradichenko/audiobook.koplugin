@@ -416,6 +416,15 @@ function Audiobook:_initSubmodules()
         end
     end)
 
+    -- ── Self-cleaning audiobook cache, a minute after start ──
+    -- Off the startup path; deletes only caches of books not open now.
+    pcall(function()
+        UIManager:scheduleIn(60, function()
+            local ok, err = pcall(self._cleanupCaches, self)
+            if not ok then logger.warn("Audiobook: cache cleanup failed:", err) end
+        end)
+    end)
+
     -- ── Media playback modules (always load; works without a document) ──
     local ok_media, err_media = pcall(function()
         local function dofile_v25(name)
@@ -1201,6 +1210,27 @@ function Audiobook:addToMainMenu(menu_items)
                     return (self.ui and self.ui.document and self._init_ok and BenchmarkRunner ~= nil) or false
                 end,
                 help_text = _("Runs a standardized TTS benchmark on test sentences using each available engine (espeak-ng, Piper). Saves a report you can share on GitHub to help document device performance. Piper tests may take several minutes on slow devices."),
+            },
+            {
+                text_func = function()
+                    local usage = self:_overlayCacheUsage()
+                    if not usage then return _("Audiobook cache") end
+                    return T(_("Audiobook cache: %1 MB in %2 book(s)"),
+                        math.floor((usage.bytes or 0) / 1048576), usage.books or 0)
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local summary = self:_cleanupCaches({ dry_run = false })
+                    if summary then
+                        UIManager:show(InfoMessage:new{
+                            text = T(_("Audiobook cache: freed %1 MB."),
+                                summary.freed_mb or 0),
+                            timeout = 3,
+                        })
+                    end
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
+                help_text = _("Extracted audiobook audio is kept here so a book reopens quickly. Cleanup runs automatically for books unused for 60 days, when the caches exceed 2 GB in total, or when the card is low on space. The open book is never removed. Tap to clean up now."),
             },
             {
                 text = _("Check for updates"),
@@ -4768,6 +4798,48 @@ function Audiobook:onSetRotationMode()
             end
         end)
     end
+end
+
+--- Lazily load the overlay parser for its cleanup helpers. Cached so the
+--- Diagnostics menu does not re-run the module on every updateItems call.
+function Audiobook:_overlayCacheModule()
+    if self._overlay_cache_module ~= nil then
+        return self._overlay_cache_module or nil
+    end
+    if not PLUGIN_PATH then return nil end
+    local ok, EMO = pcall(dofile, PLUGIN_PATH .. "epubmediaoverlay.lua")
+    self._overlay_cache_module = ok and EMO or false
+    return self._overlay_cache_module or nil
+end
+
+function Audiobook:_overlayCacheKeepPath()
+    return self._smil_doc_path
+        or (self.ui and self.ui.document
+            and (self.ui.document.file_path or self.ui.document.file))
+end
+
+--- Self-cleaning overlay caches (see EpubMediaOverlay.cleanupCaches): by
+--- EPUB gone, age and total size. Limits: settings cache_max_age_days (60)
+--- and cache_max_total_mb (2048). Returns the summary, or nil when the
+--- parser module is unavailable.
+function Audiobook:_cleanupCaches(opts)
+    opts = opts or {}
+    local EMO = self:_overlayCacheModule()
+    if not (EMO and EMO.cleanupCaches) then return nil end
+    return EMO.cleanupCaches(PLUGIN_PATH:gsub("/$", ""), {
+        max_age_days = self:getSetting("cache_max_age_days", 60),
+        max_total_mb = self:getSetting("cache_max_total_mb", 2048),
+        keep_path = self:_overlayCacheKeepPath(),
+        dry_run = opts.dry_run,
+    })
+end
+
+--- Cache size for the Diagnostics menu: { bytes, books } or nil.
+function Audiobook:_overlayCacheUsage()
+    local EMO = self:_overlayCacheModule()
+    if not (EMO and EMO.cacheUsage) then return nil end
+    local ok, usage = pcall(EMO.cacheUsage, PLUGIN_PATH:gsub("/$", ""))
+    return ok and usage or nil
 end
 
 -- Settings management
