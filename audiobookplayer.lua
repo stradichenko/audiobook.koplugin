@@ -873,7 +873,7 @@ function AudiobookPlayer:setupUI()
         vol_group[4] or HorizontalSpan:new{ width = 0 },
         CenterContainer:new{
             dimen = Geom:new{ w = center_max_width, h = self._mini_height },
-            mini_center,
+            self:_keepMiniCenter(mini_center),
         },
         nudge_group[1] or HorizontalSpan:new{ width = 0 },
         nudge_group[2] or HorizontalSpan:new{ width = 0 },
@@ -918,6 +918,7 @@ function AudiobookPlayer:setupUI()
             self._tts_info_idx = 1
             if self._mini_title then
                 self._mini_title:setText(lines[1])
+                self:_miniTextChanged()
             end
         end
     end
@@ -1257,6 +1258,7 @@ function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec, force)
     self.time_widget:setText(text)
     if self._mini_time then
         self._mini_time:setText(text)
+        self:_miniTextChanged()
     end
     if self._minimized then
         self:_dirtyChrome(self:_miniTimeDirtyRegion())
@@ -1589,6 +1591,20 @@ function AudiobookPlayer:_buildCoverFrame()
     return frame
 end
 
+--- Remember the bar's centre stack (title over clock). It places each line
+--- once, from that line's width at the time, so a line whose text changes is
+--- drawn from the old place: a clock that started empty ran from the middle
+--- and was cut off under the buttons. Place the lines again on a change.
+function AudiobookPlayer:_keepMiniCenter(stack)
+    self._mini_center_stack = stack
+    return stack
+end
+
+function AudiobookPlayer:_miniTextChanged()
+    local stack = self._mini_center_stack
+    if stack and stack.resetLayout then stack:resetLayout() end
+end
+
 --- Optional large mini bar (large_mini_bar).  Sized for fingers on e-ink:
 --- a tall strip, buttons that answer to their whole column
 --- (_isTapOnMiniButton), a wide outlined play/pause as the anchor, and a
@@ -1732,7 +1748,7 @@ function AudiobookPlayer:_buildLargeMiniBar()
     for _i, b in ipairs(left_buttons) do add(b) end
     add(CenterContainer:new{
         dimen = Geom:new{ w = center_max_width, h = inner_h },
-        mini_center,
+        self:_keepMiniCenter(mini_center),
     })
     for _i, b in ipairs(right_buttons) do add(b) end
     -- A short divider keeps ✕ apart from the buttons used while listening.
@@ -1947,6 +1963,7 @@ function AudiobookPlayer:_applyVolume(delta)
     -- itself is off-screen).  While expanded the volume widget shows it.
     if self._minimized and self._mini_time then
         self._mini_time:setText(string.format("vol %d%%", pct))
+        self:_miniTextChanged()
     end
     UIManager:setDirty(self, function()
         if self._minimized then return "ui", self.dimen end
@@ -2085,9 +2102,11 @@ function AudiobookPlayer:_updateMiniWidgets()
     -- _scheduleTtsInfo); do not clobber it with the chapter/track name.
     if self._mini_title and not self.tts_mode then
         self._mini_title:setText(track)
+        self:_miniTextChanged()
     end
     if self._mini_time then
         self._mini_time:setText(self.current_time_str or "")
+        self:_miniTextChanged()
     end
     if self._mini_play_pause then
         local txt = self.is_playing and "⏸" or "▶"
@@ -2192,6 +2211,7 @@ function AudiobookPlayer:_scheduleTtsInfo()
         self._tts_info_idx = ((self._tts_info_idx or 0) % #lines) + 1
         if self._mini_title then
             self._mini_title:setText(lines[self._tts_info_idx])
+            self:_miniTextChanged()
         end
         UIManager:setDirty(self, function()
             return "ui", self._minimized and self.dimen or nil
