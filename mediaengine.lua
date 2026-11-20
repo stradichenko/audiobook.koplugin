@@ -1337,7 +1337,9 @@ function MediaEngine:_startAudiooutStallWatchdog(gen)
             return self._audioout_client:status(300)
         end)
         local pos = ok and st and st.pos_ms and st.pos_ms / 1000 or nil
-        if pos and last_pos and pos - last_pos > 0.5 then
+        -- A seek inside the same stream (soft epoch) moves the clock either
+        -- way; a jump back is progress too, not a stall.
+        if pos and last_pos and math.abs(pos - last_pos) > 0.5 then
             still = 0
             good = good + 1
             if good >= 5 then
@@ -1352,9 +1354,18 @@ function MediaEngine:_startAudiooutStallWatchdog(gen)
         if still >= 4 then
             self._stall_retries = (self._stall_retries or 0) + 1
             if self._stall_retries <= 2 then
+                -- Restart where the stream is now, not where play() began:
+                -- seeks since then (line skips, page skips) do not start a
+                -- new play() and left start_pos stale (a seek back to 654 s
+                -- restarted at 751 s).
+                local here = pos
+                if not here then
+                    local ok_p, p = pcall(self.getPosition, self)
+                    here = ok_p and tonumber(p) or nil
+                end
                 logger.warn("MediaEngine: audioout stalled at", pos,
                     "retry", self._stall_retries)
-                self:_restartAt(start_pos, "audio stalled")
+                self:_restartAt(here or start_pos, "audio stalled")
             else
                 self._stall_retries = 0
                 logger.warn("MediaEngine: audioout still stalled; giving up")
