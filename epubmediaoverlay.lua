@@ -141,6 +141,19 @@ function EpubMediaOverlay:_epubFingerprint(epub_path)
     return nil
 end
 
+--- Same EPUB? Fingerprints are "size:mtime". FAT/exFAT (the Kobo's book
+--- storage) keeps mtimes to 2 s, and a time cached in memory before the
+--- write reached the disk can read 1 s off afterwards: a real case wiped a
+--- 1 GB audio cache and re-extracted it. Same size, mtime within 2 s.
+function EpubMediaOverlay.sameFingerprint(a, b)
+    if a == b then return true end
+    if type(a) ~= "string" or type(b) ~= "string" then return false end
+    local sa, ta = a:match("^(%d+):(%d+)$")
+    local sb, tb = b:match("^(%d+):(%d+)$")
+    if not (sa and sb) or sa ~= sb then return false end
+    return math.abs(tonumber(ta) - tonumber(tb)) <= 2
+end
+
 function EpubMediaOverlay:_ensureCacheDir(plugin_dir, epub_path)
     -- Use a hash of the epub path to create a stable cache directory
     local hash = self:_simpleHash(epub_path)
@@ -155,7 +168,7 @@ function EpubMediaOverlay:_ensureCacheDir(plugin_dir, epub_path)
         cached_fp = (f:read("*l") or ""):gsub("%s+$", "")
         f:close()
     end
-    if fp and cached_fp and cached_fp ~= "" and cached_fp ~= fp then
+    if fp and cached_fp and cached_fp ~= "" and not EpubMediaOverlay.sameFingerprint(cached_fp, fp) then
         logger.warn("EpubMediaOverlay: EPUB changed (", cached_fp, "->", fp,
             ") — wiping stale overlay cache", cache)
         os.execute("rm -rf '" .. cache:gsub("'", "'\\''") .. "'")
@@ -851,7 +864,8 @@ function EpubMediaOverlay:_loadTimingCache(epub_fp)
     f:close()
     local ok, c = pcall(sb.decode, blob)
     if not ok or type(c) ~= "table" or c.version ~= TIMING_CACHE_VERSION
-            or c.epub_fp ~= epub_fp or type(c.timing) ~= "table" or #c.timing == 0 then
+            or not EpubMediaOverlay.sameFingerprint(c.epub_fp, epub_fp)
+            or type(c.timing) ~= "table" or #c.timing == 0 then
         logger.warn("EpubMediaOverlay: timing cache unusable, reparsing")
         return nil
     end
