@@ -44,6 +44,20 @@ Text-to-speech for [KOReader](https://github.com/koreader/koreader) with synchro
 * [Sync] Storyteller compatibility; EPUB 3 Media Overlays support (work in progress)
 * [Sync] BookOrbit friendly: read-along EPUBs play their embedded narration, and narration-free copies from BookOrbit are detected with guidance (see [BookOrbit](#bookorbit))
 
+## Compatibility
+
+| Platform | Audio path and device notes |
+|----------|-----------------------------|
+| **Kobo** | All models. The release bundles espeak-ng, sanoTTS and Piper for ARMv7. Bluetooth on MTK models (Clara 2E, Libra Colour, Sage with firmware before 4.38) goes through the vendor `mtkbtmwrpc` sink; on BlueZ models (Libra 2, Io, Sage with firmware 4.38 or later) through BlueALSA. Single-core models (Clara, Clara HD, Nia, Touch) play through ALSA and have no Bluetooth. |
+| **Kindle** | Firmware before 5.16.3 uses the soft-float build, 5.16.3 and later the hard-float build. Paperwhite 2 and later have no speaker, so audio needs Bluetooth; the older speaker models (Kindle 2/3/4/Touch/PW1) play through ALSA. Pairing is done in Kindle Settings, and the plugin manages the radio through `lipc`. |
+| **PocketBook** | Plays through the firmware's ALSA loopback (`tts_sm`) with the bundled `wav-play`; Bluetooth uses the firmware's BlueZ and `alsaloop` path. |
+| **Android** | Speaks through the device's system TTS engine via the bundled `tts_helper.dex`. The bundled Piper and espeak-ng binaries do not run on Android; for neural voices install [SherpaTTS](#high-quality-voices-on-android-sherpatts). |
+| **Desktop Linux** | espeak-ng and Piper, played through ALSA. |
+
+Known limitations: on Kobo MTK Bluetooth, MBROLA voices other than `mb-en1` may repeat audio mid-sentence (firmware encoder bug, see [docs/MBROLA_MTK_REPEAT_BUG.md](docs/MBROLA_MTK_REPEAT_BUG.md)). EPUB 3 Media Overlay support is under active development.
+
+The full per-platform audio and Bluetooth architecture is in [docs/PLATFORM_AUDIO.md](docs/PLATFORM_AUDIO.md).
+
 ## Audiobookshelf integration
 
 Connect to an [Audiobookshelf](https://www.audiobookshelf.org/) server to browse your library, download audiobooks for offline playback, and sync progress across devices. All configuration is done through the KOReader menu; no file editing is required.
