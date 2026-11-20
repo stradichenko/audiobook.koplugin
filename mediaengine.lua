@@ -375,6 +375,10 @@ function MediaEngine:_haltKindlePipelineForPause(reason)
     end
     if self:_isKindle() then
         -- Kill content pipelines only; keepalive is started right after.
+        -- This is also what catches the decoder by name when setsid is
+        -- missing (or the PID was not captured yet) and the group kill above
+        -- reached only the wrapper shell: the "pause does nothing" half of
+        -- issue #85.
         self:_killOrphanKindleGstPipelines(reason or "pause-halt", 120000, { content_only = true })
     end
     if self._progress_file then
@@ -722,6 +726,16 @@ end
 -- @treturn bool
 function MediaEngine:_isKindle()
     return Device.isKindle and Device:isKindle()
+end
+
+--- 2007-2011 speaker Kindles (K2/K3/DXG, K4, Touch, PW1): a real ALSA
+--- codec and no Bluetooth hardware at all.  The A2DP machinery below
+--- (pause keepalive, resume route cycling) has nothing to act on there
+--- and only delays or muddles pause/resume, so every Kindle-specific
+--- branch asks this first (issue #85).
+-- @treturn bool
+function MediaEngine:_isSpeakerKindle()
+    return self:_isKindle() and Utils.isLegacyKindleModel()
 end
 
 --- Probe whether Kindle playermgr (LIPC) is available: lipc-set-prop,
@@ -1393,7 +1407,9 @@ function MediaEngine:play(on_complete, on_fail)
     -- lets audiomgrd suspend the datapath.  Park silence first so orphan-kill
     -- never leaves the mixer empty.
     if self:_isKindle() and self:_kindleNeedsPipelineRestartOnResume() then
-        if not self._keepalive_pid then
+        -- Speaker Kindles have no A2DP datapath: the keepalive stream there
+        -- is a gst-launch that cannot render and only needs cleaning up.
+        if not self._keepalive_pid and not self:_isSpeakerKindle() then
             self:_startKindleA2dpKeepalive("play-bridge")
         end
         self:_killOrphanKindleGstPipelines("play-preflight", 100000, { content_only = true })
@@ -2047,7 +2063,12 @@ function MediaEngine:_killOrphanKindleGstPipelines(name, wait_us, opts)
     -- differently than procps pkill.
     os.execute("pkill -9 -f 'abk-progress' 2>/dev/null")
     os.execute("pkill -9 -f 'ffmpeg.*abk-progress' 2>/dev/null")
-    os.execute("killall -9 ffmpeg 2>/dev/null")
+    -- The decoder is ffmpeg-legacy on 2007-2011 speaker Kindles, and
+    -- killall "ffmpeg" does not match that process name.  Without the
+    -- second name every pause/stop on those devices left the decoder
+    -- running and the speaker kept playing (issue #85).
+    os.execute("killall -9 ffmpeg ffmpeg-legacy 2>/dev/null")
+    os.execute("pkill -9 -f 'ffmpeg-legacy' 2>/dev/null")
     -- Content gst side (fdsrc → mixersink).  Keep /dev/zero keepalive alive
     -- when content_only so pause→resume does not drop the A2DP datapath.
     os.execute("pkill -9 -f 'gst-launch-0.10 fdsrc' 2>/dev/null")
@@ -2978,7 +2999,12 @@ function MediaEngine:_startCompletionWatcher(gen)
                     -- before reporting failure.  Session-only flag.
                     if self.backend == self.BACKENDS.FFMPEG_PIPE
                         and self._ffmpeg_alt_cmd
-                        and not self._ffmpeg_alt_tried then
+                        and not self._ffmpeg_alt_tried
+                        -- On 2007-2011 speaker Kindles the alternate is the
+                        -- regular glibc decoder, which cannot run on that
+                        -- CPU/kernel at all: retrying with it turns one
+                        -- premature exit into a guaranteed failure.
+                        and not self:_isSpeakerKindle() then
                         self._ffmpeg_alt_tried = true
                         local failed_cmd = self.backend_cmd
                         self.backend_cmd = self._ffmpeg_alt_cmd
@@ -3151,7 +3177,11 @@ function MediaEngine:pause()
         logger.warn("MediaEngine: Kindle A2DP pause-halt at", self._paused_position,
             "apple=", self:_isAppleAirPodsHeadset() and "yes" or "no")
         self:_haltKindlePipelineForPause("pause-halt")
-        self:_startKindleA2dpKeepalive("pause")
+        -- Speaker Kindles have no A2DP datapath to keep awake; the keepalive
+        -- would only spawn a gst-launch that cannot render anywhere.
+        if not self:_isSpeakerKindle() then
+            self:_startKindleA2dpKeepalive("pause")
+        end
         return
     end
 
@@ -3261,6 +3291,14 @@ function MediaEngine:resume()
         self.is_paused = false
         self._paused_position = nil
         self._seek_offset = pos
+        -- Speaker Kindles: nothing to route.  Going through the A2DP
+        -- machinery cost a ~1-2 s "no connected MAC" cycle per resume and
+        -- could leave the old stream alive (issue #85).
+        if self:_isSpeakerKindle() then
+            logger.warn("MediaEngine: speaker Kindle resume-restart at", pos)
+            self:play(complete, fail)
+            return
+        end
         logger.warn("MediaEngine: Kindle A2DP resume-restart at", pos,
             "route_up=", self:_kindleA2dpRouteUp() and "yes" or "no",
             "keepalive=", self._keepalive_pid or "none")

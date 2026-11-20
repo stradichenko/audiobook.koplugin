@@ -1448,6 +1448,7 @@ function TTSEngine:synthesizeCommand(text, callback)
         local size = self:getFileSize(audio_file)
         logger.dbg("TTSEngine: Audio file created, size:", size)
         if size and size > 0 then
+            self:_convertLegacyKindleClip(audio_file)
             self.current_audio_file = audio_file
             -- Warn if espeak-ng reported voice issues even though it produced
             -- a file (can happen when MBROLA voice is missing and espeak falls
@@ -1492,6 +1493,51 @@ Delegates to WavUtils.
 --]]
 function TTSEngine:getFileSize(path)
     return WavUtils.getFileSize(path)
+end
+
+--- Convert an espeak clip to the rate the 2007-2011 speaker Kindles render
+--- correctly.
+--
+-- espeak-ng always writes 22050 Hz mono.  On the Kindle Touch (WM8962,
+-- kernel 2.6.31, old alsa-lib) an aplay of that clip runs at roughly half
+-- speed while the 44100 Hz audiobook pipe plays normally: the measured clip
+-- lifetime in the bug report was ~1.8x its declared duration with the
+-- paused time excluded (issue #85).  Convert to 44100 mono with the bundled
+-- static ffmpeg before playback; if the conversion fails the original file
+-- is left untouched, so this can only ever be a no-op, never silent audio.
+-- @param path string  WAV file, rewritten in place
+-- @return boolean  true when the file was converted
+function TTSEngine:_convertLegacyKindleClip(path)
+    if not (Device:isKindle() and Utils.isLegacyKindleModel()) then return false end
+    local sr = WavUtils.readSampleRateFromPath(path)
+    if not sr or sr == 0 or sr == 44100 then return false end
+    local bin = Utils.normalizeDirPath(self.plugin_dir or ".") .. "/bin/ffmpeg-legacy"
+    local fh = io.open(bin, "r")
+    if not fh then
+        logger.warn("TTSEngine: no ffmpeg-legacy to resample", sr, "Hz clip")
+        return false
+    end
+    fh:close()
+    local tmp = path .. ".44k.wav"
+    os.remove(tmp)
+    os.execute(string.format(
+        '%s -y -v error -i "%s" -ar 44100 -ac 1 -c:a pcm_s16le "%s" 2>/dev/null',
+        bin, path, tmp))
+    local out = io.open(tmp, "r")
+    if not out then
+        logger.warn("TTSEngine: resample of", sr, "Hz clip produced nothing")
+        return false
+    end
+    local ok = (out:seek("end") or 0) > WavUtils.HEADER_SIZE
+    out:close()
+    if not ok then
+        os.remove(tmp)
+        return false
+    end
+    os.remove(path)
+    os.rename(tmp, path)
+    logger.warn("TTSEngine: resampled clip", sr, "-> 44100 Hz for the speaker Kindle")
+    return true
 end
 --[[--
 Synthesize using Android TTS via JNI.
@@ -2046,6 +2092,7 @@ function TTSEngine:espeakSynthesizeFallback(text)
         if target_sr ~= 22050 then
             WavUtils.resampleFile(audio_file, target_sr)
         end
+        self:_convertLegacyKindleClip(audio_file)
         -- Generate timing estimates for the espeak audio
         self:generateTimingEstimates(text)
         self.current_audio_file = audio_file
@@ -2764,6 +2811,11 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
     self.on_complete_callback = on_complete
     self.on_fail_callback = on_fail
     self.is_speaking = true
+    -- A pause that lands between sentence scheduling and this call used to
+    -- be discarded here, so the sentence played through the tap and the
+    -- pause button looked dead (issue #85).  Remember it and hold the new
+    -- clip once it is up.
+    local paused_before_launch = self.is_paused
     self.is_paused = false
     -- Start playback using system player (cached after first probe)
     local player = self._cached_player or self:findAudioPlayer()
@@ -4833,6 +4885,9 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
 
     -- Bump generation to invalidate any stale timing/watcher loops
     self.play_generation = (self.play_generation or 0) + 1
+    -- Fresh clip: the previous clip's paused time must not leak into the
+    -- new watcher's timeout accounting (issue #85).
+    self._total_pause_ms = 0
 
     logger.warn("TTSEngine: play() pre-launch took", time.to_ms(UIManager:getTime() - t0), "ms")
 
@@ -4874,6 +4929,31 @@ function TTSEngine:play(on_word, on_complete, on_fail, concat_files)
         -- sync controller can anchor its timing to reality, not an estimate.
         engine._audio_launched_at = UIManager:getTime()
         logger.warn("TTSEngine: io.popen launch took", time.to_ms(UIManager:getTime() - launch_t0), "ms, PID=", engine.audio_pid)
+        -- Log the clip's own format next to the expected duration: a
+        -- playback that sounds slow but exits on time is a rate/pitch
+        -- mismatch, and the next bug report can tell the two apart
+        -- (issue #85).
+        if engine.audio_player_type == "aplay" and engine.current_audio_file then
+            local fh = io.open(engine.current_audio_file, "rb")
+            local hdr = fh and fh:read(36)
+            if fh then fh:close() end
+            local sr, ch = 0, 0
+            if hdr and #hdr >= 28 then
+                sr = WavUtils.readLE32(hdr:sub(25, 28))
+                ch = WavUtils.readLE16(hdr:sub(23, 24))
+            end
+            logger.warn("TTSEngine: aplay clip rate=", sr, "ch=", ch,
+                "expected=", engine._expected_play_duration_ms or 0, "ms")
+        end
+
+        -- The user paused before this clip reached the player: hold it now
+        -- so it does not start talking over a paused session (issue #85).
+        if paused_before_launch and engine.audio_pid then
+            os.execute("kill -STOP " .. engine.audio_pid .. " 2>/dev/null")
+            engine.is_paused = true
+            engine.pause_time = UIManager:getTime()
+            logger.warn("TTSEngine: clip launched into a paused session; held PID", engine.audio_pid)
+        end
 
         -- Start timing loop for word highlighting (does NOT detect completion)
         engine:startTimingLoop()
@@ -6661,10 +6741,14 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_ret
             local elapsed_ms = time.to_ms(UIManager:getTime() - launch_time)
             local expected = engine._expected_play_duration_ms or 5000
             local hard_timeout_ms = math.max(30000, expected * 3)
-            if elapsed_ms > hard_timeout_ms then
+            -- Time spent paused is not hung time: counting it force-killed
+            -- a healthy clip after any pause longer than ~25 s (issue #85).
+            local active_ms = elapsed_ms - (engine._total_pause_ms or 0)
+            if active_ms > hard_timeout_ms then
                 logger.err("TTSEngine: Process watcher hard timeout after",
-                    elapsed_ms, "ms (expected", expected, "ms), force-killing PID",
-                    engine.audio_pid)
+                    active_ms, "ms active (", elapsed_ms, "ms wall, paused",
+                    engine._total_pause_ms or 0, "ms, expected", expected,
+                    "ms), force-killing PID", engine.audio_pid)
                 engine:_killAudioProcess()
                 engine:onPlaybackComplete()
                 return
@@ -6672,6 +6756,13 @@ function TTSEngine:_startProcessWatcher(bt_retry_allowed, skip_on_fail, conv_ret
             UIManager:scheduleIn(0.1, checkProcess)
         else
             local elapsed_ms = time.to_ms(UIManager:getTime() - launch_time)
+
+            -- Compare the measured clip lifetime with its declared duration.
+            if engine.audio_player_type == "aplay" then
+                logger.warn("TTSEngine: aplay exit after", elapsed_ms,
+                    "ms (paused", engine._total_pause_ms or 0, "ms, expected",
+                    engine._expected_play_duration_ms or 0, "ms)")
+            end
 
             -- BT early-death detection: gst-launch exits in <200ms when
             -- there is no A2DP sink.  Normal playback always takes >500ms
