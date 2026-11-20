@@ -1357,12 +1357,21 @@ function MediaSync:pause(auto)
             end)
         end
     end
-    -- Pin the SMIL highlight to the pause time immediately.
-    pcall(function() self:_updateHighlightAtTime(pos) end)
+    -- The bar first (play icon, clock at the frozen mark): it is what the
+    -- user is looking at. The poller is about to stop ticking, so this is
+    -- the last time update they see.
     self:_publishPlayState(false)
-    -- Repaint the bar clock at the frozen mark now; the poller is about to
-    -- stop ticking, so this is the last time update the user sees.
     pcall(function() self:_refreshPlaybackTimeUi() end)
+    -- Then pin the highlight to the pause time, after that repaint: on a
+    -- long highlighted passage, redrawing it first held the pause back.
+    -- Nothing to do when it already shows the line at the pause.
+    local sent_idx = self:_findSentenceAtTime(pos)
+    if sent_idx and sent_idx ~= self._current_sentence_idx then
+        UIManager:nextTick(function()
+            if self.state ~= self.STATE.PAUSED then return end
+            pcall(function() self:_updateHighlightAtTime(pos) end)
+        end)
+    end
     logger.warn("MediaSync: paused", auto and "(auto)" or "", "at", pos)
 end
 
