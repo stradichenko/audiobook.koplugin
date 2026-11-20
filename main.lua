@@ -2676,11 +2676,16 @@ function Audiobook:_resumeEntryFromSave(doc_path, timing_data, by_file)
 
     local audio = match_file(saved_audio)
 
-    -- Prefer the exact SMIL fragment (sentence-precision resume).
+    -- Prefer the exact SMIL fragment (sentence-precision resume), but only
+    -- when the saved time is in that line: the line can be saved at another
+    -- moment than the time (it was seen 26 lines behind), and the time is
+    -- what plays, so the page must follow the time.
     if frag and timing_data then
         for _, e in ipairs(timing_data) do
             if e.fragment_id == frag
-                and (not text_doc or not e.text_doc or e.text_doc == text_doc) then
+                and (not text_doc or not e.text_doc or e.text_doc == text_doc)
+                and (not e.start_time or not e.end_time
+                    or (saved_pos >= e.start_time - 1 and saved_pos <= e.end_time + 1)) then
                 return {
                     audio_path = e.audio_path or audio,
                     start_time = saved_pos,
