@@ -3941,6 +3941,7 @@ function Audiobook:onPosUpdate(pos, refresh_type)
     -- Screen-coordinate TTS underlines would otherwise stay glued in place.
     if self._peeking_adjacent_page then return end
     if type(pos) ~= "number" then return end
+    self:_reportCurrentPageToStatistics()
     local prev = self._tts_hl_pos
     self._tts_hl_pos = pos
     if not prev then return end
@@ -3953,8 +3954,60 @@ function Audiobook:onPosUpdate(pos, refresh_type)
     end
 end
 
+--[[--
+Feed automatic page turns to KOReader's statistics plugin.
+
+Read-along turns pages by dispatching GotoViewRel, and on some builds that
+programmatic turn does not reach the statistics plugin, so a whole TTS
+session leaves no pages and no reading time behind.  This calls the
+statistics plugin's own onPageUpdate, the same entry point a manual turn
+uses: it applies its enabled / frozen / paused checks itself, and a page it
+has already counted is ignored there, so forwarding can never double count
+and can never bypass a guard.
+
+@param pageno number|nil  Page to report; nil is ignored.
+--]]
+function Audiobook:_reportPageToStatistics(pageno)
+    if type(pageno) ~= "number" or pageno < 1 then return end
+    -- Only while a read-along or overlay session is running.  The point is
+    -- to account for pages this plugin turned, not to second-guess how
+    -- KOReader accounts ordinary manual turns.
+    if not self:_narrationActive() then return end
+    local stats = self.ui and self.ui.statistics
+    if not stats or type(stats.onPageUpdate) ~= "function" then return end
+    pcall(function() stats:onPageUpdate(pageno) end)
+end
+
+--- True while a read-along or pre-recorded-audiobook session is running.
+function Audiobook:_narrationActive()
+    local sc = self.sync_controller
+    local ms = self.media_sync
+    return (sc and sc.state and sc.state ~= sc.STATE.STOPPED)
+        or (ms and ms.state and ms.state ~= ms.STATE.STOPPED)
+        or false
+end
+
+--- Report the view's current page if it changed since the last report.
+function Audiobook:_reportCurrentPageToStatistics()
+    if not self:_narrationActive() then return end
+    local ui = self.ui
+    if not ui or type(ui.getCurrentPage) ~= "function" then return end
+    local ok, page = pcall(function() return ui:getCurrentPage() end)
+    if not ok or type(page) ~= "number" or page < 1 then return end
+    if page == self._stats_reported_page then return end
+    self._stats_reported_page = page
+    self:_reportPageToStatistics(page)
+end
+
 function Audiobook:onPageUpdate(cur_page, prev_page)
     if self._peeking_adjacent_page then return end
+    -- Count the turn in reading statistics (issue #126).
+    if type(cur_page) == "number" then
+        self._stats_reported_page = cur_page
+        self:_reportPageToStatistics(cur_page)
+    else
+        self:_reportCurrentPageToStatistics()
+    end
     self:_handlePageTurnFollow()
     -- TTS overlay boxes are screen coordinates.  A page turn must drop them
     -- or the underline is stamped at the old x,y on the new page.  Do not
