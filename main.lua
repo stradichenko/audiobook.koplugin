@@ -503,6 +503,39 @@ function Audiobook:onDispatcherRegisterActions()
     })
 end
 
+--- Arrange list for the large bar's buttons (KOReader's SortWidget: tap an
+--- item, move it with the arrows). Saves bar_button_order and lays the
+--- open bars out again.
+function Audiobook:_arrangeBarButtons()
+    local ok, ABP = pcall(dofile, PLUGIN_PATH .. "audiobookplayer.lua")
+    if not (ok and ABP and ABP.barOrder) then
+        logger.warn("Audiobook: arrange: player module failed:", ABP)
+        return
+    end
+    local labels = {}
+    for _i, it in ipairs(ABP.BAR_ITEMS) do labels[it.id] = it.label() end
+    local item_table = {}
+    for _i, id in ipairs(ABP.barOrder(self:getSetting("bar_button_order", nil))) do
+        table.insert(item_table, { text = labels[id] or id, id = id })
+    end
+    local SortWidget = require("ui/widget/sortwidget")
+    local sw
+    sw = SortWidget:new{
+        title = _("Arrange the bar's buttons"),
+        item_table = item_table,
+        callback = function()
+            local ids = {}
+            for _i, it in ipairs(sw.item_table) do table.insert(ids, it.id) end
+            self:setSetting("bar_button_order", ids)
+            for _i, owner in ipairs({ self.media_sync, self.sync_controller }) do
+                local bar = owner and owner.playback_bar
+                if bar and bar.refreshLayout then pcall(bar.refreshLayout, bar) end
+            end
+        end,
+    }
+    UIManager:show(sw)
+end
+
 function Audiobook:_showInitError()
     if not UIManager or not InfoMessage then
         logger.warn("Audiobook: init failed:", self._init_error or "Unknown error")
@@ -1154,6 +1187,17 @@ function Audiobook:addToMainMenu(menu_items)
                             self:toggleSetting("large_mini_bar", false)
                         end,
                         help_text = _("A taller player bar with bigger buttons that are easier to hit. Off by default. Applies the next time playback starts."),
+                    },
+                    {
+                        text = _("Arrange the bar's buttons"),
+                        keep_menu_open = true,
+                        enabled_func = function()
+                            return self:getSetting("large_mini_bar", false) and true or false
+                        end,
+                        callback = function()
+                            self:_arrangeBarButtons()
+                        end,
+                        help_text = _("Tap an item, then move it with the arrows. Buttons above \"Title and time\" sit to its left, those below it to its right; ✕ stays at the end. Each bar shows only the buttons that apply to it. Large player bar only."),
                     },
                     {
                         text = _("Line-by-line view in the full-screen player"),

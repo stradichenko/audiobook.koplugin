@@ -1591,6 +1591,90 @@ function AudiobookPlayer:_buildCoverFrame()
     return frame
 end
 
+-- ── Arrangeable large bar ───────────────────────────────────────────
+-- Default order, left to right. "title" stands for the title and clock:
+-- buttons before it sit on its left, buttons after it on its right. ✕
+-- always stays last. Each bar shows only the buttons that apply to it
+-- (sync for read-along, speed and settings for TTS). Labels are for the
+-- arrange list.
+AudiobookPlayer.BAR_ITEMS = {
+    { id = "play",       label = function() return _("Play / pause") end },
+    { id = "chapters",   label = function() return _("Chapters") end },
+    { id = "vol_down",   label = function() return _("Volume down") end },
+    { id = "vol_up",     label = function() return _("Volume up") end },
+    { id = "title",      label = function() return _("— Title and time —") end },
+    { id = "sync_minus", label = function() return _("Sync earlier") end },
+    { id = "sync_plus",  label = function() return _("Sync later") end },
+    { id = "speed",      label = function() return _("Speed (text-to-speech)") end },
+    { id = "settings",   label = function() return _("Settings (text-to-speech)") end },
+    { id = "refocus",    label = function() return _("Go to the line being read") end },
+}
+
+--- The saved bar order (ids), with every known id present. Ids the saved
+--- list lacks (buttons added in a later version) keep their default side.
+function AudiobookPlayer.barOrder(saved)
+    local items = AudiobookPlayer.BAR_ITEMS
+    local seq, seen, known = {}, {}, {}
+    for _i, it in ipairs(items) do known[it.id] = true end
+    if type(saved) == "table" then
+        for _i, id in ipairs(saved) do
+            if known[id] and not seen[id] then
+                table.insert(seq, id)
+                seen[id] = true
+            end
+        end
+    end
+    local title_pos
+    for i, id in ipairs(seq) do if id == "title" then title_pos = i end end
+    local before_title = true
+    for _i, it in ipairs(items) do
+        if it.id == "title" then before_title = false end
+        if not seen[it.id] then
+            if before_title and title_pos then
+                table.insert(seq, title_pos, it.id)
+                title_pos = title_pos + 1
+            else
+                table.insert(seq, it.id)
+                if it.id == "title" then title_pos = #seq end
+            end
+            seen[it.id] = true
+        end
+    end
+    return seq
+end
+
+function AudiobookPlayer:_barOrder()
+    local p = self.plugin
+    return AudiobookPlayer.barOrder(p and p.getSetting and p:getSetting("bar_button_order", nil))
+end
+
+--- Split the buttons present (by id) into the lists left and right of the
+--- title, in the saved order.
+function AudiobookPlayer:_orderBar(by_id)
+    local left, right = {}, {}
+    local side = left
+    for _i, id in ipairs(self:_barOrder()) do
+        if id == "title" then
+            side = right
+        elseif by_id[id] then
+            table.insert(side, by_id[id])
+        end
+    end
+    return left, right
+end
+
+--- Lay the large bar out again after its order changed.
+function AudiobookPlayer:refreshLayout()
+    if not self.large_mini_bar then return end
+    local ok, err = pcall(self._buildLargeMiniBar, self)
+    if not ok then
+        logger.warn("AudiobookPlayer: bar rebuild failed:", err)
+        return
+    end
+    self:_updateMiniWidgets()
+    UIManager:setDirty(self, function() return "ui", self.dimen end)
+end
+
 --- Remember the bar's centre stack (title over clock). It places each line
 --- once, from that line's width at the time, so a line whose text changes is
 --- drawn from the old place: a clock that started empty ran from the middle
@@ -1702,6 +1786,30 @@ function AudiobookPlayer:_buildLargeMiniBar()
         self._mini_vol_plus = miniButton("♪+", 17, function() self:_applyVolume(10) end)
         table.insert(left_buttons, self._mini_vol_minus)
         table.insert(left_buttons, self._mini_vol_plus)
+    end
+
+    -- The saved order (General settings > Arrange the bar's buttons): which
+    -- side of the title each button sits on, and in what order. Only the
+    -- buttons this bar carries take part.
+    do
+        local by_id = {
+            play = self._mini_play_pause,
+            chapters = self._mini_chapters,
+            vol_down = self._mini_vol_minus,
+            vol_up = self._mini_vol_plus,
+            sync_minus = self._mini_sync_minus,
+            sync_plus = self._mini_sync_plus,
+            speed = self._mini_speed,
+            settings = self._mini_settings,
+            refocus = self._mini_refocus,
+        }
+        local shown = {}
+        for _i, b in ipairs(left_buttons) do shown[b] = true end
+        for _i, b in ipairs(right_buttons) do shown[b] = true end
+        for id, w in pairs(by_id) do
+            if not shown[w] then by_id[id] = nil end
+        end
+        left_buttons, right_buttons = self:_orderBar(by_id)
     end
 
     -- Whatever width the buttons leave goes to the centered title stack.
