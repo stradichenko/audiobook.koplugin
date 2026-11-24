@@ -2003,6 +2003,8 @@ function Audiobook:_loadOverlayInBackground(doc_path, parser, opts, resume)
     pcall(function()
         ms.overlay_mode = true
         ms:showPlaybackBar()
+        -- Nothing plays yet: show ▶ (a tap says it is still loading).
+        if ms.playback_bar then ms.playback_bar:setPlaying(false) end
     end)
     setText(_("Loading audiobook…"))
 
