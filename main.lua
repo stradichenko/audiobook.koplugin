@@ -486,6 +486,18 @@ function Audiobook:_initSubmodules()
     end
 end
 
+--- KOReader's status bar was shown or hidden: the playback bars follow it
+--- (above it when it shows, at the very bottom when it does not). Next tick,
+--- so ReaderView has its new footer state.
+function Audiobook:onReaderFooterVisibilityChange()
+    UIManager:nextTick(function()
+        for _, owner in ipairs({ self.media_sync, self.sync_controller }) do
+            local bar = owner and owner.playback_bar
+            if bar and bar.onFooterChanged then pcall(bar.onFooterChanged, bar) end
+        end
+    end)
+end
+
 function Audiobook:onDispatcherRegisterActions()
     local ok, Dispatcher = pcall(require, "dispatcher")
     if not ok then return end

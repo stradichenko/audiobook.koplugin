@@ -947,6 +947,20 @@ function AudiobookPlayer:_miniBarY()
     return self.height - self._mini_height - self:_statusBarInset()
 end
 
+--- The reader's status bar was shown or hidden: sit above it, or drop to
+--- the very bottom. Without this the bar kept the place it was built in,
+--- covering the status bar or leaving a gap under itself.
+function AudiobookPlayer:onFooterChanged()
+    if not (self.visible and self._minimized) then return end
+    self.covers_footer = not self:_shouldSitAboveFooter()
+    local y = self:_miniBarY()
+    if self.dimen.y == y then return end
+    local old = Geom:new{ x = 0, y = self.dimen.y, w = self.width, h = self._mini_height }
+    self.dimen.y = y
+    local new = Geom:new{ x = 0, y = y, w = self.width, h = self._mini_height }
+    UIManager:setDirty("all", function() return "ui", old:combine(new) end)
+end
+
 function AudiobookPlayer:_applyMinimizedGeometry()
     self._minimized = true
     self.covers_fullscreen = false
