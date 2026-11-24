@@ -917,8 +917,7 @@ function AudiobookPlayer:setupUI()
         if #lines > 0 then
             self._tts_info_idx = 1
             if self._mini_title then
-                self._mini_title:setText(lines[1])
-                self:_miniTextChanged()
+                self:_fitMiniTitle(lines[1])
             end
         end
     end
@@ -1226,6 +1225,18 @@ function AudiobookPlayer:_miniTimeDirtyRegion()
     if t and t.dimen and t.dimen.w and t.dimen.w > 0 then
         local d = t.dimen
         local pad = 2
+        -- Large bar: the clock's row across the whole centre box, so a
+        -- longer time is never clipped to the previous text's width.
+        local box = self.large_mini_bar and self._mini_center_box
+            and self._mini_center_box.dimen
+        if box and box.w and box.w > 0 and box.x then
+            return Geom:new{
+                x = math.max(0, box.x),
+                y = math.max(0, d.y - pad),
+                w = box.w,
+                h = d.h + pad * 2,
+            }
+        end
         return Geom:new{
             x = math.max(0, d.x - pad),
             y = math.max(0, d.y - pad),
@@ -1257,8 +1268,7 @@ function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec, force)
     self.current_time_str = text
     self.time_widget:setText(text)
     if self._mini_time then
-        self._mini_time:setText(text)
-        self:_miniTextChanged()
+        self:_fitMiniTime(text)
     end
     if self._minimized then
         self:_dirtyChrome(self:_miniTimeDirtyRegion())
@@ -1605,6 +1615,97 @@ function AudiobookPlayer:_miniTextChanged()
     if stack and stack.resetLayout then stack:resetLayout() end
 end
 
+-- ── Large bar text that always fits ─────────────────────────────────
+-- Font sizes tried, largest first. The title wraps onto two lines at the
+-- smallest size before anything is cut; the clock line only shrinks.
+local MINI_TITLE_SIZES = { 15, 14, 13, 12 }
+local MINI_TIME_SIZES = { 12, 11, 10 }
+
+--- Largest size in `sizes` at which `text` fits `max_w` on one line.
+-- @return size, fits
+local function fitSize(text, sizes, max_w)
+    for _i, size in ipairs(sizes) do
+        local probe = TextWidget:new{ text = text, face = Font:getFace("cfont", size) }
+        local w = probe:getSize().w
+        probe:free()
+        if w <= max_w then return size, true end
+    end
+    return sizes[#sizes], false
+end
+
+--- The bar's title line: chapter, else track or book, else the return cue.
+function AudiobookPlayer:_miniTitleText()
+    if self._return_hint_active then
+        return _("Return to read-aloud")
+    end
+    local track = self.chapter_title
+    if not track or track == "" then
+        track = self.output_name
+    end
+    if not track or track == "" then
+        track = self.title or _("Audiobook")
+    end
+    return track
+end
+
+--- Title widget for the large bar: one line at the largest size that fits,
+--- else two lines at the smallest (ellipsis only past two lines).
+function AudiobookPlayer:_fittedMiniTitle(text, max_w)
+    local size, fits = fitSize(text, MINI_TITLE_SIZES, max_w)
+    if fits or self.tts_mode then
+        -- TTS cycles short info lines through this widget: stay one line.
+        return TextWidget:new{
+            text = text,
+            face = Font:getFace("cfont", size),
+            max_width = max_w,
+            truncate_left = false,
+        }
+    end
+    local face = Font:getFace("cfont", size)
+    local box = TextBoxWidget:new{
+        text = text, face = face, width = max_w, alignment = "center",
+    }
+    local lh = box.line_height_px
+    if lh and box:getSize().h > lh * 2 then
+        box:free()
+        box = TextBoxWidget:new{
+            text = text, face = face, width = max_w, alignment = "center",
+            height = lh * 2, height_overflow_show_ellipsis = true,
+        }
+    end
+    return box
+end
+
+--- Set a one-line title (TTS info, or a title that fitted on one line) so
+--- it still fits: shrink the font for longer text.
+function AudiobookPlayer:_fitMiniTitle(text)
+    local t = self._mini_title
+    if not t then return end
+    text = text or ""
+    local max_w = self.large_mini_bar and self._mini_center_w
+    if max_w and not t.line_height_px and self._mini_title_fit_text ~= text then
+        self._mini_title_fit_text = text
+        t.face = Font:getFace("cfont", (fitSize(text, MINI_TITLE_SIZES, max_w)))
+    end
+    t:setText(text)
+    self:_miniTextChanged()
+end
+
+--- Set the clock line so it always fits. Re-fitted only when the text's
+--- length changes, so the ticking clock is not measured every second.
+function AudiobookPlayer:_fitMiniTime(text)
+    local t = self._mini_time
+    if not t then return end
+    text = text or ""
+    local max_w = self.large_mini_bar and self._mini_center_w
+    if max_w and self._mini_time_fit_key ~= #text then
+        self._mini_time_fit_key = #text
+        t.face = Font:getFace("cfont", (fitSize(text, MINI_TIME_SIZES, max_w)))
+    end
+    t:setText(text)
+    self:_miniTextChanged()
+end
+
 --- Optional large mini bar (large_mini_bar).  Sized for fingers on e-ink:
 --- a tall strip, buttons that answer to their whole column
 --- (_isTapOnMiniButton), a wide outlined play/pause as the anchor, and a
@@ -1705,20 +1806,26 @@ function AudiobookPlayer:_buildLargeMiniBar()
     end
 
     -- Whatever width the buttons leave goes to the centered title stack.
-    local center_max_width = math.max(0, self.width - play_w
-        - mini_btn_size * (n_buttons) - gap * n_gaps - Size.line.medium)
+    -- Measured from the buttons as built, so it stays right whatever they
+    -- carry.
+    local function width_of(w) return w and w:getSize().w or 0 end
+    local used = gap * n_gaps + Size.line.medium + width_of(self._mini_close)
+    for _i, b in ipairs(left_buttons) do used = used + width_of(b) end
+    for _i, b in ipairs(right_buttons) do used = used + width_of(b) end
+    local center_max_width = math.max(0, self.width - used)
+    -- Later text on the bar (clock, chapter changes) is fitted to this.
+    self._mini_center_w = center_max_width
 
     -- Create the centered title stack now that side buttons have reserved
     -- their full width, so the text cannot overlap the volume/sync buttons.
     -- TTS carries no time on the bar: read-along has no meaningful clock
     -- (there is no audio timeline, only sentences), so the line is dropped.
-    self._mini_title = TextWidget:new{
-        text = (self.chapter_title and self.chapter_title ~= "" and self.chapter_title)
-            or self.output_name or self.title or _("Audiobook"),
-        face = Font:getFace("cfont", 15),
-        max_width = center_max_width,
-        truncate_left = false,
-    }
+    -- Title and clock are sized to fit instead of being cut off.
+    local title_text = self:_miniTitleText()
+    self._mini_title_built_text = title_text
+    self._mini_title_fit_text = title_text
+    self._mini_time_fit_key = nil
+    self._mini_title = self:_fittedMiniTitle(title_text, center_max_width)
     local mini_center
     if self.tts_mode then
         self._mini_time = nil
@@ -1727,11 +1834,17 @@ function AudiobookPlayer:_buildLargeMiniBar()
             self._mini_title,
         }
     else
+        -- Sized for the clock's shape ("88:88 / 88:88", with hours when the
+        -- current text has them), so ticking never needs a bigger font box.
+        local shape = self.current_time_str and self.current_time_str ~= ""
+            and (self.current_time_str:gsub("%d", "8")) or ""
+        if #shape < #"88:88 / 88:88" then shape = "88:88 / 88:88" end
         self._mini_time = TextWidget:new{
             text = self.current_time_str or "",
-            face = Font:getFace("cfont", 12),
+            face = Font:getFace("cfont", (fitSize(shape, MINI_TIME_SIZES, center_max_width))),
             max_width = center_max_width,
         }
+        self._mini_time_fit_key = #(self.current_time_str or "")
         mini_center = VerticalGroup:new{
             align = "center",
             self._mini_title,
@@ -1746,10 +1859,13 @@ function AudiobookPlayer:_buildLargeMiniBar()
         table.insert(row_items, HorizontalSpan:new{ width = gap })
     end
     for _i, b in ipairs(left_buttons) do add(b) end
-    add(CenterContainer:new{
+    -- Kept so the clock's repaint covers the whole centre width (see
+    -- _miniTimeDirtyRegion).
+    self._mini_center_box = CenterContainer:new{
         dimen = Geom:new{ w = center_max_width, h = inner_h },
         self:_keepMiniCenter(mini_center),
-    })
+    }
+    add(self._mini_center_box)
     for _i, b in ipairs(right_buttons) do add(b) end
     -- A short divider keeps ✕ apart from the buttons used while listening.
     add(LineWidget:new{
@@ -1962,8 +2078,7 @@ function AudiobookPlayer:_applyVolume(delta)
     -- When minimized, flash the level in the mini time slot (the volume row
     -- itself is off-screen).  While expanded the volume widget shows it.
     if self._minimized and self._mini_time then
-        self._mini_time:setText(string.format("vol %d%%", pct))
-        self:_miniTextChanged()
+        self:_fitMiniTime(string.format("vol %d%%", pct))
     end
     UIManager:setDirty(self, function()
         if self._minimized then return "ui", self.dimen end
@@ -2086,27 +2201,27 @@ function AudiobookPlayer:_updateMiniWidgets()
     -- (track/book) when no chapter is known yet.
     -- When browsing away from the audio page, the title becomes a clear
     -- "Return to read-aloud" cue (tapping the bar centers on the sentence).
-    local track
-    if self._return_hint_active then
-        track = _("Return to read-aloud")
-    else
-        track = self.chapter_title
-        if not track or track == "" then
-            track = self.output_name
-        end
-        if not track or track == "" then
-            track = self.title or _("Audiobook")
+    local track = self:_miniTitleText()
+    -- Large bar: its title is sized (one or two lines) when built, so new
+    -- text means building it again. Chapter changes are rare; the clock
+    -- does not come through here.
+    if self.large_mini_bar and not self.tts_mode and self._mini_title
+            and self._mini_title_built_text ~= track and not self._rebuilding_mini then
+        self._rebuilding_mini = true
+        local ok, err = pcall(self._buildLargeMiniBar, self)
+        self._rebuilding_mini = nil
+        if not ok then logger.warn("AudiobookPlayer: bar rebuild failed:", err) end
+        if self._minimized then
+            UIManager:setDirty(self, function() return "ui", self.dimen end)
         end
     end
     -- TTS owns its center line through the context cycler (see
     -- _scheduleTtsInfo); do not clobber it with the chapter/track name.
-    if self._mini_title and not self.tts_mode then
-        self._mini_title:setText(track)
-        self:_miniTextChanged()
+    if self._mini_title and not self.tts_mode and self._mini_title_built_text ~= track then
+        self:_fitMiniTitle(track)
     end
     if self._mini_time then
-        self._mini_time:setText(self.current_time_str or "")
-        self:_miniTextChanged()
+        self:_fitMiniTime(self.current_time_str or "")
     end
     if self._mini_play_pause then
         local txt = self.is_playing and "⏸" or "▶"
@@ -2210,8 +2325,7 @@ function AudiobookPlayer:_scheduleTtsInfo()
         end
         self._tts_info_idx = ((self._tts_info_idx or 0) % #lines) + 1
         if self._mini_title then
-            self._mini_title:setText(lines[self._tts_info_idx])
-            self:_miniTextChanged()
+            self:_fitMiniTitle(lines[self._tts_info_idx])
         end
         UIManager:setDirty(self, function()
             return "ui", self._minimized and self.dimen or nil
