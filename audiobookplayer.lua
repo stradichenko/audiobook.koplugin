@@ -1269,7 +1269,27 @@ function AudiobookPlayer:_miniTimeDirtyRegion()
     }
 end
 
+--- Show a loading line (e.g. "Loading 12 / 73") where the clock sits, so
+--- the book stays readable while the audiobook loads. nil clears it.
+function AudiobookPlayer:setLoadingText(text)
+    if text == self._loading_text then return end
+    self._loading_text = text
+    self.current_time_str = text or ""
+    if self.time_widget then self.time_widget:setText(self.current_time_str) end
+    if self._mini_time then
+        -- The loading line is wider than the clock it replaces: fit it with
+        -- the same helper so the large bar shrinks it instead of clipping.
+        self:_fitMiniTime(self.current_time_str)
+    else
+        self:_miniTextChanged()
+    end
+    -- The text changes width: repaint the whole bar, not the old clock rect.
+    UIManager:setDirty(self, self:_isEink() and "fast" or "ui")
+end
+
 function AudiobookPlayer:updateTimeDisplay(current_sec, total_sec, force)
+    -- Pollers must not overwrite the loading line with 0:00 / 0:00.
+    if self._loading_text then return end
     local text
     if self._time_display_mode == "chapter" and self._current_chapter_end > self._current_chapter_start then
         local chapter_pos = math.max(0, current_sec - self._current_chapter_start)
