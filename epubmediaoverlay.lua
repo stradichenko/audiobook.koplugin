@@ -916,6 +916,20 @@ function EpubMediaOverlay:_saveTimingCache(epub_fp, timing)
     logger.warn("EpubMediaOverlay: saved timing cache,", #blob, "bytes")
 end
 
+--- True when this exact EPUB already has a stored parse, so loadFromEpub
+--- takes the fast path. Read-only: no directories are made or wiped.
+function EpubMediaOverlay:hasTimingCache(epub_path, plugin_dir)
+    if not (epub_path and plugin_dir and stringBuffer()) then return false end
+    local cache = plugin_dir .. "/cache/overlays/" .. self:_simpleHash(epub_path)
+    local f = io.open(cache .. "/.epub_fingerprint", "r")
+    if not f then return false end
+    local cached_fp = (f:read("*l") or ""):gsub("%s+$", "")
+    f:close()
+    local fp = self:_epubFingerprint(epub_path)
+    if not fp or not EpubMediaOverlay.sameFingerprint(cached_fp, fp) then return false end
+    return self:_fileExists(cache .. "/" .. TIMING_CACHE_NAME)
+end
+
 function EpubMediaOverlay:getCacheDir()
     return self._cache_dir
 end
