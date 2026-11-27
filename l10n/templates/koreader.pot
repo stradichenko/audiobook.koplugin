@@ -3130,3 +3130,47 @@ msgstr ""
 #: main.lua:1233
 msgid "Extracted audiobook audio is kept here so a book reopens quickly. Cleanup runs automatically for books unused for 60 days, when the caches exceed 2 GB in total, or when the card is low on space. The open book is never removed. Tap to clean up now."
 msgstr ""
+
+#: audiobookplayer.lua:1625
+msgid "Play / pause"
+msgstr ""
+
+#: audiobookplayer.lua:1627
+msgid "Volume down"
+msgstr ""
+
+#: audiobookplayer.lua:1628
+msgid "Volume up"
+msgstr ""
+
+#: audiobookplayer.lua:1629
+msgid "— Title and time —"
+msgstr ""
+
+#: audiobookplayer.lua:1630
+msgid "Sync earlier"
+msgstr ""
+
+#: audiobookplayer.lua:1631
+msgid "Sync later"
+msgstr ""
+
+#: audiobookplayer.lua:1632
+msgid "Speed (text-to-speech)"
+msgstr ""
+
+#: audiobookplayer.lua:1633
+msgid "Settings (text-to-speech)"
+msgstr ""
+
+#: audiobookplayer.lua:1634
+msgid "Go to the line being read"
+msgstr ""
+
+#: main.lua:536 main.lua:1204
+msgid "Arrange the bar's buttons"
+msgstr ""
+
+#: main.lua:1212
+msgid "Tap an item, then move it with the arrows. Buttons above \"Title and time\" sit to its left, those below it to its right; ✕ stays at the end. Each bar shows only the buttons that apply to it. Large player bar only."
+msgstr ""
