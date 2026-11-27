@@ -3568,3 +3568,15 @@ msgstr ""
 #: main.lua:1212
 msgid "Tap an item, then move it with the arrows. Buttons above \"Title and time\" sit to its left, those below it to its right; ✕ stays at the end. Each bar shows only the buttons that apply to it. Large player bar only."
 msgstr ""
+
+#: main.lua:2046
+msgid "Still loading. Playback starts when ready."
+msgstr ""
+
+#: main.lua:2084
+msgid "Loading audiobook…"
+msgstr ""
+
+#: main.lua:2091
+msgid "Loading %1 / %2"
+msgstr ""

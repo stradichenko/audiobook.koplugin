@@ -1928,6 +1928,164 @@ function Audiobook:_smilProgressUi(loading_msg)
     end
 end
 
+-- ── Background overlay load ─────────────────────────────────────────
+
+function Audiobook:_readerXPointer()
+    local ok, xp = pcall(function() return self.ui.document:getXPointer() end)
+    return ok and xp or nil
+end
+
+function Audiobook:_openDocPath()
+    local doc = self.ui and self.ui.document
+    return doc and (doc.file_path or doc.file) or nil
+end
+
+--- Parse this book's overlays in a child process when there is no stored
+--- parse yet. Progress shows in the bar; pages keep turning. When it ends,
+--- resume(moved, prepare_only) is called, moved = the reader left the page
+--- they were on. Returns false when the caller should load in-process.
+--- Remove a book's overlay cache directory. Used before a background parse
+--- and when one is cancelled: a killed unzip can leave a partial audio file,
+--- and the extractor trusts any file that exists. Nothing is lost here: the
+--- background path only runs when no stored timing parse exists.
+function Audiobook:_removeOverlayCacheFor(doc_path)
+    if not (doc_path and PLUGIN_PATH) then return end
+    local EMO = self:_overlayCacheModule()
+    if not (EMO and EMO._simpleHash) then return end
+    local dir = PLUGIN_PATH:gsub("/$", "") .. "/cache/overlays/"
+        .. EMO:_simpleHash(doc_path)
+    os.execute("rm -rf '" .. dir:gsub("'", "'\\''") .. "'")
+    logger.warn("Audiobook: cleared overlay cache", dir)
+end
+
+function Audiobook:_loadOverlayInBackground(doc_path, parser, opts, resume)
+    opts = opts or {}
+    local plugin_dir = PLUGIN_PATH:sub(1, -2)
+    if not self.media_sync then return false end
+    if self._overlay_bg_no_cache == doc_path then return false end
+    if parser:hasTimingCache(doc_path, plugin_dir) then return false end
+    if not pcall(require, "string.buffer") then return false end -- no parse cache
+    local ok_l, OverlayLoader = pcall(dofile, PLUGIN_PATH .. "overlayloader.lua")
+    if not (ok_l and OverlayLoader and OverlayLoader.available()) then
+        logger.warn("Audiobook: background load unavailable:", tostring(OverlayLoader))
+        return false
+    end
+
+    local job = self._overlay_job
+    if job and job.doc_path == doc_path then
+        -- Already loading this book. Play during a quiet arm upgrades it.
+        if job.prepare_only and not opts.prepare_only then
+            job.prepare_only = false
+            job.resume = resume
+        end
+        UIManager:show(InfoMessage:new{
+            text = _("Still loading. Playback starts when ready."),
+            timeout = 2,
+        })
+        return true
+    end
+    self:_cancelOverlayLoad("another load started")
+
+    -- Start from a clean directory: a cancelled or crashed parse may have
+    -- left a truncated audio file, which the extractor would otherwise
+    -- reuse because it only checks that the path exists.
+    self:_removeOverlayCacheFor(doc_path)
+
+    local ms = self.media_sync
+    job = {
+        doc_path = doc_path,
+        prepare_only = opts.prepare_only and true or false,
+        resume = resume,
+        start_xp = self:_readerXPointer(),
+        shown_bar = not (ms.playback_bar and ms.playback_bar:isVisible()),
+    }
+    local function setText(text)
+        local bar = self.media_sync and self.media_sync.playback_bar
+        if bar and bar.setLoadingText then pcall(bar.setLoadingText, bar, text) end
+    end
+    local function dropBar()
+        setText(nil)
+        if job.shown_bar and self.media_sync
+                and not self.media_sync:_shouldKeepOverlayBar() then
+            pcall(function() self.media_sync:stop() end)
+        end
+    end
+
+    pcall(function()
+        ms.overlay_mode = true
+        ms:showPlaybackBar()
+        -- Nothing plays yet: show ▶ (a tap says it is still loading).
+        if ms.playback_bar then ms.playback_bar:setPlaying(false) end
+    end)
+    setText(_("Loading audiobook…"))
+
+    job.loader = OverlayLoader.start(parser, doc_path, plugin_dir,
+        function(cur, total)
+            if self._overlay_job ~= job then return end
+            -- Short, so it fits the clock line on any bar; the title line
+            -- above already names the book.
+            setText(T(_("Loading %1 / %2"), cur, total))
+        end,
+        function(ok, err)
+            if self._overlay_job ~= job then return end
+            self._overlay_job = nil
+            if self:_openDocPath() ~= doc_path then
+                setText(nil)
+                return
+            end
+            if not ok then
+                local why = tostring(err or "no timing data")
+                logger.warn("Audiobook: no media overlays:", why)
+                dlog("overlay load failed:", why, "book=", doc_path:match("([^/]+)$") or "?")
+                self:_noteOverlayDiag({
+                    ok = false, stage = "loadFromEpub", error = why,
+                    book = doc_path:match("([^/]+)$"),
+                })
+                -- Do not fork the same parse again this session, and do not
+                -- let a half-written extraction survive.
+                self._overlay_bg_no_cache = doc_path
+                self:_removeOverlayCacheFor(doc_path)
+                dropBar()
+                UIManager:show(InfoMessage:new{
+                    text = _("This book has no built-in audiobook."),
+                    timeout = 4,
+                })
+                return
+            end
+            if not parser:hasTimingCache(doc_path, plugin_dir) then
+                -- Parsed but not stored: load in-process next time instead
+                -- of forking the same parse again.
+                self._overlay_bg_no_cache = doc_path
+            end
+            setText(nil)
+            local moved = job.start_xp ~= self:_readerXPointer()
+            local ok_r, r_err = pcall(job.resume, moved, job.prepare_only)
+            if not ok_r then
+                logger.warn("Audiobook: start after background load failed:", r_err)
+                dropBar()
+            end
+        end)
+    if not job.loader then
+        dropBar()
+        return false
+    end
+    self._overlay_job = job
+    return true
+end
+
+--- Stop a background overlay load (✕, stop, book closed).
+function Audiobook:_cancelOverlayLoad(reason)
+    local job = self._overlay_job
+    if not job then return end
+    self._overlay_job = nil
+    if job.loader then pcall(job.loader.cancel, job.loader) end
+    -- Drop the partial extraction now that the child is killed; the next
+    -- play starts from a clean directory either way.
+    self:_removeOverlayCacheFor(job.doc_path)
+    local bar = self.media_sync and self.media_sync.playback_bar
+    if bar and bar.setLoadingText then pcall(bar.setLoadingText, bar, nil) end
+end
+
 --- @param opts table|nil  { prepare_only = true } arms the overlay (bar, SMIL,
 --- saved position) without starting audio; Play continues from the mark.
 --- Same EPUB by "size:mtime", allowing the 2 s mtime slack of the Kobo's
@@ -1988,21 +2146,45 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
             return
         end
 
-        local loading_msg = InfoMessage:new{
-            text = _("Loading the built-in audiobook…"),
-            timeout = 3600,
-        }
-        UIManager:show(loading_msg)
-        UIManager:forceRePaint()
-
         parser = EpubMediaOverlay:new()
         local plugin_dir = PLUGIN_PATH:sub(1, -2)
+
+        -- First load of this book: parse in the background, show progress
+        -- in the bar, and come back here when it is done.
+        if self:_loadOverlayInBackground(doc_path, parser, opts,
+                function(moved, prepare_only)
+                    local again = { prepare_only = prepare_only }
+                    if moved then
+                        -- The reader turned pages while it loaded: start
+                        -- (or arm) at the page they are on now, no prompt,
+                        -- no jump back to where Play was pressed.
+                        self:_startSmilPlayback(doc_path, nil, false, again)
+                    else
+                        self:_startSmilPlayback(doc_path, start_entry, allow_resume, again)
+                    end
+                end) then
+            return
+        end
+
+        -- A cached parse loads in well under a second: no box for that.
+        local loading_msg
+        if not parser:hasTimingCache(doc_path, plugin_dir) then
+            loading_msg = InfoMessage:new{
+                text = _("Loading the built-in audiobook…"),
+                timeout = 3600,
+            }
+            UIManager:show(loading_msg)
+            UIManager:forceRePaint()
+        end
+
         local err
         timing_data, err = parser:loadFromEpub(doc_path, plugin_dir,
-            self:_smilProgressUi(loading_msg))
+            loading_msg and self:_smilProgressUi(loading_msg) or nil)
 
-        UIManager:close(loading_msg)
-        UIManager:forceRePaint()
+        if loading_msg then
+            UIManager:close(loading_msg)
+            UIManager:forceRePaint()
+        end
 
         if not timing_data then
             local why = tostring(err or "no timing data")
@@ -3339,18 +3521,36 @@ function Audiobook:_startSmilPlaybackFromSelection(doc_path, selected_text, allo
         self._smil_doc_path = nil
     end
     if not parser or not timing_data then
-        local loading_msg = InfoMessage:new{
-            text = _("Loading the built-in audiobook…"),
-            timeout = 3600,
-        }
-        UIManager:show(loading_msg)
-        UIManager:forceRePaint()
         parser = EpubMediaOverlay:new()
+        local plugin_dir = PLUGIN_PATH:sub(1, -2)
+        if self:_loadOverlayInBackground(doc_path, parser, nil,
+                function(moved)
+                    if moved then
+                        -- Pages turned while it loaded: the page now on
+                        -- screen wins over the selection made before.
+                        self:_startSmilPlayback(doc_path, nil, false)
+                    else
+                        self:_startSmilPlaybackFromSelection(doc_path, selected_text, allow_resume)
+                    end
+                end) then
+            return
+        end
+        local loading_msg
+        if not parser:hasTimingCache(doc_path, plugin_dir) then
+            loading_msg = InfoMessage:new{
+                text = _("Loading the built-in audiobook…"),
+                timeout = 3600,
+            }
+            UIManager:show(loading_msg)
+            UIManager:forceRePaint()
+        end
         local err
-        timing_data, err = parser:loadFromEpub(doc_path, PLUGIN_PATH:sub(1, -2),
-            self:_smilProgressUi(loading_msg))
-        UIManager:close(loading_msg)
-        UIManager:forceRePaint()
+        timing_data, err = parser:loadFromEpub(doc_path, plugin_dir,
+            loading_msg and self:_smilProgressUi(loading_msg) or nil)
+        if loading_msg then
+            UIManager:close(loading_msg)
+            UIManager:forceRePaint()
+        end
         if not timing_data then
             local why = tostring(err or "no timing data")
             logger.warn("Audiobook: no media overlays:", why)
@@ -4688,6 +4888,7 @@ end
 
 function Audiobook:onCloseDocument()
     logger.warn("Audiobook: onCloseDocument event received")
+    pcall(self._cancelOverlayLoad, self, "document closed")
     -- Re-assert the overlay inset into the sidecar before ReaderConfig writes
     -- copt_* (SaveSettings fires before CloseDocument, so this only covers
     -- paths that bypassed it). Dropping chrome must not restore the original

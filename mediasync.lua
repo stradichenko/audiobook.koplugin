@@ -889,6 +889,10 @@ function MediaSync:stop(keep_chapter_menu, opts)
     opts = opts or {}
     local track_transition = opts.track_transition and true or false
     local drop_chrome = opts.drop_chrome and true or false
+    -- ✕ or stop while the book is still loading in the background ends that too.
+    if not track_transition and self.plugin and self.plugin._cancelOverlayLoad then
+        pcall(self.plugin._cancelOverlayLoad, self.plugin, "stopped")
+    end
     local was_playing = self.state ~= self.STATE.STOPPED
     -- Sync ReaderRolling to the page actually shown before the stop
     -- re-renders, or the view snaps back to the session start.
