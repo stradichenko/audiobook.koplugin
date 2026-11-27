@@ -1940,6 +1940,70 @@ function Audiobook:_openDocPath()
     return doc and (doc.file_path or doc.file) or nil
 end
 
+--- First narrated sentence on the page the reader is on (the sentence that
+--- runs onto it when none starts there). nil when the page's content
+--- document has no narration or its ids cannot be resolved.
+function Audiobook:_entryOnCurrentPage(parser, timing_data)
+    local doc = self.ui and self.ui.document
+    if not (doc and parser and timing_data and doc.getXPointer
+            and doc.getPageFromXPointer and doc.getNormalizedXPointer) then
+        return nil
+    end
+    local cur_xp = doc:getXPointer()
+    local frag_idx = cur_xp and tonumber(cur_xp:match("DocFragment%[(%d+)%]"))
+    local base = frag_idx and (parser._spine_hrefs or {})[frag_idx]
+    if not base then return nil end
+    local list = {}
+    for _, e in ipairs(timing_data) do
+        if e.audio_path and e.fragment_id and e.text_doc
+                and e.text_doc:match("([^/]+)$") == base then
+            list[#list + 1] = e
+        end
+    end
+    if #list == 0 then return nil end
+    local cur_page = doc:getPageFromXPointer(cur_xp)
+    if not cur_page then return nil end
+    local frag_tag = "DocFragment[" .. frag_idx .. "]"
+    -- crengine namespaces ids of merged content documents as
+    -- "_doc_fragment_<n-1>_ <id>"; try that first, then the raw id.
+    local ns = string.format("#_doc_fragment_%d_ ", frag_idx - 1)
+    local function resolve(id)
+        local ok, xp = pcall(doc.getNormalizedXPointer, doc, ns .. id)
+        if ok and xp and xp ~= false then return xp end
+        ok, xp = pcall(doc.getNormalizedXPointer, doc, "#" .. id)
+        if ok and xp and xp ~= false then return xp end
+        return nil
+    end
+    local function page_of(e)
+        local xp = resolve(e.fragment_id)
+        -- Ids can repeat across chapters: only trust a hit in this document.
+        if not xp or not xp:find(frag_tag, 1, true) then
+            return nil
+        end
+        local ok2, pg = pcall(doc.getPageFromXPointer, doc, xp)
+        return ok2 and pg or nil
+    end
+    -- Binary search: first entry on or after the current page.
+    local lo, hi, found, found_pg = 1, #list, nil, nil
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        local pg = page_of(list[mid])
+        if not pg then return nil end
+        if pg >= cur_page then
+            found, found_pg, hi = mid, pg, mid - 1
+        else
+            lo = mid + 1
+        end
+    end
+    if not found then
+        found, found_pg = #list, cur_page -- page is past the last sentence
+    end
+    if found_pg > cur_page and found > 1 then
+        found = found - 1 -- nothing starts here: the sentence running onto it
+    end
+    return list[found]
+end
+
 --- Parse this book's overlays in a child process when there is no stored
 --- parse yet. Progress shows in the bar; pages keep turning. When it ends,
 --- resume(moved, prepare_only) is called, moved = the reader left the page
@@ -2311,6 +2375,16 @@ function Audiobook:_startSmilPlayback(doc_path, start_entry, allow_resume, opts)
         -- Start from the reader's current position, unless a specific entry was
         -- requested (e.g., "Play aligned audiobook from here").
         local start_file, start_time
+        if not (chosen_entry and chosen_entry.audio_path) and not opts.prepare_only then
+            -- The first sentence on the page the reader is looking at now,
+            -- rather than the start of its chapter.
+            local ok_pg, page_entry = pcall(self._entryOnCurrentPage, self, parser, timing_data)
+            if ok_pg and page_entry then
+                chosen_entry = page_entry
+            elseif not ok_pg then
+                logger.warn("Audiobook: current-page entry lookup failed:", page_entry)
+            end
+        end
         if chosen_entry and chosen_entry.audio_path then
             start_file = chosen_entry.audio_path
             start_time = chosen_entry.start_time
